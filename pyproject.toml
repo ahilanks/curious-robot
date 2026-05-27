@@ -13,7 +13,7 @@ dependencies = [
     "numpy>=1.26",
     "mujoco>=3.1",           # SO-ARM101 simulation
     "einops>=0.7",           # lewm/jepa.py, lewm/module.py
-    "transformers>=4.40",    # from-scratch ViT-tiny encoder
+    "transformers>=4.44,<4.50", # ViT-tiny encoder only; <4.50 keeps it torch-2.4 compatible (v5 needs torch>=2.5)
     "wandb>=0.16",           # metric/video logging
     "huggingface_hub>=0.24", # intermittent checkpoint upload
     "python-dotenv>=1.0",    # load WANDB_*/HF_* from .env
