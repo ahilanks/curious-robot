@@ -15,7 +15,7 @@ working defaults, meant to be swept; they are intentionally NOT pinned in the RE
 """
 import os
 import platform
-os.environ.setdefault("MUJOCO_GL", "glfw" if platform.system() == "Darwin" else "egl")
+os.environ.setdefault("MUJOCO_GL", "glfw" if platform.system() == "Darwin" else "osmesa")
 
 import argparse
 import json
@@ -35,7 +35,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from lewm.module import SIGReg                       # noqa: E402
 from model.state_encoder import WorldModel           # noqa: E402
 from model.proprio import symlog                     # noqa: E402
-from env.parallel_env import VectorMujocoEnv         # noqa: E402
+from env.parallel_env import (VectorMujocoEnv,       # noqa: E402
+                              SubprocVectorMujocoEnv, SubprocSingleEnv)
+from env.mujoco_env import MujocoSO101Env            # noqa: E402
 
 try:
     import wandb
@@ -368,12 +370,14 @@ def main(args):
     except ImportError:
         pass
 
-    env = VectorMujocoEnv(n_envs=args.n_envs, frame_skip=args.frame_skip,
-                          action_max=args.action_max, dq_max=args.dq_max,
-                          safety_delta=args.safety_delta, seed=args.seed,
-                          threads=args.env_threads)
-    eval_env = env.envs[0].__class__(action_max=args.action_max, dq_max=args.dq_max,
-                                     safety_delta=args.safety_delta, seed=args.seed + 9999)
+    VecEnv = SubprocVectorMujocoEnv if args.env_backend == "subproc" else VectorMujocoEnv
+    env = VecEnv(n_envs=args.n_envs, frame_skip=args.frame_skip,
+                 action_max=args.action_max, dq_max=args.dq_max,
+                 safety_delta=args.safety_delta, seed=args.seed,
+                 threads=args.env_threads)
+    EvalEnv = SubprocSingleEnv if args.env_backend == "subproc" else MujocoSO101Env
+    eval_env = EvalEnv(action_max=args.action_max, dq_max=args.dq_max,
+                       safety_delta=args.safety_delta, seed=args.seed + 9999)
     n_dof = env.n_dof
     a_dim = n_dof * args.action_block
     prop_dim = 3 * n_dof
@@ -506,7 +510,7 @@ def main(args):
         done_envs = np.where(done > 0)[0]
         if len(done_envs):
             for e in done_envs:
-                o_e = env.envs[int(e)].reset()
+                o_e = env.reset_one(int(e))
                 obs["image"][e] = o_e["image"]
                 obs["proprio"][e] = o_e["proprio"]
             z_reset = encode_obs(wm, obs["image"][done_envs], obs["proprio"][done_envs], device)
@@ -649,7 +653,12 @@ def parse_args():
     p.add_argument("--total-steps", type=int, default=200_000)
     p.add_argument("--start-steps", type=int, default=1000, help="random-action warmup (decision steps)")
     p.add_argument("--n-envs", type=int, default=8)
-    p.add_argument("--env-threads", type=int, default=0, help=">0 steps envs on a thread pool")
+    p.add_argument("--env-threads", type=int, default=0,
+                   help=">0 steps envs on a thread pool (inproc backend only)")
+    p.add_argument("--env-backend", choices=("subproc", "inproc"), default="subproc",
+                   help="subproc: each env in a CUDA-free worker process, needed on "
+                        "GPU+EGL to avoid the MuJoCo-render/CUDA SIGABRT; "
+                        "inproc: envs in this process (sequential or --env-threads)")
     p.add_argument("--frame-skip", type=int, default=6)
     p.add_argument("--max-episode-steps", type=int, default=200, help="decision steps before truncation-as-done")
     p.add_argument("--seed", type=int, default=0)
