@@ -19,10 +19,17 @@ load_env() {
 }
 load_env
 
+# Headless rendering: MuJoCo defaults to the on-screen GLFW backend, which needs an
+# X11 display. Use OSMesa (CPU offscreen) -- GPU EGL rendering aborts when it shares
+# a GPU with the trainer's CUDA (even across processes), so we render on CPU and keep
+# the GPU for training. Respect an explicit override.
+export MUJOCO_GL="${MUJOCO_GL:-osmesa}"
+
 mkdir -p runs "${WANDB_DIR:-runs/wandb}"
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 have_egl_loader() { ldconfig -p 2>/dev/null | grep -q 'libEGL\.so\.1'; }
+have_osmesa_loader() { ldconfig -p 2>/dev/null | grep -q 'libOSMesa\.so'; }
 
 require_env() {
     local missing=0
@@ -57,14 +64,14 @@ ensure_node_tooling() {
 }
 
 ensure_mujoco_runtime_deps() {
-    if have_egl_loader; then
+    if have_osmesa_loader; then
         echo "MuJoCo runtime libraries already installed"
         return
     fi
-    echo "Installing MuJoCo runtime libraries"
+    echo "Installing MuJoCo runtime libraries (OSMesa CPU rendering + GL)"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y libegl1 libgl1 libgles2
+    apt-get install -y libosmesa6 libgl1 libegl1 libgles2
 }
 
 ensure_gh_cli() {
@@ -204,7 +211,7 @@ r.update_scene(d, camera=0)
 frame = r.render()
 r.close()
 print(f'  scene loaded: {m.nbody} bodies, {m.ngeom} geoms, {m.ncam} cameras')
-print(f'  EGL renderer OK: {frame.shape}')
+print(f'  renderer OK [{os.environ.get(\"MUJOCO_GL\")}]: {frame.shape}')
 "
 
 echo ""
