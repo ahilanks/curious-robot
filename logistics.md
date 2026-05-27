@@ -9,7 +9,7 @@ learning dynamics?*
 - **Code** — `lewm/` (verbatim JEPA+SIGReg), `env/` (MuJoCo SO101 + safety reward),
   `model/` (ViT-tiny state encoder), `src/` (train · play_policy · eval_predictor).
 - **Backends** — W&B project `curious-robot` · HF `a5ilank/curious-robot` · GitHub
-  `ahilanks/curious-robot` (private). Creds in `.env` (auto-loaded; not gitignored).
+  `ahilanks/curious-robot` (private). Creds in `.env` (auto-loaded; gitignored — keep local).
 - **Train** — `python src/train.py --name <kw> --n-envs 8 --env-threads 8`. `--name` is
   a short keyword → W&B run name + `runs/<name>/` + HF `<name>/ckpt_*.pt`; every constant
   lives in the W&B config table, not the name. Pod bootstrap: `bash setup.sh`.
@@ -31,8 +31,8 @@ arm-contact set empty → all interaction metrics were silently 0; now verified 
 
 ## To-do
 
-- [ ] **Push `.env`, then rotate tokens** — `git add .env && git commit && git push`;
-      GitHub secret-scanning auto-revokes the GH/HF tokens, so regenerate them after.
+- [ ] **Provide `.env` on new machines** — it's gitignored (kept local), so copy it to
+      pods out-of-band (scp / paste), not via the repo. Rotate a token only if it leaks.
 - [ ] **Baseline run** to ~200k steps (`--keep-local-ckpts` if you want local eval); fill
       the sweep table.
 - [ ] **Sweep the `?` constants** — β (0.9), λ_cur (15 → safety:curiosity ~0.5:1),

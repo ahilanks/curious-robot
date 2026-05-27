@@ -1,6 +1,3 @@
-# NOTE: .env is intentionally NOT ignored — the maintainer pushes it on purpose.
-# It holds live GH/WANDB/HF tokens; treat the repo accordingly (kept private).
-
 # python
 __pycache__/
 *.pyc
@@ -22,3 +19,6 @@ wandb/
 
 # os / editor
 .DS_Store
+
+# secrets — WANDB/HF/GH tokens; keep local, never commit
+.env
