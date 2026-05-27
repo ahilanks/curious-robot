@@ -22,7 +22,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from model.state_encoder import WorldModel       # noqa: E402
 from env.mujoco_env import MujocoSO101Env         # noqa: E402
-from src.train import Actor, encode_obs           # noqa: E402
+from src.train import Actor, encode_obs, resolve_ckpt   # noqa: E402
 
 
 @torch.no_grad()
@@ -66,17 +66,27 @@ def rollout_error(wm, Z, A, H, maxh):
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", required=True)
+    p = argparse.ArgumentParser(description="Open-loop WM prediction error (HF or local ckpt).")
+    p.add_argument("--name", default="baseline", help="run name (HF folder) to pull from")
+    p.add_argument("--step", type=int, default=None, help="checkpoint step (default: latest)")
+    p.add_argument("--hf-repo", default=None, help="HF repo id (else $HF_UPLOAD_REPO_ID)")
+    p.add_argument("--ckpt", default=None, help="local .pt path (overrides HF fetch)")
     p.add_argument("--steps", type=int, default=500)
     p.add_argument("--maxh", type=int, default=20)
     p.add_argument("--seed", type=int, default=7)
-    p.add_argument("--out", default=None, help="json output path (default next to ckpt)")
+    p.add_argument("--out", default=None, help="json output path (default derived from run/ckpt)")
     args = p.parse_args()
+
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(PROJECT_ROOT / ".env")
+    except ImportError:
+        pass
 
     device = torch.device("cuda" if torch.cuda.is_available()
                           else "mps" if torch.backends.mps.is_available() else "cpu")
-    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
+    ckpt = torch.load(resolve_ckpt(args.ckpt, args.name, args.step, args.hf_repo),
+                      map_location=device, weights_only=False)
     ca = ckpt["args"]; n_dof = 6
     wm = WorldModel(n_dof=n_dof, action_block=ca["action_block"],
                     history_size=ca["history_size"]).to(device)
@@ -94,7 +104,13 @@ def main():
     for h, v in res.items():
         ratio = v["pred_mse"] / max(v["persist_mse"], 1e-9)
         print(f"{h:>3} {v['pred_mse']:>12.4f} {v['persist_mse']:>12.4f} {ratio:>12.3f}")
-    out = Path(args.out) if args.out else Path(args.ckpt).with_suffix(".pred_eval.json")
+    if args.out:
+        out = Path(args.out)
+    elif args.ckpt:
+        out = Path(args.ckpt).with_suffix(".pred_eval.json")
+    else:
+        tag = args.name if args.step is None else f"{args.name}_{args.step:07d}"
+        out = Path(f"{tag}.pred_eval.json")
     out.write_text(json.dumps(res, indent=2))
     print(f"[eval] wrote {out}")
 

@@ -306,6 +306,28 @@ def save_and_upload(state, out_dir, step, repo_id, run_name, enable_hf, keep_loc
     return path
 
 
+def resolve_ckpt(ckpt=None, name="baseline", step=None, hf_repo=None):
+    """Return a local checkpoint path: the explicit `ckpt` if given, else download
+    <name>/ckpt_<step>.pt (or the latest step for that run) from the HF Hub
+    (hf_repo, else $HF_UPLOAD_REPO_ID). Shared by play_policy.py / eval_predictor.py."""
+    if ckpt:
+        return ckpt
+    repo = hf_repo or os.environ.get("HF_UPLOAD_REPO_ID")
+    if not repo:
+        raise SystemExit("no --ckpt and no HF repo (set --hf-repo or HF_UPLOAD_REPO_ID in .env)")
+    from huggingface_hub import HfApi, hf_hub_download
+    token = os.environ.get("HF_TOKEN")
+    files = [f for f in HfApi(token=token).list_repo_files(repo)
+             if f.startswith(f"{name}/") and f.endswith(".pt")]
+    if not files:
+        raise SystemExit(f"no checkpoints for run '{name}' in {repo}")
+    target = f"{name}/ckpt_{step:07d}.pt" if step is not None else sorted(files)[-1]
+    if target not in files:
+        raise SystemExit(f"{target} not found in {repo}; available: {sorted(files)}")
+    print(f"[hf] downloading {target} from {repo}", flush=True)
+    return hf_hub_download(repo_id=repo, filename=target, token=token)
+
+
 @torch.no_grad()
 def record_rollout(actor, wm, eval_env, action_block, n_dof, device, out_dir, tag, n_steps, fps):
     """Policy rollout in eval_env, written as TWO videos: the overhead cam (what we

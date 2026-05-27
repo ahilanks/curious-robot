@@ -25,30 +25,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from model.state_encoder import WorldModel       # noqa: E402
 from env.mujoco_env import MujocoSO101Env         # noqa: E402
-from src.train import Actor, record_rollout       # noqa: E402
-
-
-def resolve_ckpt(args) -> str:
-    """Local --ckpt if given, else download <name>/ckpt_<step>.pt (or the latest
-    step for that run) from the HF Hub."""
-    if args.ckpt:
-        return args.ckpt
-    repo = args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID")
-    if not repo:
-        raise SystemExit("no --ckpt and no HF repo (set --hf-repo or HF_UPLOAD_REPO_ID in .env)")
-    from huggingface_hub import HfApi, hf_hub_download
-    token = os.environ.get("HF_TOKEN")
-    api = HfApi(token=token)
-    files = [f for f in api.list_repo_files(repo)
-             if f.startswith(f"{args.name}/") and f.endswith(".pt")]
-    if not files:
-        raise SystemExit(f"no checkpoints for run '{args.name}' in {repo}")
-    target = (f"{args.name}/ckpt_{args.step:07d}.pt" if args.step is not None
-              else sorted(files)[-1])          # zero-padded step -> lexical sort = latest
-    if target not in files:
-        raise SystemExit(f"{target} not found in {repo}; available: {sorted(files)}")
-    print(f"[hf] downloading {target} from {repo}", flush=True)
-    return hf_hub_download(repo_id=repo, filename=target, token=token)
+from src.train import Actor, record_rollout, resolve_ckpt   # noqa: E402
 
 
 def main():
@@ -71,7 +48,8 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available()
                           else "mps" if torch.backends.mps.is_available() else "cpu")
-    ckpt = torch.load(resolve_ckpt(args), map_location=device, weights_only=False)
+    ckpt = torch.load(resolve_ckpt(args.ckpt, args.name, args.step, args.hf_repo),
+                      map_location=device, weights_only=False)
     ca = ckpt["args"]
     n_dof = 6
 
