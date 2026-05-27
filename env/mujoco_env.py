@@ -122,16 +122,20 @@ class MujocoSO101Env:
             self._object_qpos_addrs.append(int(self.model.jnt_qposadr[joint]))
             self._object_qvel_addrs.append(int(self.model.jnt_dofadr[joint]))
         self._object_geom_id_set = set(self._object_geom_ids)
+        # Classify every geom: objects (named object_*), the table/floor "ground"
+        # bucket (named table*/floor), and everything else = arm links. The arm's
+        # mesh geoms are UNNAMED, so we must NOT skip name=None here -- doing so
+        # leaves the arm set empty and no contact ever registers.
         self._arm_geom_ids: set[int] = set()
-        self._table_geom_ids: set[int] = set()   # table top/legs + floor (the "ground" bucket)
+        self._table_geom_ids: set[int] = set()
         for gid in range(self.model.ngeom):
+            if gid in self._object_geom_id_set:
+                continue
             name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, gid)
-            if name is None or gid in self._object_geom_id_set:   # ids, not name-vs-id-set
-                continue
-            if name.startswith(("table", "floor")):
+            if name is not None and name.startswith(("table", "floor")):
                 self._table_geom_ids.add(gid)
-                continue
-            self._arm_geom_ids.add(gid)
+            else:
+                self._arm_geom_ids.add(gid)
 
         self._wrist_renderer = mujoco.Renderer(self.model, height=wrist_resolution, width=wrist_resolution)
         self._overhead_renderer = mujoco.Renderer(self.model, height=overhead_resolution, width=overhead_resolution)
