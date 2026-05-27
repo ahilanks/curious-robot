@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "curious-robot"
+version = "0.1.0"
+description = "From-scratch JEPA+SIGReg world model + SAC intrinsic curiosity on the MuJoCo SO-ARM101"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",            # models, SAC
+    "numpy>=1.26",
+    "mujoco>=3.1",           # SO-ARM101 simulation
+    "einops>=0.7",           # lewm/jepa.py, lewm/module.py
+    "transformers>=4.40",    # from-scratch ViT-tiny encoder
+    "wandb>=0.16",           # metric/video logging
+    "huggingface_hub>=0.24", # intermittent checkpoint upload
+    "python-dotenv>=1.0",    # load WANDB_*/HF_* from .env
+    "imageio>=2.34",         # rollout videos
+    "imageio-ffmpeg>=0.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "ruff"]
+
+[tool.setuptools]
+# editable install (`pip install -e .`) puts the repo root on sys.path so
+# `lewm` / `env` / `model` / `src` import cleanly; SO101 XML+meshes stay in place.
+packages = ["lewm", "env", "model", "src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

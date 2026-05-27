@@ -1,0 +1,24 @@
+# NOTE: .env is intentionally NOT ignored — the maintainer pushes it on purpose.
+# It holds live GH/WANDB/HF tokens; treat the repo accordingly (kept private).
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
+dist/
+.ruff_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+*.so
+
+# training artifacts
+runs/
+outputs/
+wandb/
+*.pt
+*.mp4
+
+# os / editor
+.DS_Store

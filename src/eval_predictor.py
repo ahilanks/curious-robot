@@ -1,0 +1,103 @@
+"""Open-loop multi-step prediction error of the world model -- the "is it learning
+dynamics?" metric. Collects a policy trajectory, then for each horizon h rolls the
+predictor h steps open-loop (feeding its own output back with the real actions) and
+compares to the real latent. Reports pred MSE and the persistence baseline per h.
+
+    python src/eval_predictor.py --ckpt runs/curious/ckpt_0050000.pt --steps 500
+"""
+import argparse
+import json
+import os
+import platform
+import sys
+from pathlib import Path
+
+os.environ.setdefault("MUJOCO_GL", "glfw" if platform.system() == "Darwin" else "egl")
+
+import numpy as np
+import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from model.state_encoder import WorldModel       # noqa: E402
+from env.mujoco_env import MujocoSO101Env         # noqa: E402
+from src.train import Actor, encode_obs           # noqa: E402
+
+
+@torch.no_grad()
+def collect(env, wm, actor, n_dof, action_block, n_steps, device):
+    obs = env.reset()
+    z = encode_obs(wm, obs["image"][None], obs["proprio"][None], device)[0]
+    zs, acts = [z], []
+    for _ in range(n_steps):
+        a, _, _ = actor.sample(z[None])
+        acts.append(a[0])
+        a_env = a[0].cpu().numpy().reshape(action_block, n_dof)
+        for k in range(action_block):
+            obs, _ = env.step(a_env[k])
+        z = encode_obs(wm, obs["image"][None], obs["proprio"][None], device)[0]
+        zs.append(z)
+    return torch.stack(zs), torch.stack(acts)      # (N+1, D), (N, A)
+
+
+@torch.no_grad()
+def rollout_error(wm, Z, A, H, maxh):
+    N = A.shape[0]
+    starts = torch.arange(H - 1, N - maxh + 1)
+    if len(starts) < 2:
+        return {}
+    win = lambda X, off: X[(starts[:, None] + off + torch.arange(-H + 1, 1)[None, :])]
+    ctx_z, ctx_a = win(Z, 0), win(A, 0)            # Z[t-H+1..t], A[t-H+1..t]
+    cur = wm.predict(ctx_z, wm.action_encoder(ctx_a))
+    roll, roll_a = ctx_z, wm.action_encoder(ctx_a)
+    out = {}
+    for h in range(1, maxh + 1):
+        zhat = cur[:, -1]
+        z_true = Z[starts + h]
+        out[h] = {"pred_mse": float(((zhat - z_true) ** 2).sum(-1).mean()),
+                  "persist_mse": float(((Z[starts] - z_true) ** 2).sum(-1).mean())}
+        if h < maxh:
+            na = wm.action_encoder(A[starts + h][:, None, :])
+            roll = torch.cat([roll[:, 1:], zhat[:, None]], 1)
+            roll_a = torch.cat([roll_a[:, 1:], na], 1)
+            cur = wm.predict(roll, roll_a)
+    return out
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--ckpt", required=True)
+    p.add_argument("--steps", type=int, default=500)
+    p.add_argument("--maxh", type=int, default=20)
+    p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--out", default=None, help="json output path (default next to ckpt)")
+    args = p.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available()
+                          else "mps" if torch.backends.mps.is_available() else "cpu")
+    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
+    ca = ckpt["args"]; n_dof = 6
+    wm = WorldModel(n_dof=n_dof, action_block=ca["action_block"],
+                    history_size=ca["history_size"]).to(device)
+    wm.load_state_dict(ckpt["wm"]); wm.eval()
+    actor = Actor(wm.z_dim, n_dof * ca["action_block"]).to(device)
+    actor.load_state_dict(ckpt["actor"]); actor.eval()
+    env = MujocoSO101Env(action_max=ca["action_max"], dq_max=ca["dq_max"],
+                         safety_delta=ca["safety_delta"], seed=args.seed)
+
+    Z, A = collect(env, wm, actor, n_dof, ca["action_block"], args.steps, device)
+    res = rollout_error(wm, Z, A, ca["history_size"], args.maxh)
+    env.close()
+
+    print(f"{'h':>3} {'pred_mse':>12} {'persist_mse':>12} {'pred/persist':>12}")
+    for h, v in res.items():
+        ratio = v["pred_mse"] / max(v["persist_mse"], 1e-9)
+        print(f"{h:>3} {v['pred_mse']:>12.4f} {v['persist_mse']:>12.4f} {ratio:>12.3f}")
+    out = Path(args.out) if args.out else Path(args.ckpt).with_suffix(".pred_eval.json")
+    out.write_text(json.dumps(res, indent=2))
+    print(f"[eval] wrote {out}")
+
+
+if __name__ == "__main__":
+    main()
