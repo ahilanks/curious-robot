@@ -87,7 +87,7 @@ multi-step dynamics learning**, not motion volume.
 eff_rank is a noisy single-batch estimate that partially recovers even in the frozen control (SIGReg
 re-isotropizes whatever data it gets), so read collapse off **feat_corr + contacts + pred/persist**, not eff_rank alone.
 
-### BatchNorm + UTD + safety-weight (2026-05-28)
+### BatchNorm + UTD + safety-weight + δ-deadband (2026-05-28)
 
 All below add **BatchNorm1d** to the encoder projector/fuse/pred_proj (matching le-wm; the `module.MLP`
 default is LayerNorm). All use `--normalize-curiosity`, λ_cur=40, β=1 unless noted. eff_rank shown for
@@ -100,6 +100,9 @@ the *active* window (it's the metric that gets gamed — see the hollow-eff_rank
 | bn_norm_10k | BN + norm λ40 + **UTD 4/2** | ~6k* | →**0.002** | →0.001 | 14→**29** | 0.14 | **hollow eff_rank**: rank rose toward le-wm's 50 *as interaction collapsed* — BN+SIGReg+high-UTD inflate the metric without behavior |
 | sw_1p0 | BN + norm λ40, safety×**1.0** | ~2.5k* | 0.007 | 0.0017 | 10.1 | 0.24 | A/B control |
 | sw_0p3 | BN + norm λ40, safety×**0.3** | ~2.5k* | 0.015 | 0.0019 | 12.5 | 0.22 | lowering r_safe 3.3× → **no interaction gain** (within noise); safety magnitude isn't the lever |
+| nosafety | BN + norm λ40, safety×**0.0** | 1.75k* | 0.013 | 0.0018 | ~13 (16 late) | 0.18 | safety **fully off**: motion (0.0018) & contacts (0.013) **identical to ×1.0/×0.3** → magnitude does nothing for manipulation, confirmed all the way to zero. But the failure *mode* flips: **no stillness-freeze** (r_safe stays −53, flagged *active*, not pinned ~0) — the now-mobile arm flails in free space without finding the blocks. Rep healthy (eff_rank ~16, feat_corr 0.18), WM>persist (pred−ident −0.43) |
+| delta25 | BN + norm λ40, **δ=25** | 6k | 0.05 | 0.0026 | 18.0 | 0.18 | δ at the *real* scale: relaxes r_safe (−29 vs −33) but contacts noisy/low — threshold isn't the lever |
+| delta80 | BN + norm λ40, **δ=80** | 6k | 0.08 | 0.0026 | 14.5 | 0.20 | relaxes r_safe most (−10.5); contacts noisy ~0.08 but **object_motion flat (0.0026)** → no real manipulation gain |
 
 *stopped early once the trend was clear. **Across all of these, vigorous block interaction never
 emerged** — it's an exploration/discovery problem, not a reward-balance one (see the 2026-05-28 log).
@@ -150,7 +153,10 @@ _(add a dated entry per run)_
   • **δ is a dead knob**: measured the `−τ·q̈` distribution (sanity-checked against env r_safe) — the
     hinge fires ~13%/joint-step on *large* events (p90 +25, p95 +79, max 464) and firing is **flat
     from δ=0.05→5**; it'd need δ≈25–100 to move. So δ=0.05 isn't "firing on noise" — the penalty is
-    large because the motion genuinely fights its own acceleration.
+    large because the motion genuinely fights its own acceleration. **Ran δ=25/80** (`delta25`/`delta80`):
+    r_safe relaxes as designed (−29/−10.5 vs −33 at δ=0.05) but interaction stays noisy/low (contacts
+    ~0.05–0.08, object_motion flat ~0.0026) — relaxing safety by *threshold* doesn't unlock interaction
+    either (cf. the safety-weight A/B). Reinforces: the bottleneck is exploration, not the safety term.
   • **Safety-weight A/B** (`sw_1p0` vs `sw_0p3`, new `--safety-weight`): lowering r_safe ×0.3 gave
     **no interaction gain** (contacts 0.015 vs 0.007, both ~0; object_motion identical). Safety
     magnitude isn't the lever either.
@@ -166,3 +172,14 @@ _(add a dated entry per run)_
   20→**1** (curriculum off by default — runs had climbed to h_fwd 11–12 because a *flatlined* WM loss
   was misread as "mastered"); BatchNorm1d in the encoder; new `src/hw_config.py` (GPU/CPU max-util
   recommender) and `src/analyze_run.py` (collapse/freeze read-out).
+- 2026-05-28 — **safety fully off (`nosafety`, safety×0.0) — the sw A/B endpoint.** Ran `--safety-weight 0`
+  (else best config: BN + norm, λ_cur=40, β=1) to ~1.75k, the zero endpoint of the `sw_1p0`/`sw_0p3` series.
+  **`object_motion` (0.0018) and `contacts` (0.013) come out identical to ×1.0/×0.3** → safety *magnitude*
+  does nothing for manipulation, now confirmed all the way to zero. What *does* change is the failure
+  **mode**: with no jerk penalty the *stillness*-freeze attractor is gone — the arm no longer goes still to
+  zero out r_safe (r_safe holds ~−53, `analyze_run` flags **active**, not pinned ~0); rep stays healthy
+  (eff_rank ~13–16, feat_corr 0.18, no collapse) and the WM still beats persistence (pred−ident ≈ −0.43).
+  But the now-mobile arm just **flails in free space without discovering the blocks** — curiosity is sated by
+  free-space self-prediction-error and never needs contact. **Net:** the safety term shaped *how* exploration
+  fails (still vs flailing), not *whether* the arm interacts; vigorous block interaction still never emerges.
+  Reinforces the exploration/discovery bottleneck — untried lever remains `--learn-alpha` / pink-noise.

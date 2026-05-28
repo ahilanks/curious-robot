@@ -432,7 +432,10 @@ def main(args):
     critic_tgt.load_state_dict(critic.state_dict())
     for p in critic_tgt.parameters():
         p.requires_grad_(False)
-    log_alpha = torch.tensor(float(np.log(args.alpha)), device=device)   # fixed entropy temp
+    # entropy temperature: fixed --alpha (default), or auto-tuned to --target-entropy (--learn-alpha)
+    log_alpha = torch.tensor(float(np.log(args.alpha)), device=device, requires_grad=args.learn_alpha)
+    target_entropy = args.target_entropy if args.target_entropy is not None else -float(a_dim)
+    alpha_opt = torch.optim.Adam([log_alpha], lr=args.alpha_lr) if args.learn_alpha else None
 
     actor_opt = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
     critic_opt = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
@@ -530,7 +533,9 @@ def main(args):
 
         z_next = encode_obs(wm, obs["image"], obs["proprio"], device)
         r_cur = curiosity_reward(wm, hist_z, hist_a, z_next).cpu().numpy()        # (n_envs,) >= 0
-        if args.normalize_curiosity:    # de-saturate: standardize r_cur by a running mean/std (clip a la RND)
+        if args.raw_curiosity:          # no transform at all: cur_term = lambda_cur * r_cur (raw, unbounded)
+            cur_term = args.lambda_cur * r_cur
+        elif args.normalize_curiosity:  # de-saturate: standardize r_cur by a running mean/std (clip a la RND)
             rms_cur.update(r_cur)
             cur_term = args.lambda_cur * np.clip((r_cur - rms_cur.mean) / rms_cur.std, -5.0, 5.0)
         else:
@@ -602,11 +607,11 @@ def main(args):
         if step >= args.start_steps and buf.total >= args.batch_size:
             per_beta = min(1.0, args.per_beta_start
                            + (1 - args.per_beta_start) * step / max(args.total_steps, 1))
-            alpha = log_alpha.exp()
             for _ in range(args.updates_per_step):
                 b = buf.sample_sac(args.batch_size, args.per_alpha, per_beta)
                 if b is None:
                     break
+                alpha = log_alpha.exp().detach()      # recompute: auto-tuned α can change each update
                 zb = encode_obs(wm, b["px"], b["prop"], device)
                 znb = encode_obs(wm, b["px_n"], b["prop_n"], device)
                 with torch.no_grad():
@@ -623,11 +628,17 @@ def main(args):
                 q1p, q2p = critic(zb, ap)
                 actor_loss = (alpha * logpp - torch.min(q1p, q2p)).mean()
                 actor_opt.zero_grad(); actor_loss.backward(); actor_opt.step()
+                if args.learn_alpha:                  # SAC dual: auto-tune α toward target_entropy
+                    alpha_loss = (-log_alpha * (logpp.detach() + target_entropy)).mean()
+                    alpha_opt.zero_grad(); alpha_loss.backward(); alpha_opt.step()
+                    if args.min_alpha > 0.0:
+                        with torch.no_grad():
+                            log_alpha.clamp_(min=float(np.log(args.min_alpha)))
                 with torch.no_grad():
                     for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
                         pt.mul_(1 - args.tau).add_(args.tau * p)
                 last_zb = zb.detach()
-                last_sac = (float(critic_loss.item()), float(actor_loss.item()))
+                last_sac = (float(critic_loss.item()), float(actor_loss.item()), float((-logpp).mean().item()))
 
         # --- logging ---
         if step % args.log_every == 0:
@@ -660,7 +671,7 @@ def main(args):
                           "wm/identity_baseline": last_wm[2]})
             if last_sac is not None:
                 d.update({"sac/critic_loss": last_sac[0], "sac/actor_loss": last_sac[1],
-                          "sac/alpha": float(log_alpha.exp().item())})
+                          "sac/alpha": float(log_alpha.exp().item()), "sac/policy_entropy": last_sac[2]})
             wlog(d, step)
             with open(out_dir / "metrics.jsonl", "a") as f:    # local metrics record (esp. when --no-wandb)
                 f.write(json.dumps({"step": step, **{k: float(v) for k, v in d.items()}}) + "\n")
@@ -780,9 +791,22 @@ def parse_args():
                         "spread at the r_cur floor) so SAC keeps exploring. Default off = exact README reward.")
     p.add_argument("--cur-norm-momentum", type=float, default=0.999,
                    help="EMA retention for the curiosity running mean/std (only with --normalize-curiosity)")
+    p.add_argument("--raw-curiosity", action="store_true",
+                   help="use the RAW r_cur as the curiosity reward (cur_term = lambda_cur*r_cur): no symlog, "
+                        "no normalization, no clip. Preserves the full per-state spread but keeps the large "
+                        "r_cur DC floor (~240) and is unbounded — pair with a small --lambda-cur (and watch "
+                        "sac/policy_entropy: at this reward scale a fixed --alpha is negligible -> near-greedy "
+                        "policy). Takes precedence over --normalize-curiosity.")
     # SAC (README)
     p.add_argument("--gamma", type=float, default=0.9)
-    p.add_argument("--alpha", type=float, default=0.2, help="fixed entropy temperature")
+    p.add_argument("--alpha", type=float, default=0.2, help="fixed entropy temperature (used when not --learn-alpha)")
+    p.add_argument("--learn-alpha", action="store_true",
+                   help="auto-tune entropy temperature α toward --target-entropy (SAC dual). Default off "
+                        "= fixed --alpha. Keeps the policy from collapsing to deterministic (more exploration).")
+    p.add_argument("--alpha-lr", type=float, default=3e-4, help="learning rate for log α (with --learn-alpha)")
+    p.add_argument("--target-entropy", type=float, default=None,
+                   help="target policy entropy for --learn-alpha (default: -action_dim)")
+    p.add_argument("--min-alpha", type=float, default=0.0, help="floor on α when auto-tuning (0 = no floor)")
     p.add_argument("--tau", type=float, default=0.005, help="Polyak rate")
     p.add_argument("--actor-lr", type=float, default=3e-4)
     p.add_argument("--critic-lr", type=float, default=3e-4)
