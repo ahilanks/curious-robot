@@ -95,6 +95,10 @@ class VectorMujocoEnv:
     def render_overhead(self) -> np.ndarray:
         return np.stack(self._map(lambda e: e.render_overhead()))
 
+    def render_overhead_one(self, idx: int) -> np.ndarray:
+        """Overhead frame for a single env (for cheap training-run snapshots)."""
+        return self.envs[idx].render_overhead()
+
     def close(self) -> None:
         for env in self.envs:
             env.close()
@@ -221,6 +225,11 @@ class SubprocVectorMujocoEnv:
         for w in self._workers:
             w.send("render_overhead")
         return np.stack([w.recv() for w in self._workers])
+
+    def render_overhead_one(self, idx: int) -> np.ndarray:
+        """Overhead frame for a single env (for cheap training-run snapshots)."""
+        self._workers[idx].send("render_overhead")
+        return self._workers[idx].recv()
 
     def close(self) -> None:
         for w in self._workers:

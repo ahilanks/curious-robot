@@ -3,11 +3,13 @@
 
 # Curious Robot
 
-JEPA + SIGReg world model with SAC. Everything is trained from scratch. Uses the Mujoco environment with a SO101 6-DOF arm.
+JEPA + SIGReg world model(reference: https://github.com/lucas-maes/le-wm) with SAC. Everything is trained from scratch. Uses the Mujoco environment with a SO101 6-DOF arm.
 
 ## State encoder
 
 $$z_t=\mathrm{LN}\!\Big[\,\mathrm{MLP}\big(\,\mathrm{MLP}(\mathrm{ViT}(o_t)_{\text{cls}})\ \big\Vert\ \mathrm{MLP}(\mathrm{symlog}(q_t,\dot q_t,u^{\text{app}}_{t-1}))\,\big)\,\Big]\in\mathbb{R}^{256}\quad(192+64)$$
+
+Each $\mathrm{MLP}$ is $\mathrm{Linear}\!\to\!\mathrm{BatchNorm1d}\!\to\!\mathrm{GELU}\!\to\!\mathrm{Linear}$ (BatchNorm on the hidden layer, as in the le-wm reference encoder); the predictor's output projection is likewise BatchNorm1d. Batch-whitening counteracts dimensional collapse / lifts the latent's effective rank, which the per-sample outer $\mathrm{LN}$ alone does not.
 
 ## Dynamics + world-model loss
 

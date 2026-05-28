@@ -61,6 +61,39 @@ def to_norm_pixel(px_uint8, device):
     return (t - IMAGENET_MEAN.to(device).view(shp)) / IMAGENET_STD.to(device).view(shp)
 
 
+class RunningMeanStd:
+    """EMA running mean/std (bias-corrected, like Adam's moments) for normalizing the
+    intrinsic reward. The README scales curiosity with symlog (lambda_cur*log1p(r_cur)),
+    but at the z_dim-driven r_cur floor (~250) symlog sits on its flat tail: it crushes
+    the *per-state spread* (a +/-30 swing in r_cur -> ~+/-0.12 in symlog), so SAC sees a
+    near-constant curiosity term and stops exploring. Standardizing by a running mean/std
+    restores that spread at any scale; EMA (vs infinite-count Welford) tracks the drift as
+    the WM learns and r_cur falls. Opt-in via --normalize-curiosity; default off keeps the
+    exact README reward. update() consumes one (n_envs,) batch per decision step."""
+
+    def __init__(self, momentum=0.999, eps=1e-8):
+        self.m, self.eps = momentum, eps
+        self._mean = 0.0; self._sq = 0.0; self._t = 0
+
+    def update(self, x):
+        x = np.asarray(x, np.float64)
+        self._mean = self.m * self._mean + (1 - self.m) * x.mean()
+        self._sq = self.m * self._sq + (1 - self.m) * (x * x).mean()
+        self._t += 1
+
+    @property
+    def mean(self):
+        c = 1 - self.m ** self._t if self._t else 1.0      # bias correction
+        return self._mean / max(c, self.eps)
+
+    @property
+    def std(self):
+        c = 1 - self.m ** self._t if self._t else 1.0
+        mean = self._mean / max(c, self.eps)
+        var = max(self._sq / max(c, self.eps) - mean * mean, 0.0)
+        return float(np.sqrt(var) + self.eps)
+
+
 # --------------------------------------------------------------------------- SAC
 class Actor(nn.Module):
     def __init__(self, z_dim, a_dim, hidden=256, log_std_range=(-5, 2)):
@@ -447,6 +480,8 @@ def main(args):
               ("r_cur", "r_safe", "cur_contrib", "contacts", "table_contacts",
                "motion", "ret", "frac_block", "frac_table")}
     recent_mse = {k: deque(maxlen=2000) for k in ("mse_block", "mse_table", "mse_none")}
+    rms_cur = RunningMeanStd(momentum=args.cur_norm_momentum)   # curiosity reward normalizer (opt-in)
+    snap = None                 # active env-0 training-snapshot capture window (started at --video-every)
     t0 = time.time()
     last_wm = last_sac = None
     last_zb = None
@@ -474,12 +509,33 @@ def main(args):
             contacts += info["object_contacts"].astype(np.float32)
             table_contacts += info["table_contacts"].astype(np.float32)
             motion += info["object_motion"]
+            if snap is not None:                  # training-run snapshot: env 0, every frame
+                snap["overhead"].append(env.render_overhead_one(0))
+                snap["wrist"].append(obs["image"][0])
         r_safe /= args.action_block      # one r_safe per decision (README: Env(a_t) -> r_safe_t)
+        if snap is not None:                      # close the snapshot window after video_steps decisions
+            snap["left"] -= 1
+            if snap["left"] <= 0:
+                if imageio is not None and run is not None:
+                    sdir = out_dir / "rollouts"; sdir.mkdir(exist_ok=True)
+                    for cam in ("overhead", "wrist"):
+                        try:
+                            vp = sdir / f"train_{cam}_{snap['tag']}.mp4"
+                            imageio.mimsave(vp, snap[cam], fps=args.video_fps)
+                            wlog({f"train/{cam}": wandb.Video(str(vp), format="mp4")}, step)
+                            vp.unlink(missing_ok=True)
+                        except Exception as ex:
+                            print(f"[train-video] failed (non-fatal): {ex}", flush=True)
+                snap = None
 
         z_next = encode_obs(wm, obs["image"], obs["proprio"], device)
         r_cur = curiosity_reward(wm, hist_z, hist_a, z_next).cpu().numpy()        # (n_envs,) >= 0
-        cur_term = args.lambda_cur * np.log1p(r_cur)         # lambda_cur * symlog(r_cur)  (r_cur>=0)
-        reward = r_safe + cur_term                           # README: r = r_safe + lambda_cur*symlog(r_cur)
+        if args.normalize_curiosity:    # de-saturate: standardize r_cur by a running mean/std (clip a la RND)
+            rms_cur.update(r_cur)
+            cur_term = args.lambda_cur * np.clip((r_cur - rms_cur.mean) / rms_cur.std, -5.0, 5.0)
+        else:
+            cur_term = args.lambda_cur * np.log1p(r_cur)     # README default: lambda_cur * symlog(r_cur)  (r_cur>=0)
+        reward = args.safety_weight * r_safe + cur_term      # README: r = r_safe + lambda_cur*symlog(r_cur) (safety_weight=1)
 
         # contact-conditioned curiosity MSE (r_cur = ||zhat-z||^2): is the model more
         # surprised poking a block than scraping the table or moving in free space?
@@ -580,7 +636,7 @@ def main(args):
             d = {"reward/r_cur": np.mean(recent["r_cur"]),
                  "reward/r_safe": safe_m,
                  "reward/cur_contrib": cur_m,                 # lambda_cur * symlog(r_cur)
-                 "reward/safe_cur_ratio": abs(safe_m) / max(abs(cur_m), 1e-6),
+                 "reward/safe_cur_ratio": abs(args.safety_weight * safe_m) / max(abs(cur_m), 1e-6),
                  "reward/total": np.mean(recent["ret"]),
                  "interact/contacts_per_step": np.mean(recent["contacts"]),
                  "interact/table_contacts_per_step": np.mean(recent["table_contacts"]),
@@ -592,6 +648,9 @@ def main(args):
             for key in ("mse_block", "mse_table", "mse_none"):   # curiosity MSE by contact type
                 if recent_mse[key]:
                     d[f"wm/{key}"] = float(np.mean(recent_mse[key]))
+            if args.normalize_curiosity:    # watch de-saturation: running r_cur mean/std
+                d["reward/cur_norm_mean"] = rms_cur.mean
+                d["reward/cur_norm_std"] = rms_cur.std
             if last_zb is not None:
                 z_std, eff_rank, feat_corr = collapse_metrics(last_zb)
                 d.update({"encoder/z_std": z_std, "encoder/eff_rank": eff_rank,
@@ -633,6 +692,8 @@ def main(args):
                         vp.unlink(missing_ok=True)   # in W&B now; keep local disk clean
             except Exception as ex:
                 print(f"[video] failed (non-fatal): {ex}", flush=True)
+            if snap is None:        # also capture an env-0 training-run snapshot over the next decisions
+                snap = {"overhead": [], "wrist": [], "left": args.video_steps, "tag": f"step_{step:07d}"}
 
     # --- final checkpoint ---
     state = {"step": args.total_steps, "wm": wm.state_dict(), "actor": actor.state_dict(),
@@ -651,8 +712,16 @@ def parse_args():
     p = argparse.ArgumentParser(description="Curious Robot: JEPA+SIGReg WM + SAC curiosity on SO-ARM101")
     # schedule / infra
     p.add_argument("--total-steps", type=int, default=200_000)
-    p.add_argument("--start-steps", type=int, default=1000, help="random-action warmup (decision steps)")
-    p.add_argument("--n-envs", type=int, default=8)
+    p.add_argument("--start-steps", type=int, default=200,
+                   help="random-action warmup (decision steps) before WM/SAC updates start. The PER "
+                        "buffer is small (fills in ~30 steps), so 200 fills it many times over while "
+                        "avoiding a long GPU-idle warmup; raise it for more pre-training random data.")
+    p.add_argument("--n-envs", type=int, default=32,
+                   help="parallel envs. CPU/render-bound: more envs = more parallel data per step, "
+                        "NOT a faster fixed-length run (per-step cost grows). Keep BELOW CPU "
+                        "saturation (~cores/4.5) or env renders compete & it slows sharply; 32 suits "
+                        "a ~224-core box (~144 cores), ~48 nears its edge (~216). "
+                        "Run `python src/hw_config.py` for a hardware-specific recommendation.")
     p.add_argument("--env-threads", type=int, default=0,
                    help=">0 steps envs on a thread pool (inproc backend only)")
     p.add_argument("--env-backend", choices=("subproc", "inproc"), default="subproc",
@@ -683,7 +752,11 @@ def parse_args():
     # world model (README; the '?' values below are sweepable, not pinned in README)
     p.add_argument("--history-size", type=int, default=3, help="H_bwd")
     p.add_argument("--h-fwd-start", type=int, default=1)
-    p.add_argument("--h-fwd-max", type=int, default=20)
+    p.add_argument("--h-fwd-max", type=int, default=1,
+                   help="max WM rollout horizon. Default 1 = single-step prediction, NO horizon "
+                        "curriculum (matches the le-wm reference, which trains with num_preds=1). "
+                        "Raise it (e.g. --h-fwd-max 20) to enable the flatline-triggered "
+                        "autoregressive curriculum that grows H_fwd from --h-fwd-start up to this cap.")
     p.add_argument("--gamma-wm", type=float, default=0.95)
     p.add_argument("--sigreg-weight", type=float, default=0.9, help="beta (README '?'; sweep)")
     p.add_argument("--wm-batch-size", type=int, default=128)
@@ -697,6 +770,16 @@ def parse_args():
                    help="curiosity weight; ~15 puts safety:curiosity ~0.5:1 at observed magnitudes "
                         "(|r_safe|~40, symlog(r_cur)~5.6). README '?'; sweep & watch reward/safe_cur_ratio")
     p.add_argument("--safety-delta", type=float, default=0.05, help="delta deadband (README '?'; sweep)")
+    p.add_argument("--safety-weight", type=float, default=1.0,
+                   help="multiplier on r_safe in the reward (r = safety_weight*r_safe + lambda_cur*cur). "
+                        "Default 1.0 = README. Lower it (<1) to de-emphasize the jerk penalty so curiosity "
+                        "can drive more interaction. (delta barely affects firing — this is the real knob.)")
+    p.add_argument("--normalize-curiosity", action="store_true",
+                   help="standardize the curiosity reward by a running (EMA) mean/std instead of "
+                        "lambda_cur*symlog(r_cur). De-saturates curiosity (symlog crushes per-state "
+                        "spread at the r_cur floor) so SAC keeps exploring. Default off = exact README reward.")
+    p.add_argument("--cur-norm-momentum", type=float, default=0.999,
+                   help="EMA retention for the curiosity running mean/std (only with --normalize-curiosity)")
     # SAC (README)
     p.add_argument("--gamma", type=float, default=0.9)
     p.add_argument("--alpha", type=float, default=0.2, help="fixed entropy temperature")

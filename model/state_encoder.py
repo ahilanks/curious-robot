@@ -10,6 +10,12 @@ CLS token is projected to 192 by an MLP head; the proprio branch (`ProprioEncode
 maps symlog(q, qdot, u_prev) to 64. The two are concatenated (192+64) and fused by
 a joint MLP, then LayerNorm'd, giving the 256-d latent.
 
+The projector/fusion MLPs (and the predictor's `pred_proj`) use BatchNorm1d on their
+hidden layer, matching the le-wm reference (`norm_fn=nn.BatchNorm1d`): batch-whitening
+counteracts dimensional collapse / lifts the latent's effective rank in a way the
+per-sample outer LayerNorm does not. BatchNorm runs in train() only during the WM
+update (batch >> 1); inference uses its running stats.
+
 WorldModel is a `lewm.jepa.JEPA` whose encoder is this combined StateEncoder and
 whose predictor/action_encoder/pred_proj come from `lewm.module`. It overrides
 `encode` to read image+proprio; `predict` (predictor + pred_proj) is inherited.
@@ -41,11 +47,14 @@ class StateEncoder(nn.Module):
         super().__init__()
         self.vit = build_vit_tiny(image_size, patch_size)
         cls_dim = self.vit.config.hidden_size  # 192
-        self.visual_head = MLP(cls_dim, 4 * cls_dim, vis_dim)   # MLP(ViT_cls) -> 192
+        # BatchNorm1d in the projector/fusion MLPs (matches the le-wm reference, which sets
+        # norm_fn=nn.BatchNorm1d): batch-whitening fights dimensional collapse / promotes
+        # effective rank in a way per-sample LayerNorm does not.
+        self.visual_head = MLP(cls_dim, 4 * cls_dim, vis_dim, norm_fn=nn.BatchNorm1d)  # MLP(ViT_cls) -> 192
         self.proprio = ProprioEncoder(n_dof, out_dim=prop_dim)  # MLP(symlog(.)) -> 64
         self.out_dim = vis_dim + prop_dim                       # 256
         # Joint fusion MLP over the concatenated visual+proprio features (README's outer MLP).
-        self.fuse = MLP(self.out_dim, 4 * self.out_dim, self.out_dim)
+        self.fuse = MLP(self.out_dim, 4 * self.out_dim, self.out_dim, norm_fn=nn.BatchNorm1d)
         self.norm = nn.LayerNorm(self.out_dim)
 
     def forward(self, image_norm: torch.Tensor, proprio: torch.Tensor) -> torch.Tensor:
@@ -81,7 +90,7 @@ class WorldModel(JEPA):
             depth=depth, heads=heads, dim_head=dim_head, mlp_dim=mlp_dim, dropout=dropout,
         )
         action_encoder = Embedder(input_dim=n_dof * action_block, emb_dim=z_dim)
-        pred_proj = MLP(z_dim, 2048, z_dim)
+        pred_proj = MLP(z_dim, 2048, z_dim, norm_fn=nn.BatchNorm1d)   # BatchNorm like le-wm's pred_proj
         super().__init__(encoder=encoder, predictor=predictor,
                          action_encoder=action_encoder, pred_proj=pred_proj)
         self.z_dim = z_dim
