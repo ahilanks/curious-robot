@@ -434,6 +434,8 @@ def main(args):
     video_on = imageio is not None and args.video_every > 0
     wrist_buf = deque(maxlen=args.video_steps)      # train-video clips (per-env frames, tiled)
     over_buf = deque(maxlen=args.video_steps)
+    probe_px = probe_prop = None                    # fixed diverse probe set for encoder/eff_rank_probe
+    probe_buf = []                                  # collected from early warmup obs, then frozen
 
     def learner_updates(step, h_fwd):
         """SAC + periodic WM gradient steps on buffered (past) data; returns the
@@ -521,10 +523,20 @@ def main(args):
             motion += info["object_motion"]
         r_safe /= args.action_block      # one r_safe per decision (README: Env(a_t) -> r_safe_t)
 
+        # freeze a FIXED diverse probe set (early warmup obs) so encoder/eff_rank_probe
+        # measures encoder health independent of how narrow the policy's behavior gets.
+        if args.probe_size > 0 and probe_px is None:
+            probe_buf.append((obs["image"].copy(), obs["proprio"].copy()))
+            if len(probe_buf) * args.n_envs >= args.probe_size:
+                probe_px = np.concatenate([p for p, _ in probe_buf])[:args.probe_size]
+                probe_prop = np.concatenate([q for _, q in probe_buf])[:args.probe_size]
+                probe_buf = None
+                print(f"[probe] froze {len(probe_px)} obs for encoder/eff_rank_probe", flush=True)
+
         z_next = encode_obs(wm, obs["image"], obs["proprio"], device)
         r_cur = curiosity_reward(wm, hist_z, hist_a, z_next).cpu().numpy()        # (n_envs,) >= 0
         cur_term = args.lambda_cur * np.log1p(r_cur)         # lambda_cur * symlog(r_cur)  (r_cur>=0)
-        reward = r_safe + cur_term                           # README: r = r_safe + lambda_cur*symlog(r_cur)
+        reward = args.lambda_safe * r_safe + cur_term        # r = lambda_safe*r_safe + lambda_cur*symlog(r_cur)
 
         # contact-conditioned curiosity MSE (r_cur = ||zhat-z||^2): is the model more
         # surprised poking a block than scraping the table or moving in free space?
@@ -601,6 +613,10 @@ def main(args):
                 z_std, eff_rank, feat_corr = collapse_metrics(last_zb)
                 d.update({"encoder/z_std": z_std, "encoder/eff_rank": eff_rank,
                           "encoder/feat_corr": feat_corr})
+            if probe_px is not None:                          # encoder health on a FIXED diverse probe set
+                p_std, p_eff, p_corr = collapse_metrics(encode_obs(wm, probe_px, probe_prop, device))
+                d.update({"encoder/eff_rank_probe": p_eff, "encoder/z_std_probe": p_std,
+                          "encoder/feat_corr_probe": p_corr})
             if last_wm is not None:
                 d.update({"wm/pred_loss": last_wm[0], "wm/sigreg": last_wm[1],
                           "wm/identity_baseline": last_wm[2]})
@@ -685,6 +701,9 @@ def parse_args():
     p.add_argument("--video-steps", type=int, default=60,
                    help="frames per train-video clip (window of decision steps before each save)")
     p.add_argument("--video-fps", type=int, default=20)
+    p.add_argument("--probe-size", type=int, default=256,
+                   help="fixed diverse probe-set size for encoder/eff_rank_probe (frozen from early warmup "
+                        "obs; isolates encoder health from behavioral diversity; 0 disables)")
     # action / actuation (README)
     p.add_argument("--action-block", type=int, default=5)
     p.add_argument("--action-max", type=float, default=0.3)
@@ -708,6 +727,8 @@ def parse_args():
     p.add_argument("--flatline-window", type=int, default=200)
     p.add_argument("--flatline-tol", type=float, default=0.03)
     # reward ('?' values; sweepable)
+    p.add_argument("--lambda-safe", type=float, default=1.0,
+                   help="weight on the safety penalty r_safe in the reward (1.0 = README default; 0 ablates safety)")
     p.add_argument("--lambda-cur", type=float, default=15.0,
                    help="curiosity weight; ~15 puts safety:curiosity ~0.5:1 at observed magnitudes "
                         "(|r_safe|~40, symlog(r_cur)~5.6). README '?'; sweep & watch reward/safe_cur_ratio")
