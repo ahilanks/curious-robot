@@ -60,6 +60,9 @@ The remaining README `?` constants (λ_cur, δ) are swept here before being pinn
 | run | β | λ_cur | δ | steps | contacts/step | pred/persist | notes |
 |-----|---|-------|---|-------|---------------|--------------|-------|
 | newarch | 0.3 | 15.0 | 0.05 | 10000 | 0.00 | 0.50 | WM learns (pred/persist 0.50, h_fwd→11, eff_rank 4.4→7.8) but policy never contacts blocks; curiosity harvested from non-contact motion |
+| nosafe | 0.3 | 15.0 | 0.05 | 5000 | 0.175 | 0.58 | **λ_safe=0** (safety ablated) + sum-curiosity, fixed α=0.2 → **interacts** (frac_block 0.066); stopped at 5k. W&B `5n2ir1vl` |
+| meancur | 0.3 | 1.0 | 0.05 | 10000 | ~0.04 | 0.32 | λ_safe=0, **r_cur=mean** (λ_cur=1), fixed α=0.2 → bursty/undirected (entropy dominates curiosity **9.5:1** measured); encoder healthy on clean probe (eff_rank_probe 5.6→8.8). W&B `v0k0mvxz` |
+| autoalpha | 0.3 | 1.0 | 0.05 | 10000 | 0.005 | 0.39 | λ_safe=0, mean-curiosity, **learnable α** (target −\|A\|=−30) → α decayed 0.20→~0.015, entropy 20→6, **re-froze**; standard target miscalibrated for the 30-dim tanh action. W&B `kowlqmq1` |
 
 ## Ablations
 
@@ -98,3 +101,27 @@ _(add a dated entry per run)_
   from blocks → exploration-toward-objects is now the open problem (reward shaping / λ_cur, not WM
   arch). The modest `eff_rank`≈8 likely reflects the low-dim experience (arm-only, blocks static)
   more than encoder health — a fixed diverse probe-set eff_rank would disentangle the two.
+- 2026-05-29 — **λ_safe ablation + curiosity-normalization + auto-α arc** (3 runs; branch
+  `perf/faster-runs`, PR #2 — also landed async actor-learner, train videos, 1-step WM, and a
+  fixed-probe `eff_rank_probe` on an HF-cached uniform-pose probe `probe_v1`).
+  • **`nosafe`** (λ_safe=0, sum-curiosity λ_cur=15, α=0.2; 5k, W&B `5n2ir1vl`) — **removing the
+    safety penalty unfroze interaction**: contacts/step 0→**0.175** (newarch was 0), frac_block
+    0.066. Confirms the safety term was suppressing block contact. (Its `eff_rank_probe` 11.7→3.0
+    "collapse" was a weak warmup-probe artifact — see meancur.)
+  • **`meancur`** (λ_safe=0, **r_cur=per-dim mean**, λ_cur=1, α=0.2; 10k, W&B `v0k0mvxz`) — switched
+    r_cur to mean so symlog stays in its discriminative region (the d_z-summed version saturated
+    symlog's flat tail). Encoder **healthy** on the clean probe (eff_rank_probe 5.6→8.8, feat_corr
+    0.33→0.24) — so nosafe's "collapse" was the probe, not the encoder. But interaction went
+    **bursty/undirected**: shrinking the reward ~150× left the fixed-α entropy bonus dominating
+    **9.5:1** (measured: −α·logπ≈3.6 vs cur_contrib≈0.38).
+  • **`autoalpha`** (λ_safe=0, mean-curiosity, **learnable α**, target −\|A\|=−30; 10k, W&B
+    `kowlqmq1`) — standard SAC auto-entropy **fails here**: α decayed monotonically 0.20→~0.015,
+    entropy collapsed 20→6, interaction **re-froze** (contacts 0.005). The −30 target sits far below
+    the 30-dim tanh policy's natural entropy (+6..+20), so the tuner just kills α; with exploration
+    dead the greedy policy can't discover contact. WM/encoder healthy throughout (pred/identity
+    0.39, eff_rank_probe 7.0).
+  **Cross-run lesson:** directed interaction needs curiosity to **dominate the entropy bonus while
+  exploration stays alive**. `nosafe` had it (curiosity ~74 ≫ entropy ~3.6, fixed α keeping entropy
+  ~18); mean+λ_cur=1 and auto-α both broke it. **Next:** mean-curiosity with **λ_cur≈15–25, fixed
+  α=0.2** (restore nosafe-style curiosity dominance + keep entropy alive for exploration). Code
+  defaults now: λ_safe=0, r_cur=mean, λ_cur=1, h_fwd pinned 1 (see README).
