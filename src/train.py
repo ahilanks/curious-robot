@@ -19,6 +19,7 @@ os.environ.setdefault("MUJOCO_GL", "glfw" if platform.system() == "Darwin" else 
 
 import argparse
 import json
+import signal
 import sys
 import time
 from collections import deque
@@ -48,6 +49,14 @@ except ImportError:
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+
+_STOP_REQUESTED = {"flag": False}   # set by SIGTERM/SIGINT -> the training loop saves a resume bundle and exits
+
+
+def _request_stop(signum, _frame):
+    _STOP_REQUESTED["flag"] = True
+    print(f"\n[resume] caught signal {signum}; saving resume bundle (state + buffer) then stopping", flush=True)
 
 
 def to_norm_pixel(px_uint8, device):
@@ -114,6 +123,24 @@ class ReplayBuffer:
         self.prio = np.zeros(s, np.float64)
         self.head = np.zeros(n_envs, np.int64)
         self.count = np.zeros(n_envs, np.int64)
+
+    _ARRAYS = ("pixels", "proprio", "action", "r", "d", "is_start", "prio", "head", "count")
+
+    def state_dict(self):
+        return {k: getattr(self, k) for k in self._ARRAYS}
+
+    def load_state_dict(self, sd):
+        old_C = int(sd["pixels"].shape[1])
+        n = min(self.C, old_C)                         # copy what fits: exact (==) or extend (>) or shrink (<)
+        for k in ("pixels", "proprio", "action", "r", "d", "is_start", "prio"):
+            getattr(self, k)[:, :n] = sd[k][:, :n]
+        if self.C == old_C:                            # exact resume: preserve ring head/count
+            self.count[:] = sd["count"]; self.head[:] = sd["head"]
+        else:                                          # cap changed: treat copied data as a linear prefix
+            self.count[:] = np.minimum(sd["count"], n)
+            self.head[:] = self.count % self.C
+            if self.C < old_C:
+                print(f"[resume] buffer cap shrank {old_C}->{self.C}; kept first {n}/env (approx)", flush=True)
 
     def add(self, pixels, proprio, action, r, d, is_start, prio):
         for e in range(self.n_envs):
@@ -309,6 +336,56 @@ def save_and_upload(state, out_dir, step, repo_id, run_name, enable_hf, keep_loc
     return path
 
 
+def save_resume(out_dir, repo_id, run_name, enable_hf, *, step, h_fwd, updates_at_stage,
+                pred_hist, wm, actor, critic, critic_tgt, log_alpha,
+                wm_opt, actor_opt, critic_opt, alpha_opt, buf, args):
+    """Save a full resume bundle so a run can be continued with --resume: models +
+    optimizers + curriculum/scalar state in resume_state.pt, and the replay buffer in a
+    compressed resume_buffer.npz (it's large). Both uploaded to HF under <run_name>/."""
+    out_dir = Path(out_dir)
+    state = {"step": int(step), "h_fwd": int(h_fwd), "updates_at_stage": int(updates_at_stage),
+             "pred_hist": list(pred_hist),
+             "wm": wm.state_dict(), "actor": actor.state_dict(), "critic": critic.state_dict(),
+             "critic_tgt": critic_tgt.state_dict(), "log_alpha": log_alpha.detach().cpu(),
+             "wm_opt": wm_opt.state_dict(), "actor_opt": actor_opt.state_dict(),
+             "critic_opt": critic_opt.state_dict(),
+             "alpha_opt": alpha_opt.state_dict() if alpha_opt is not None else None,
+             "args": vars(args)}
+    spath, bpath = out_dir / "resume_state.pt", out_dir / "resume_buffer.npz"
+    torch.save(state, spath)
+    np.savez_compressed(bpath, **buf.state_dict())
+    print(f"[resume] saved state + buffer ({bpath.stat().st_size/1e6:.0f} MB, {buf.total} transitions) "
+          f"at step {step}", flush=True)
+    if enable_hf and repo_id and os.environ.get("HF_TOKEN"):
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi(token=os.environ["HF_TOKEN"])
+            api.create_repo(repo_id, repo_type="model", exist_ok=True)
+            for p in (spath, bpath):
+                api.upload_file(path_or_fileobj=str(p), repo_id=repo_id,
+                                path_in_repo=f"{run_name}/{p.name}")
+            print(f"[resume] uploaded -> {repo_id}/{run_name}/{{resume_state.pt,resume_buffer.npz}}", flush=True)
+        except Exception as ex:
+            print(f"[resume] HF upload failed (kept local): {ex}", flush=True)
+
+
+def load_resume(out_dir, repo_id, run_name, enable_hf):
+    """Load a resume bundle, preferring HF then local. Returns (state_dict, buffer_dict) or None."""
+    out_dir = Path(out_dir)
+    spath, bpath = out_dir / "resume_state.pt", out_dir / "resume_buffer.npz"
+    if enable_hf and repo_id and os.environ.get("HF_TOKEN"):
+        try:
+            from huggingface_hub import hf_hub_download
+            tok = os.environ["HF_TOKEN"]
+            spath = Path(hf_hub_download(repo_id, f"{run_name}/resume_state.pt", repo_type="model", token=tok))
+            bpath = Path(hf_hub_download(repo_id, f"{run_name}/resume_buffer.npz", repo_type="model", token=tok))
+        except Exception as ex:
+            print(f"[resume] HF download failed ({ex}); trying local", flush=True)
+    if not (spath.exists() and bpath.exists()):
+        return None
+    return torch.load(spath, map_location="cpu"), dict(np.load(bpath))
+
+
 def resolve_ckpt(ckpt=None, name="baseline", step=None, hf_repo=None):
     """Return a local checkpoint path: the explicit `ckpt` if given, else download
     <name>/ckpt_<step>.pt (or the latest step for that run) from the HF Hub
@@ -438,6 +515,35 @@ def main(args):
     t0 = time.time()
     last_wm = last_sac = None
     last_zb = None
+
+    # --- resume: save a bundle (models+optimizers+curriculum+replay buffer) on SIGTERM/SIGINT or
+    #     normal completion; --resume reloads it (from HF, else local) and continues. ---
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
+    start_step = 0
+    if args.resume:
+        rb = load_resume(out_dir, args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"), run_name, not args.no_hf)
+        if rb is None:
+            print("[resume] no bundle found -> starting fresh", flush=True)
+        else:
+            st, bufd = rb
+            wm.load_state_dict(st["wm"]); actor.load_state_dict(st["actor"])
+            critic.load_state_dict(st["critic"]); critic_tgt.load_state_dict(st["critic_tgt"])
+            with torch.no_grad():
+                log_alpha.copy_(st["log_alpha"].to(device))
+            wm_opt.load_state_dict(st["wm_opt"]); actor_opt.load_state_dict(st["actor_opt"])
+            critic_opt.load_state_dict(st["critic_opt"])
+            if alpha_opt is not None and st.get("alpha_opt") is not None:
+                alpha_opt.load_state_dict(st["alpha_opt"])
+            buf.load_state_dict(bufd)
+            z = encode_obs(wm, obs["image"], obs["proprio"], device)   # re-encode obs with the resumed weights
+            hist_z = z.unsqueeze(0).repeat(H, 1, 1)
+            h_fwd = int(st["h_fwd"]); updates_at_stage = int(st["updates_at_stage"])
+            pred_hist = deque(st["pred_hist"], maxlen=args.flatline_window)
+            start_step = int(st["step"]) + 1
+            print(f"[resume] continuing from step {start_step} (h_fwd={h_fwd}, "
+                  f"buffer {buf.total} transitions)", flush=True)
+
     video_on = imageio is not None and args.video_every > 0
     wrist_buf = deque(maxlen=args.video_steps)      # train-video clips (per-env frames, tiled)
     over_buf = deque(maxlen=args.video_steps)
@@ -512,7 +618,14 @@ def main(args):
                 last_sac = (float(critic_loss.item()), float(actor_loss.item()), float(logpp.mean().item()))
         return h_fwd
 
-    for step in range(args.total_steps):
+    for step in range(start_step, args.total_steps):
+        if _STOP_REQUESTED["flag"]:                              # SIGTERM/SIGINT -> save resume bundle and stop
+            save_resume(out_dir, args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"), run_name,
+                        not args.no_hf, step=step, h_fwd=h_fwd, updates_at_stage=updates_at_stage,
+                        pred_hist=pred_hist, wm=wm, actor=actor, critic=critic, critic_tgt=critic_tgt,
+                        log_alpha=log_alpha, wm_opt=wm_opt, actor_opt=actor_opt, critic_opt=critic_opt,
+                        alpha_opt=alpha_opt, buf=buf, args=args)
+            break
         cur_px, cur_prop = obs["image"], obs["proprio"]          # o_t (before acting)
 
         # --- act ---
@@ -685,6 +798,12 @@ def main(args):
     save_and_upload(state, out_dir, args.total_steps,
                     args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
                     run_name, not args.no_hf, args.keep_local_ckpts)
+    if not _STOP_REQUESTED["flag"]:    # normal completion: also save a resume bundle so --resume can extend the run
+        save_resume(out_dir, args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"), run_name, not args.no_hf,
+                    step=args.total_steps - 1, h_fwd=h_fwd, updates_at_stage=updates_at_stage,
+                    pred_hist=pred_hist, wm=wm, actor=actor, critic=critic, critic_tgt=critic_tgt,
+                    log_alpha=log_alpha, wm_opt=wm_opt, actor_opt=actor_opt, critic_opt=critic_opt,
+                    alpha_opt=alpha_opt, buf=buf, args=args)
     env.close()
     if run is not None:
         run.finish()
@@ -780,6 +899,9 @@ def parse_args():
     # logging backends (keys from .env)
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--wandb-project", default=None)
+    p.add_argument("--resume", action="store_true",
+                   help="resume from the run's saved bundle (models+optimizers+replay buffer) on HF (else "
+                        "local); bundles are written on SIGTERM/SIGINT (kill/pause) and on normal completion")
     p.add_argument("--no-hf", action="store_true", help="disable HF checkpoint upload")
     p.add_argument("--hf-repo", default=None, help="HF repo id (else $HF_UPLOAD_REPO_ID)")
     return p.parse_args()
