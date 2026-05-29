@@ -34,9 +34,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from lewm.module import SIGReg                       # noqa: E402
 from model.state_encoder import WorldModel           # noqa: E402
-from env.parallel_env import (VectorMujocoEnv,       # noqa: E402
-                              SubprocVectorMujocoEnv, SubprocSingleEnv)
-from env.mujoco_env import MujocoSO101Env            # noqa: E402
+from env.parallel_env import VectorMujocoEnv, SubprocVectorMujocoEnv   # noqa: E402
+from src.probe import load_probe_hf                  # noqa: E402
 
 try:
     import wandb
@@ -216,12 +215,14 @@ def encode_obs(wm, px_uint8, proprio_np, device):
 
 @torch.no_grad()
 def curiosity_reward(wm, hist_z, hist_a, z_next):
-    """r_cur = ||f(z_{t-H+1:t}, a_t)[-1] - z_{t+1}||^2, per env. hist_z/hist_a are
-    (H, B, .) tensors; returns (B,) squared L2 prediction error."""
+    """r_cur = mean_d (f(z_{t-H+1:t}, a_t)[-1] - z_{t+1})^2, per env: the PER-DIM MEAN
+    squared 1-step prediction error (same normalization as the WM loss). Keeps r_cur
+    O(0.1-1) so symlog operates in its sensitive region (not the saturated tail of the
+    d_z-summed version) -> a more discriminative curiosity reward. Returns (B,)."""
     z_ctx = hist_z.transpose(0, 1)                       # (B, H, D)
     a_emb = wm.action_encoder(hist_a.transpose(0, 1))    # (B, H, A_emb)
     pred = wm.predict(z_ctx, a_emb)[:, -1]               # (B, D)
-    return (pred - z_next).pow(2).sum(-1)
+    return (pred - z_next).pow(2).mean(-1)
 
 
 def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device):
@@ -330,31 +331,16 @@ def resolve_ckpt(ckpt=None, name="baseline", step=None, hf_repo=None):
     return hf_hub_download(repo_id=repo, filename=target, token=token)
 
 
-@torch.no_grad()
-def record_rollout(actor, wm, eval_env, action_block, n_dof, device, out_dir, tag, n_steps, fps):
-    """Policy rollout in eval_env, written as TWO videos: the overhead cam (what we
-    watch) and the wrist cam (what the policy actually sees). Returns {cam: path}
-    for whatever got written ({} if imageio is unavailable)."""
-    if imageio is None:
-        return {}
-    obs = eval_env.reset()
-    over = [eval_env.render_overhead()]
-    wrist = [obs["image"]]
-    for _ in range(n_steps):
-        z = encode_obs(wm, obs["image"][None], obs["proprio"][None], device)
-        a, _, _ = actor.sample(z)
-        a = a.squeeze(0).cpu().numpy().reshape(action_block, n_dof)
-        for k in range(action_block):
-            obs, _ = eval_env.step(a[k])
-            over.append(eval_env.render_overhead())
-            wrist.append(obs["image"])
-    out_dir = Path(out_dir)
-    paths = {}
-    for name, frames in (("overhead", over), ("wrist", wrist)):
-        p = out_dir / f"{name}_{tag}.mp4"
-        imageio.mimsave(p, frames, fps=fps)
-        paths[name] = p
-    return paths
+def tile_frames(imgs):
+    """Tile (n_envs, H, W, 3) per-env camera frames into one (rows*H, cols*W, 3) grid,
+    so a single train-video clip shows all parallel envs at once."""
+    n, H, W, C = imgs.shape
+    cols = int(np.ceil(np.sqrt(n))); rows = int(np.ceil(n / cols))
+    grid = np.zeros((rows * H, cols * W, C), imgs.dtype)
+    for i in range(n):
+        r, c = divmod(i, cols)
+        grid[r * H:(r + 1) * H, c * W:(c + 1) * W] = imgs[i]
+    return grid
 
 
 # -------------------------------------------------------------------------- main
@@ -375,9 +361,6 @@ def main(args):
                  action_max=args.action_max, dq_max=args.dq_max,
                  safety_delta=args.safety_delta, seed=args.seed,
                  threads=args.env_threads)
-    EvalEnv = SubprocSingleEnv if args.env_backend == "subproc" else MujocoSO101Env
-    eval_env = EvalEnv(action_max=args.action_max, dq_max=args.dq_max,
-                       safety_delta=args.safety_delta, seed=args.seed + 9999)
     n_dof = env.n_dof
     a_dim = n_dof * args.action_block
     prop_dim = 3 * n_dof
@@ -385,10 +368,11 @@ def main(args):
 
     wm = WorldModel(n_dof=n_dof, action_block=args.action_block,
                     history_size=H, dropout=args.wm_dropout).to(device)
-    try:  # bound WM-update activation memory so the H_fwd curriculum can grow
-        wm.encoder.vit.gradient_checkpointing_enable()
-    except Exception as ex:
-        print(f"[wm] grad checkpoint not enabled: {ex}", flush=True)
+    if args.wm_grad_checkpoint:  # off by default: ViT-tiny encode activations are sub-GB vs 80GB free,
+        try:                     # so recompute-on-backward is pure slowdown here (the H_fwd rollout is in latent space)
+            wm.encoder.vit.gradient_checkpointing_enable()
+        except Exception as ex:
+            print(f"[wm] grad checkpoint not enabled: {ex}", flush=True)
     wm.eval()                                  # train() only inside wm_update
     sigreg = SIGReg(knots=17, num_proj=1024).to(device)
     z_dim = wm.z_dim
@@ -450,6 +434,76 @@ def main(args):
     t0 = time.time()
     last_wm = last_sac = None
     last_zb = None
+    video_on = imageio is not None and args.video_every > 0
+    wrist_buf = deque(maxlen=args.video_steps)      # train-video clips (per-env frames, tiled)
+    over_buf = deque(maxlen=args.video_steps)
+    probe_px = probe_prop = None                    # fixed diverse probe set for encoder/eff_rank_probe
+    probe_buf = []                                  # warmup-rollout fallback if the HF probe is unavailable
+    if args.probe_size > 0:                         # prefer the canonical uniform-pose probe cached on HF
+        loaded = (load_probe_hf(args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"), args.probe_id)
+                  if not args.no_hf else None)
+        if loaded is not None:
+            probe_px, probe_prop = loaded[0][:args.probe_size], loaded[1][:args.probe_size]
+            print(f"[probe] loaded {len(probe_px)} uniform-pose obs from HF ({args.probe_id})", flush=True)
+        else:
+            print(f"[probe] HF probe '{args.probe_id}' unavailable; falling back to warmup-rollout probe",
+                  flush=True)
+
+    def learner_updates(step, h_fwd):
+        """SAC + periodic WM gradient steps on buffered (past) data; returns the
+        possibly-bumped h_fwd. Called between env.step_block_async/step_block_wait so
+        these GPU updates overlap the env workers rendering the next decision. Update
+        count and schedule are identical to the serial loop; they just see the buffer
+        minus the single in-flight transition (added after wait) -- negligible off-policy."""
+        nonlocal last_wm, last_sac, last_zb, updates_at_stage
+        # --- world-model co-training: autoregressive MSE rollout + beta*SIGReg ---
+        if step >= args.start_steps and step % args.wm_update_every == 0:
+            batch = buf.sample_wm(args.wm_batch_size, H + h_fwd)
+            if batch is not None:
+                wm.train()
+                last_wm = wm_update(wm, sigreg, wm_opt, batch, H, h_fwd,
+                                    args.gamma_wm, args.sigreg_weight, device)
+                wm.eval()
+                pred_hist.append(last_wm[0]); updates_at_stage += 1
+                # curriculum: bump H_fwd when pred loss flatlines over the last window
+                if (h_fwd < args.h_fwd_max and len(pred_hist) == pred_hist.maxlen
+                        and updates_at_stage >= pred_hist.maxlen):
+                    arr = np.asarray(pred_hist); half = len(arr) // 2
+                    older, newer = arr[:half].mean(), arr[half:].mean()
+                    if abs((older - newer) / max(abs(older), 1e-9)) < args.flatline_tol:
+                        h_fwd += 1; updates_at_stage = 0; pred_hist.clear()
+                        print(f"[curriculum] step={step} H_fwd -> {h_fwd}", flush=True)
+        # --- SAC updates (PER; encoder is frozen w.r.t. SAC, z encoded under no_grad) ---
+        if step >= args.start_steps and buf.total >= args.batch_size:
+            per_beta = min(1.0, args.per_beta_start
+                           + (1 - args.per_beta_start) * step / max(args.total_steps, 1))
+            alpha = log_alpha.exp()
+            for _ in range(args.updates_per_step):
+                b = buf.sample_sac(args.batch_size, args.per_alpha, per_beta)
+                if b is None:
+                    break
+                zb = encode_obs(wm, b["px"], b["prop"], device)
+                znb = encode_obs(wm, b["px_n"], b["prop_n"], device)
+                with torch.no_grad():
+                    an, logpn, _ = actor.sample(znb)
+                    q1n, q2n = critic_tgt(znb, an)
+                    y = b["r"] + (1 - b["d"]) * args.gamma * (torch.min(q1n, q2n) - alpha * logpn)
+                q1, q2 = critic(zb, b["a"])
+                critic_loss = (b["w"] * ((q1 - y).pow(2) + (q2 - y).pow(2))).mean()
+                critic_opt.zero_grad(); critic_loss.backward(); critic_opt.step()
+                if args.per_priority == "td":   # ablation: replace curiosity priority with |TD error|
+                    td = (0.5 * (q1 + q2) - y).abs().detach().squeeze(1).cpu().numpy()
+                    buf.update_priorities(b["e"], b["i"], td)
+                ap, logpp, _ = actor.sample(zb)
+                q1p, q2p = critic(zb, ap)
+                actor_loss = (alpha * logpp - torch.min(q1p, q2p)).mean()
+                actor_opt.zero_grad(); actor_loss.backward(); actor_opt.step()
+                with torch.no_grad():
+                    for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
+                        pt.mul_(1 - args.tau).add_(args.tau * p)
+                last_zb = zb.detach()
+                last_sac = (float(critic_loss.item()), float(actor_loss.item()))
+        return h_fwd
 
     for step in range(args.total_steps):
         cur_px, cur_prop = obs["image"], obs["proprio"]          # o_t (before acting)
@@ -463,23 +517,38 @@ def main(args):
         hist_a = torch.cat([hist_a[1:], a.unsqueeze(0)], 0)
         a_env = a.detach().cpu().numpy().reshape(args.n_envs, args.action_block, n_dof)
 
-        # --- action_block env steps; accumulate safety reward + interaction stats ---
+        # --- async actor-learner: launch the env rollout for this decision, then run
+        #     the GPU updates on buffered data WHILE the workers render -> overlap CPU/GPU ---
+        env.step_block_async(a_env)
+        h_fwd = learner_updates(step, h_fwd)
+        obs, sub_infos = env.step_block_wait()
+
+        # --- accumulate safety reward + interaction stats over the action_block ---
         r_safe = np.zeros(args.n_envs, np.float32)
         contacts = np.zeros(args.n_envs, np.float32)
         table_contacts = np.zeros(args.n_envs, np.float32)
         motion = np.zeros(args.n_envs, np.float32)
-        for k in range(args.action_block):
-            obs, info = env.step(a_env[:, k])
+        for info in sub_infos:
             r_safe += info["safety_reward"]
             contacts += info["object_contacts"].astype(np.float32)
             table_contacts += info["table_contacts"].astype(np.float32)
             motion += info["object_motion"]
         r_safe /= args.action_block      # one r_safe per decision (README: Env(a_t) -> r_safe_t)
 
+        # freeze a FIXED diverse probe set (early warmup obs) so encoder/eff_rank_probe
+        # measures encoder health independent of how narrow the policy's behavior gets.
+        if args.probe_size > 0 and probe_px is None:
+            probe_buf.append((obs["image"].copy(), obs["proprio"].copy()))
+            if len(probe_buf) * args.n_envs >= args.probe_size:
+                probe_px = np.concatenate([p for p, _ in probe_buf])[:args.probe_size]
+                probe_prop = np.concatenate([q for _, q in probe_buf])[:args.probe_size]
+                probe_buf = None
+                print(f"[probe] froze {len(probe_px)} obs for encoder/eff_rank_probe", flush=True)
+
         z_next = encode_obs(wm, obs["image"], obs["proprio"], device)
         r_cur = curiosity_reward(wm, hist_z, hist_a, z_next).cpu().numpy()        # (n_envs,) >= 0
         cur_term = args.lambda_cur * np.log1p(r_cur)         # lambda_cur * symlog(r_cur)  (r_cur>=0)
-        reward = r_safe + cur_term                           # README: r = r_safe + lambda_cur*symlog(r_cur)
+        reward = args.lambda_safe * r_safe + cur_term        # r = lambda_safe*r_safe + lambda_cur*symlog(r_cur)
 
         # contact-conditioned curiosity MSE (r_cur = ||zhat-z||^2): is the model more
         # surprised poking a block than scraping the table or moving in free space?
@@ -524,54 +593,14 @@ def main(args):
             ep_len[done_envs] = 0
             ep_ret[done_envs] = 0.0
 
-        # --- world-model co-training: autoregressive MSE rollout + beta*SIGReg ---
-        if step >= args.start_steps and step % args.wm_update_every == 0:
-            batch = buf.sample_wm(args.wm_batch_size, H + h_fwd)
-            if batch is not None:
-                wm.train()
-                last_wm = wm_update(wm, sigreg, wm_opt, batch, H, h_fwd,
-                                    args.gamma_wm, args.sigreg_weight, device)
-                wm.eval()
-                pred_hist.append(last_wm[0]); updates_at_stage += 1
-                # curriculum: bump H_fwd when pred loss flatlines over the last window
-                if (h_fwd < args.h_fwd_max and len(pred_hist) == pred_hist.maxlen
-                        and updates_at_stage >= pred_hist.maxlen):
-                    arr = np.asarray(pred_hist); half = len(arr) // 2
-                    older, newer = arr[:half].mean(), arr[half:].mean()
-                    if abs((older - newer) / max(abs(older), 1e-9)) < args.flatline_tol:
-                        h_fwd += 1; updates_at_stage = 0; pred_hist.clear()
-                        print(f"[curriculum] step={step} H_fwd -> {h_fwd}", flush=True)
-
-        # --- SAC updates (PER; encoder is frozen w.r.t. SAC, z encoded under no_grad) ---
-        if step >= args.start_steps and buf.total >= args.batch_size:
-            per_beta = min(1.0, args.per_beta_start
-                           + (1 - args.per_beta_start) * step / max(args.total_steps, 1))
-            alpha = log_alpha.exp()
-            for _ in range(args.updates_per_step):
-                b = buf.sample_sac(args.batch_size, args.per_alpha, per_beta)
-                if b is None:
-                    break
-                zb = encode_obs(wm, b["px"], b["prop"], device)
-                znb = encode_obs(wm, b["px_n"], b["prop_n"], device)
-                with torch.no_grad():
-                    an, logpn, _ = actor.sample(znb)
-                    q1n, q2n = critic_tgt(znb, an)
-                    y = b["r"] + (1 - b["d"]) * args.gamma * (torch.min(q1n, q2n) - alpha * logpn)
-                q1, q2 = critic(zb, b["a"])
-                critic_loss = (b["w"] * ((q1 - y).pow(2) + (q2 - y).pow(2))).mean()
-                critic_opt.zero_grad(); critic_loss.backward(); critic_opt.step()
-                if args.per_priority == "td":   # ablation: replace curiosity priority with |TD error|
-                    td = (0.5 * (q1 + q2) - y).abs().detach().squeeze(1).cpu().numpy()
-                    buf.update_priorities(b["e"], b["i"], td)
-                ap, logpp, _ = actor.sample(zb)
-                q1p, q2p = critic(zb, ap)
-                actor_loss = (alpha * logpp - torch.min(q1p, q2p)).mean()
-                actor_opt.zero_grad(); actor_loss.backward(); actor_opt.step()
-                with torch.no_grad():
-                    for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
-                        pt.mul_(1 - args.tau).add_(args.tau * p)
-                last_zb = zb.detach()
-                last_sac = (float(critic_loss.item()), float(actor_loss.item()))
+        # --- train videos: buffer per-env frames in the window before each save.
+        #     wrist (what the policy sees) is free (already rendered as the obs);
+        #     overhead is rendered from the training envs only inside the window
+        #     (parallel across workers) -> ~video_steps renders per video_every. ---
+        if video_on and 0 < step % args.video_every \
+                and step % args.video_every >= args.video_every - args.video_steps:
+            wrist_buf.append(tile_frames(obs["image"]))
+            over_buf.append(tile_frames(env.render_overhead()))
 
         # --- logging ---
         if step % args.log_every == 0:
@@ -596,6 +625,10 @@ def main(args):
                 z_std, eff_rank, feat_corr = collapse_metrics(last_zb)
                 d.update({"encoder/z_std": z_std, "encoder/eff_rank": eff_rank,
                           "encoder/feat_corr": feat_corr})
+            if probe_px is not None:                          # encoder health on a FIXED diverse probe set
+                p_std, p_eff, p_corr = collapse_metrics(encode_obs(wm, probe_px, probe_prop, device))
+                d.update({"encoder/eff_rank_probe": p_eff, "encoder/z_std_probe": p_std,
+                          "encoder/feat_corr_probe": p_corr})
             if last_wm is not None:
                 d.update({"wm/pred_loss": last_wm[0], "wm/sigreg": last_wm[1],
                           "wm/identity_baseline": last_wm[2]})
@@ -621,18 +654,21 @@ def main(args):
                             args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
                             run_name, not args.no_hf, args.keep_local_ckpts)
 
-        # --- periodic policy rollout videos (overhead + wrist cams) ---
-        if args.video_every > 0 and step > 0 and step % args.video_every == 0:
+        # --- train videos: save the buffered wrist + overhead clips (every video_every) ---
+        if video_on and step > 0 and step % args.video_every == 0:
             roll_dir = out_dir / "rollouts"; roll_dir.mkdir(exist_ok=True)
-            try:
-                paths = record_rollout(actor, wm, eval_env, args.action_block, n_dof, device,
-                                       roll_dir, f"step_{step:07d}", args.video_steps, args.video_fps)
-                for cam, vp in paths.items():
+            for tag, frames in (("wrist", wrist_buf), ("overhead", over_buf)):
+                if not frames:
+                    continue
+                vp = roll_dir / f"train_{tag}_{step:07d}.mp4"
+                try:
+                    imageio.mimsave(vp, list(frames), fps=args.video_fps)
                     if run is not None:
-                        wlog({f"rollout/{cam}": wandb.Video(str(vp), format="mp4")}, step)
+                        wlog({f"train/{tag}": wandb.Video(str(vp), format="mp4")}, step)
                         vp.unlink(missing_ok=True)   # in W&B now; keep local disk clean
-            except Exception as ex:
-                print(f"[video] failed (non-fatal): {ex}", flush=True)
+                except Exception as ex:
+                    print(f"[video] {tag} failed (non-fatal): {ex}", flush=True)
+            wrist_buf.clear(); over_buf.clear()
 
     # --- final checkpoint ---
     state = {"step": args.total_steps, "wm": wm.state_dict(), "actor": actor.state_dict(),
@@ -641,7 +677,7 @@ def main(args):
     save_and_upload(state, out_dir, args.total_steps,
                     args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
                     run_name, not args.no_hf, args.keep_local_ckpts)
-    env.close(); eval_env.close()
+    env.close()
     if run is not None:
         run.finish()
     print("[done]", flush=True)
@@ -672,10 +708,17 @@ def parse_args():
                    help="HF-upload-then-clear-disk period (decision steps)")
     p.add_argument("--keep-local-ckpts", action="store_true",
                    help="keep the local .pt after a successful upload (default: delete to bound disk)")
-    p.add_argument("--video-every", type=int, default=500,
-                   help="overhead+wrist rollout video period (decision steps)")
-    p.add_argument("--video-steps", type=int, default=60)
+    p.add_argument("--video-every", type=int, default=1000,
+                   help="train-video period (decision steps): save a wrist + overhead clip every N; 0 disables")
+    p.add_argument("--video-steps", type=int, default=60,
+                   help="frames per train-video clip (window of decision steps before each save)")
     p.add_argument("--video-fps", type=int, default=20)
+    p.add_argument("--probe-size", type=int, default=256,
+                   help="size of the fixed probe set for encoder/eff_rank_probe (isolates encoder health "
+                        "from behavioral diversity); 0 disables")
+    p.add_argument("--probe-id", default="probe_v1",
+                   help="HF probe artifact id (probe/<id>.npz): canonical uniform-pose probe; "
+                        "falls back to a warmup-rollout probe if unavailable")
     # action / actuation (README)
     p.add_argument("--action-block", type=int, default=5)
     p.add_argument("--action-max", type=float, default=0.3)
@@ -683,7 +726,9 @@ def parse_args():
     # world model (README; the '?' values below are sweepable, not pinned in README)
     p.add_argument("--history-size", type=int, default=3, help="H_bwd")
     p.add_argument("--h-fwd-start", type=int, default=1)
-    p.add_argument("--h-fwd-max", type=int, default=20)
+    p.add_argument("--h-fwd-max", type=int, default=1,
+                   help="max forward rollout horizon; ==start (1) pins the WM to 1-step-ahead "
+                        "prediction and disables the H_fwd curriculum")
     p.add_argument("--gamma-wm", type=float, default=0.95)
     p.add_argument("--sigreg-weight", type=float, default=0.3,
                    help="beta: SIGReg (isotropic-Gaussian) weight, pinned at 0.3")
@@ -691,12 +736,18 @@ def parse_args():
     p.add_argument("--wm-lr", type=float, default=5e-5)
     p.add_argument("--wm-update-every", type=int, default=4)
     p.add_argument("--wm-dropout", type=float, default=0.1)
+    p.add_argument("--wm-grad-checkpoint", action="store_true",
+                   help="enable ViT gradient checkpointing in the WM update (default off; trades ~10-15ms "
+                        "recompute for memory — only worth it if WM-update activation memory is tight)")
     p.add_argument("--flatline-window", type=int, default=200)
     p.add_argument("--flatline-tol", type=float, default=0.03)
     # reward ('?' values; sweepable)
-    p.add_argument("--lambda-cur", type=float, default=15.0,
-                   help="curiosity weight; ~15 puts safety:curiosity ~0.5:1 at observed magnitudes "
-                        "(|r_safe|~40, symlog(r_cur)~5.6). README '?'; sweep & watch reward/safe_cur_ratio")
+    p.add_argument("--lambda-safe", type=float, default=0.0,
+                   help="weight on the safety penalty r_safe in the reward; 0 (default) ablates safety "
+                        "(reward = pure curiosity), set 1.0 for the README r = r_safe + lambda_cur*symlog(r_cur)")
+    p.add_argument("--lambda-cur", type=float, default=1.0,
+                   help="curiosity weight on symlog(r_cur). r_cur is the per-dim MEAN squared pred error "
+                        "(~O(0.1-1)), so lambda_cur~1 keeps cur_term O(1) in symlog's sensitive region. README '?'")
     p.add_argument("--safety-delta", type=float, default=0.05, help="delta deadband (README '?'; sweep)")
     # SAC (README)
     p.add_argument("--gamma", type=float, default=0.9)
