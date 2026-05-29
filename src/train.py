@@ -215,12 +215,14 @@ def encode_obs(wm, px_uint8, proprio_np, device):
 
 @torch.no_grad()
 def curiosity_reward(wm, hist_z, hist_a, z_next):
-    """r_cur = ||f(z_{t-H+1:t}, a_t)[-1] - z_{t+1}||^2, per env. hist_z/hist_a are
-    (H, B, .) tensors; returns (B,) squared L2 prediction error."""
+    """r_cur = mean_d (f(z_{t-H+1:t}, a_t)[-1] - z_{t+1})^2, per env: the PER-DIM MEAN
+    squared 1-step prediction error (same normalization as the WM loss). Keeps r_cur
+    O(0.1-1) so symlog operates in its sensitive region (not the saturated tail of the
+    d_z-summed version) -> a more discriminative curiosity reward. Returns (B,)."""
     z_ctx = hist_z.transpose(0, 1)                       # (B, H, D)
     a_emb = wm.action_encoder(hist_a.transpose(0, 1))    # (B, H, A_emb)
     pred = wm.predict(z_ctx, a_emb)[:, -1]               # (B, D)
-    return (pred - z_next).pow(2).sum(-1)
+    return (pred - z_next).pow(2).mean(-1)
 
 
 def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device):
@@ -742,9 +744,9 @@ def parse_args():
     # reward ('?' values; sweepable)
     p.add_argument("--lambda-safe", type=float, default=1.0,
                    help="weight on the safety penalty r_safe in the reward (1.0 = README default; 0 ablates safety)")
-    p.add_argument("--lambda-cur", type=float, default=15.0,
-                   help="curiosity weight; ~15 puts safety:curiosity ~0.5:1 at observed magnitudes "
-                        "(|r_safe|~40, symlog(r_cur)~5.6). README '?'; sweep & watch reward/safe_cur_ratio")
+    p.add_argument("--lambda-cur", type=float, default=1.0,
+                   help="curiosity weight on symlog(r_cur). r_cur is the per-dim MEAN squared pred error "
+                        "(~O(0.1-1)), so lambda_cur~1 keeps cur_term O(1) in symlog's sensitive region. README '?'")
     p.add_argument("--safety-delta", type=float, default=0.05, help="delta deadband (README '?'; sweep)")
     # SAC (README)
     p.add_argument("--gamma", type=float, default=0.9)
