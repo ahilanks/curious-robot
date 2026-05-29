@@ -85,12 +85,36 @@ class VectorMujocoEnv:
         info = {k: np.stack([d[k] for d in info_list]) for k in _INFO_KEYS}
         return self._stack_obs(obs_list), info
 
+    def step_block_async(self, action_blocks: np.ndarray) -> None:
+        action_blocks = np.asarray(action_blocks, dtype=np.float32)
+
+        def run(env, ab):
+            obs, infos = None, []
+            for a_k in ab:
+                obs, info = env.step(a_k)
+                infos.append(info)
+            return obs, infos
+        self._pending = self._map(run, self.envs, list(action_blocks))
+
+    def step_block_wait(self):
+        results, self._pending = self._pending, None
+        return (self._stack_obs([r[0] for r in results]),
+                self._stack_sub_infos([r[1] for r in results]))
+
     @staticmethod
     def _stack_obs(obs_list):
         return {
             "image": np.stack([o["image"] for o in obs_list]),
             "proprio": np.stack([o["proprio"] for o in obs_list]),
         }
+
+    @staticmethod
+    def _stack_sub_infos(infos_per_env):
+        """infos_per_env: list over envs of list over substeps of info-dicts ->
+        list over substeps of {key: (n_envs, ...)} (so the loop accumulates per substep)."""
+        n_sub = len(infos_per_env[0])
+        return [{k: np.stack([infos_per_env[e][s][k] for e in range(len(infos_per_env))])
+                 for k in _INFO_KEYS} for s in range(n_sub)]
 
     def render_overhead(self) -> np.ndarray:
         return np.stack(self._map(lambda e: e.render_overhead()))
@@ -115,6 +139,12 @@ def _env_worker(remote, parent_remote, env_kwargs):
             cmd, data = remote.recv()
             if cmd == "step":
                 remote.send(env.step(data))
+            elif cmd == "step_block":          # run a whole action_block in-worker: 1 IPC round-trip / decision
+                obs, infos = None, []
+                for a_k in data:               # data: (action_block, n_dof)
+                    obs, info = env.step(a_k)
+                    infos.append(info)
+                remote.send((obs, infos))      # final obs + per-substep info list
             elif cmd == "reset":
                 remote.send(env.reset())
             elif cmd == "render_overhead":
@@ -216,6 +246,22 @@ class SubprocVectorMujocoEnv:
         obs_list, info_list = zip(*(w.recv() for w in self._workers))
         info = {k: np.stack([d[k] for d in info_list]) for k in _INFO_KEYS}
         return VectorMujocoEnv._stack_obs(obs_list), info
+
+    def step_block_async(self, action_blocks: np.ndarray) -> None:
+        """Dispatch a full action_block per env (non-blocking). Workers run all
+        action_block substeps while the trainer does GPU work; collect with
+        step_block_wait(). This overlaps CPU rollout with GPU learning."""
+        action_blocks = np.asarray(action_blocks, dtype=np.float32)
+        assert action_blocks.shape[0] == self.n_envs and action_blocks.ndim == 3
+        for w, ab in zip(self._workers, action_blocks):
+            w.send("step_block", ab)
+
+    def step_block_wait(self):
+        """Collect step_block_async(): final stacked obs + a list (over the action_block)
+        of per-substep infos, each {key: (n_envs, ...)}."""
+        results = [w.recv() for w in self._workers]            # each: (final_obs, [info_0..info_{B-1}])
+        obs = VectorMujocoEnv._stack_obs([r[0] for r in results])
+        return obs, VectorMujocoEnv._stack_sub_infos([r[1] for r in results])
 
     def render_overhead(self) -> np.ndarray:
         for w in self._workers:
