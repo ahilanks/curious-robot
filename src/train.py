@@ -7,7 +7,7 @@ Per decision step (action_block env steps), for every parallel env:
   3. curiosity   r_cur = ||f(z_{t-H+1:t}, a_t) - z_{t+1}||^2     (1-step pred error)
      reward      r_t   = sum_k r_safe_k + lambda_cur * symlog(r_cur)
   4. store (o_t, q_t, qdot_t, a_t, r_t, o_{t+1}) with PER priority = r_cur
-Periodically: co-train the WM (autoregressive symlog rollout loss + beta*SIGReg, with
+Periodically: co-train the WM (autoregressive MSE rollout loss + beta*SIGReg, with
 an H_fwd curriculum), run SAC updates (PER), log to W&B, checkpoint to the HF Hub.
 
 The `?` constants in the README (beta, lambda_cur, delta, ...) are CLI flags here with
@@ -34,7 +34,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from lewm.module import SIGReg                       # noqa: E402
 from model.state_encoder import WorldModel           # noqa: E402
-from model.proprio import symlog                     # noqa: E402
 from env.parallel_env import (VectorMujocoEnv,       # noqa: E402
                               SubprocVectorMujocoEnv, SubprocSingleEnv)
 from env.mujoco_env import MujocoSO101Env            # noqa: E402
@@ -226,7 +225,8 @@ def curiosity_reward(wm, hist_z, hist_a, z_next):
 
 
 def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device):
-    """One AdamW step on L_wm = discounted symlog autoregressive rollout + beta*SIGReg."""
+    """One AdamW step on L_wm = discounted plain-MSE autoregressive rollout + beta*SIGReg
+    (LeWM-style: mean squared error per step over batch+feature dims, no symlog)."""
     px, prop, ac = batch
     B, T = px.shape[:2]
     px_n = to_norm_pixel(px, device).reshape(B * T, 3, px.shape[2], px.shape[3])
@@ -241,17 +241,17 @@ def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device):
         zhat = cur[:, -1]
         z_k = emb[:, H_bwd - 1 + k]                        # real z_{t+k}
         g = gamma_wm ** k
-        sq = (zhat - z_k).pow(2).sum(-1)                   # ||.||^2 per sample
-        pred_loss = pred_loss + g * symlog(sq).mean()
+        mse = (zhat - z_k).pow(2).mean()                   # LeWM plain MSE over batch+feature dims (no symlog)
+        pred_loss = pred_loss + g * mse
         wsum += g
         if k < h:
             roll = torch.cat([roll[:, 1:], zhat.unsqueeze(1)], 1)
             roll_a = torch.cat([roll_a[:, 1:], a_emb[:, H_bwd - 1 + k].unsqueeze(1)], 1)
             cur = wm.predict(roll, roll_a)
     pred_loss = pred_loss / wsum
-    with torch.no_grad():   # persistence baseline on the SAME discounted h-step schedule
+    with torch.no_grad():   # persistence baseline on the SAME discounted h-step schedule (same MSE metric)
         z_last = emb[:, H_bwd - 1]
-        idl = sum((gamma_wm ** k) * symlog((z_last - emb[:, H_bwd - 1 + k]).pow(2).sum(-1)).mean()
+        idl = sum((gamma_wm ** k) * (z_last - emb[:, H_bwd - 1 + k]).pow(2).mean()
                   for k in range(1, h + 1)) / wsum
     sig = sigreg(emb.transpose(0, 1))                      # (T,B,D)
     loss = pred_loss + beta * sig
@@ -524,7 +524,7 @@ def main(args):
             ep_len[done_envs] = 0
             ep_ret[done_envs] = 0.0
 
-        # --- world-model co-training: autoregressive symlog rollout + beta*SIGReg ---
+        # --- world-model co-training: autoregressive MSE rollout + beta*SIGReg ---
         if step >= args.start_steps and step % args.wm_update_every == 0:
             batch = buf.sample_wm(args.wm_batch_size, H + h_fwd)
             if batch is not None:
@@ -685,7 +685,8 @@ def parse_args():
     p.add_argument("--h-fwd-start", type=int, default=1)
     p.add_argument("--h-fwd-max", type=int, default=20)
     p.add_argument("--gamma-wm", type=float, default=0.95)
-    p.add_argument("--sigreg-weight", type=float, default=0.9, help="beta (README '?'; sweep)")
+    p.add_argument("--sigreg-weight", type=float, default=0.3,
+                   help="beta: SIGReg (isotropic-Gaussian) weight, pinned at 0.3")
     p.add_argument("--wm-batch-size", type=int, default=128)
     p.add_argument("--wm-lr", type=float, default=5e-5)
     p.add_argument("--wm-update-every", type=int, default=4)

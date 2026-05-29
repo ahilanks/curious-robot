@@ -21,7 +21,8 @@ learning dynamics?*
 
 Implementation **complete and validated end-to-end** (smoke run, HF up/download
 round-trip, deterministic contact check), pushed to GitHub. **No real training run yet** —
-the README `?` constants (β, λ_cur, δ, Kp/Kd) are unswept and stay `?` until then.
+the remaining README `?` constants (λ_cur, δ, Kp/Kd) are unswept and stay `?` until then
+(β is now pinned at **0.3** — no longer swept; see the 2026-05-28 Log entry).
 
 Recently landed: dual-cam rollout videos every 500 steps; contact-bucketed curiosity MSE
 (`wm/mse_block|table|none`); encoder-collapse metrics (`z_std`/`eff_rank`/`feat_corr`);
@@ -35,8 +36,9 @@ arm-contact set empty → all interaction metrics were silently 0; now verified 
       pods out-of-band (scp / paste), not via the repo. Rotate a token only if it leaks.
 - [ ] **Baseline run** to ~200k steps (`--keep-local-ckpts` if you want local eval); fill
       the sweep table.
-- [ ] **Sweep the `?` constants** — β (0.9), λ_cur (15 → safety:curiosity ~0.5:1),
+- [ ] **Sweep the remaining `?` constants** — λ_cur (15 → safety:curiosity ~0.5:1),
       δ (0.05). Watch `reward/safe_cur_ratio`, `interact/contacts_per_step`, pred/persist.
+      (β is pinned at 0.3, no longer swept.)
 - [ ] **TD-priority ablation** — `--per-priority td` vs `curiosity` (see Ablations).
 - [ ] Pin the swept `?` values into `README.md` — **ask the maintainer before editing it.**
 
@@ -53,11 +55,11 @@ arm-contact set empty → all interaction metrics were silently 0; now verified 
 
 ## Sweeps
 
-The README `?` constants are swept here before being pinned.
+The remaining README `?` constants (λ_cur, δ) are swept here before being pinned; β is fixed at 0.3.
 
 | run | β | λ_cur | δ | steps | contacts/step | pred/persist | notes |
 |-----|---|-------|---|-------|---------------|--------------|-------|
-| _tbd_ | 0.9 | 15.0 | 0.05 | | | | baseline defaults (λ_cur≈15 → safety:curiosity ~0.5:1) |
+| _tbd_ | 0.3 | 15.0 | 0.05 | | | | baseline (β pinned 0.3; λ_cur≈15 → safety:curiosity ~0.5:1) |
 
 ## Ablations
 
@@ -69,3 +71,17 @@ The README `?` constants are swept here before being pinned.
 
 _(add a dated entry per run)_
 - 2026-05-27 — implementation complete + validated end-to-end; no training run yet.
+- 2026-05-28 — **aligned the WM with the LeWM reference** after diagnosing universal policy
+  freezing across the 26 runs: curiosity reward sits at a ~constant spatially-uniform floor
+  (`r_cur`≈220, CV 3–10%; `mse_block` barely > `mse_none`), the WM never learns (`pred_loss`
+  flat), so the safety penalty is the only action-discriminating signal → SAC freezes
+  (`contacts/step`→0, `r_safe` −55→−3). Reward-scaling/exploration knobs (RND norm, raw
+  curiosity, BatchNorm, learnable-α, δ/safety sweeps) were all tried and all still froze.
+  Changes: **β SIGReg pinned 0.3** (was 0.9 / swept 1–5, which collapsed the latent —
+  eff_rank fell as β rose); **WM loss → plain MSE** `(ẑ−z).pow(2).mean()` (dropped
+  symlog-on-summed-sq, which compressed the metric + anti-curriculum-reweighted surprising
+  samples); **removed the encoder's final LayerNorm** (it pinned z to a sphere, fighting
+  SIGReg). Horizon/`h_fwd` curriculum + online co-training kept. Reward's
+  `λ_cur·symlog(r_cur)` unchanged. Open lever: WM is still co-trained online on a freezing
+  policy's degenerate data (LeWM is offline) — likely need to pretrain the WM on a random
+  buffer until `pred_loss` < persistence before safety dominates.
