@@ -35,6 +35,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from lewm.module import SIGReg                       # noqa: E402
 from model.state_encoder import WorldModel           # noqa: E402
 from env.parallel_env import VectorMujocoEnv, SubprocVectorMujocoEnv   # noqa: E402
+from src.probe import load_probe_hf                  # noqa: E402
 
 try:
     import wandb
@@ -435,7 +436,16 @@ def main(args):
     wrist_buf = deque(maxlen=args.video_steps)      # train-video clips (per-env frames, tiled)
     over_buf = deque(maxlen=args.video_steps)
     probe_px = probe_prop = None                    # fixed diverse probe set for encoder/eff_rank_probe
-    probe_buf = []                                  # collected from early warmup obs, then frozen
+    probe_buf = []                                  # warmup-rollout fallback if the HF probe is unavailable
+    if args.probe_size > 0:                         # prefer the canonical uniform-pose probe cached on HF
+        loaded = (load_probe_hf(args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"), args.probe_id)
+                  if not args.no_hf else None)
+        if loaded is not None:
+            probe_px, probe_prop = loaded[0][:args.probe_size], loaded[1][:args.probe_size]
+            print(f"[probe] loaded {len(probe_px)} uniform-pose obs from HF ({args.probe_id})", flush=True)
+        else:
+            print(f"[probe] HF probe '{args.probe_id}' unavailable; falling back to warmup-rollout probe",
+                  flush=True)
 
     def learner_updates(step, h_fwd):
         """SAC + periodic WM gradient steps on buffered (past) data; returns the
@@ -702,8 +712,11 @@ def parse_args():
                    help="frames per train-video clip (window of decision steps before each save)")
     p.add_argument("--video-fps", type=int, default=20)
     p.add_argument("--probe-size", type=int, default=256,
-                   help="fixed diverse probe-set size for encoder/eff_rank_probe (frozen from early warmup "
-                        "obs; isolates encoder health from behavioral diversity; 0 disables)")
+                   help="size of the fixed probe set for encoder/eff_rank_probe (isolates encoder health "
+                        "from behavioral diversity); 0 disables")
+    p.add_argument("--probe-id", default="probe_v1",
+                   help="HF probe artifact id (probe/<id>.npz): canonical uniform-pose probe; "
+                        "falls back to a warmup-rollout probe if unavailable")
     # action / actuation (README)
     p.add_argument("--action-block", type=int, default=5)
     p.add_argument("--action-max", type=float, default=0.3)
