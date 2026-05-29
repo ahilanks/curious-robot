@@ -742,8 +742,9 @@ def parse_args():
     p.add_argument("--flatline-window", type=int, default=200)
     p.add_argument("--flatline-tol", type=float, default=0.03)
     # reward ('?' values; sweepable)
-    p.add_argument("--lambda-safe", type=float, default=1.0,
-                   help="weight on the safety penalty r_safe in the reward (1.0 = README default; 0 ablates safety)")
+    p.add_argument("--lambda-safe", type=float, default=0.0,
+                   help="weight on the safety penalty r_safe in the reward; 0 (default) ablates safety "
+                        "(reward = pure curiosity), set 1.0 for the README r = r_safe + lambda_cur*symlog(r_cur)")
     p.add_argument("--lambda-cur", type=float, default=1.0,
                    help="curiosity weight on symlog(r_cur). r_cur is the per-dim MEAN squared pred error "
                         "(~O(0.1-1)), so lambda_cur~1 keeps cur_term O(1) in symlog's sensitive region. README '?'")
