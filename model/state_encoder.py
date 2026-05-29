@@ -2,13 +2,15 @@
 
 State encoder (z_t in R^256):
 
-    z_t = LN[ MLP( MLP(ViT(o_t)_cls)  ||  MLP(symlog(q_t, qdot_t, u^app_{t-1})) ) ]
-                    (-> 192)                    (-> 64)         (joint fusion -> 256)
+    z_t = MLP( MLP(ViT(o_t)_cls)  ||  MLP(symlog(q_t, qdot_t, u^app_{t-1})) )
+                 (-> 192)                    (-> 64)         (joint fusion -> 256)
 
 The visual branch is a from-scratch ViT-tiny (hidden 192, patch 14, 224x224) whose
 CLS token is projected to 192 by an MLP head; the proprio branch (`ProprioEncoder`)
 maps symlog(q, qdot, u_prev) to 64. The two are concatenated (192+64) and fused by
-a joint MLP, then LayerNorm'd, giving the 256-d latent.
+a joint MLP, giving the 256-d latent. There is no final per-sample LayerNorm: it
+would pin every z to a fixed-radius sphere, which fights SIGReg's isotropic-Gaussian
+objective (LeWM keeps only BatchNorm inside the projector MLP, no output norm).
 
 WorldModel is a `lewm.jepa.JEPA` whose encoder is this combined StateEncoder and
 whose predictor/action_encoder/pred_proj come from `lewm.module`. It overrides
@@ -45,15 +47,17 @@ class StateEncoder(nn.Module):
         self.proprio = ProprioEncoder(n_dof, out_dim=prop_dim)  # MLP(symlog(.)) -> 64
         self.out_dim = vis_dim + prop_dim                       # 256
         # Joint fusion MLP over the concatenated visual+proprio features (README's outer MLP).
+        # No final LayerNorm on the fused output: a per-sample LN forces every z onto a
+        # fixed-radius sphere, which fights SIGReg's isotropic-Gaussian regularizer (LeWM
+        # keeps only BatchNorm inside the projector MLP and no output normalization).
         self.fuse = MLP(self.out_dim, 4 * self.out_dim, self.out_dim)
-        self.norm = nn.LayerNorm(self.out_dim)
 
     def forward(self, image_norm: torch.Tensor, proprio: torch.Tensor) -> torch.Tensor:
         """image_norm: (B,3,H,W) normalized; proprio: (B,3*n_dof) -> z: (B, 256)."""
         cls = self.vit(image_norm, interpolate_pos_encoding=True).last_hidden_state[:, 0]
         v = self.visual_head(cls)
         p = self.proprio(proprio)
-        return self.norm(self.fuse(torch.cat([v, p], dim=-1)))
+        return self.fuse(torch.cat([v, p], dim=-1))
 
 
 class WorldModel(JEPA):

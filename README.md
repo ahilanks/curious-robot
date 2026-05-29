@@ -7,13 +7,15 @@ JEPA + SIGReg world model with SAC. Everything is trained from scratch. Uses the
 
 ## State encoder
 
-$$z_t=\mathrm{LN}\!\Big[\,\mathrm{MLP}\big(\,\mathrm{MLP}(\mathrm{ViT}(o_t)_{\text{cls}})\ \big\Vert\ \mathrm{MLP}(\mathrm{symlog}(q_t,\dot q_t,u^{\text{app}}_{t-1}))\,\big)\,\Big]\in\mathbb{R}^{256}\quad(192+64)$$
+$$z_t=\mathrm{MLP}\big(\,\mathrm{MLP}(\mathrm{ViT}(o_t)_{\text{cls}})\ \big\Vert\ \mathrm{MLP}(\mathrm{symlog}(q_t,\dot q_t,u^{\text{app}}_{t-1}))\,\big)\in\mathbb{R}^{256}\quad(192+64)$$
+
+No final per-sample LayerNorm on $z_t$: it would pin every latent to a fixed-radius sphere, fighting SIGReg's isotropic-Gaussian objective (LeWM keeps only BatchNorm inside the projector MLP, no output norm).
 
 ## Dynamics + world-model loss
 
 $$\hat z_{t+1}=f\big(z_{t-H_{\text{bwd}}+1:t},\,a_t\big)$$
 
-$$\mathcal{L}_{\text{wm}}=\underbrace{\frac{1}{\sum_{k=1}^{H_{\text{fwd}}}\gamma_{\text{wm}}^{k}}\sum_{k=1}^{H_{\text{fwd}}}\gamma_{\text{wm}}^{k}\,\mathrm{symlog}\!\big(\lVert \hat z_{t+k}-z_{t+k}\rVert_2^2\big)}_{\text{autoregressive rollout: }\hat z\text{ re-fed with real }a_{t+k}}+\ \beta\,\mathrm{SIGReg}(z_{\text{batch}})$$
+$$\mathcal{L}_{\text{wm}}=\underbrace{\frac{1}{\sum_{k=1}^{H_{\text{fwd}}}\gamma_{\text{wm}}^{k}}\sum_{k=1}^{H_{\text{fwd}}}\gamma_{\text{wm}}^{k}\,\tfrac{1}{d_z}\lVert \hat z_{t+k}-z_{t+k}\rVert_2^2}_{\text{autoregressive rollout (LeWM plain MSE, no symlog): }\hat z\text{ re-fed with real }a_{t+k}}+\ \beta\,\mathrm{SIGReg}(z_{\text{batch}})$$
 
 Rollout-on variant (vs. the single-horizon loss that scores one sampled $h$ against the real target). $H_{\text{fwd}}$ starts at $1$ and bumps to $H_{\text{fwd}}{+}1$ when the pred term's mean relative change over the last $200$ WM updates falls below tol, capped at $H_{\text{fwd,max}}=20$.
 
@@ -48,7 +50,7 @@ Real $z_{t+1}$, no WM rollout in the target; $d_t$ via truncation-as-done. Buffe
 | $H_{\text{bwd}}$ | predictor context (history) | 3 |
 | $H_{\text{fwd}}$ / $H_{\text{fwd,max}}$ | rollout horizon: start / max | 1 / 20 |
 | $\gamma_{\text{wm}}$ | WM rollout discount | 0.95 |
-| $\beta$ | SIGReg weight | ? |
+| $\beta$ | SIGReg weight | 0.3 |
 | batch | WM batch | 128 |
 | $\gamma$ | SAC discount | 0.9 |
 | $\alpha$ | entropy coef (fixed) | 0.2 |
