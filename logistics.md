@@ -59,7 +59,7 @@ The remaining README `?` constants (λ_cur, δ) are swept here before being pinn
 
 | run | β | λ_cur | δ | steps | contacts/step | pred/persist | notes |
 |-----|---|-------|---|-------|---------------|--------------|-------|
-| _tbd_ | 0.3 | 15.0 | 0.05 | | | | baseline (β pinned 0.3; λ_cur≈15 → safety:curiosity ~0.5:1) |
+| newarch | 0.3 | 15.0 | 0.05 | 10000 | 0.00 | 0.50 | WM learns (pred/persist 0.50, h_fwd→11, eff_rank 4.4→7.8) but policy never contacts blocks; curiosity harvested from non-contact motion |
 
 ## Ablations
 
@@ -85,3 +85,16 @@ _(add a dated entry per run)_
   `λ_cur·symlog(r_cur)` unchanged. Open lever: WM is still co-trained online on a freezing
   policy's degenerate data (LeWM is offline) — likely need to pretrain the WM on a random
   buffer until `pred_loss` < persistence before safety dominates.
+- 2026-05-29 — **first real run on the LeWM-aligned arch** (`newarch`, 10k steps; β=0.3,
+  λ_cur=15, δ=0.05; W&B run `oc6p0un6`). **The WM now learns** — the 2026-05-28 changes worked:
+  `pred_loss`/`identity_baseline` ≈ **0.50** (beats persistence), the `h_fwd` curriculum climbed
+  **1→11**, and the latent stayed healthy (`z_std` 0.25→0.84, `eff_rank` 4.4→7.8, `feat_corr`≈0.28
+  — no collapse). **But the policy never interacts**: `contacts/step`=0 the entire run,
+  `object_motion` 0.067→0.0014, `r_safe` −42→−17 (calmer), `safe:cur` 0.67→0.22 (curiosity
+  dominates ~4.5:1), `r_cur` 64→188. Curiosity is harvested from non-contact free-space motion
+  (`mse_none` 64→189 ≫ `mse_block`≈67 — though the block bucket is starved since contacts≈0, so
+  that comparison is chicken-and-egg). **New failure mode**, distinct from the 26 frozen runs
+  (where the WM never learned): here the WM learns fine, but the curiosity gradient points *away*
+  from blocks → exploration-toward-objects is now the open problem (reward shaping / λ_cur, not WM
+  arch). The modest `eff_rank`≈8 likely reflects the low-dim experience (arm-only, blocks static)
+  more than encoder health — a fixed diverse probe-set eff_rank would disentangle the two.
