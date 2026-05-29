@@ -383,10 +383,14 @@ def main(args):
     critic_tgt.load_state_dict(critic.state_dict())
     for p in critic_tgt.parameters():
         p.requires_grad_(False)
-    log_alpha = torch.tensor(float(np.log(args.alpha)), device=device)   # fixed entropy temp
+    log_alpha = torch.tensor(float(np.log(args.alpha)), device=device, requires_grad=args.auto_alpha)
+    target_entropy = args.target_entropy if args.target_entropy is not None else -float(a_dim)
 
     actor_opt = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
     critic_opt = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
+    alpha_opt = torch.optim.Adam([log_alpha], lr=args.alpha_lr) if args.auto_alpha else None
+    if args.auto_alpha:
+        print(f"[alpha] learnable (target_entropy={target_entropy:.1f}, lr={args.alpha_lr})", flush=True)
     wm_opt = torch.optim.AdamW([p for p in wm.parameters() if p.requires_grad],
                                lr=args.wm_lr, weight_decay=1e-3)
 
@@ -477,11 +481,11 @@ def main(args):
         if step >= args.start_steps and buf.total >= args.batch_size:
             per_beta = min(1.0, args.per_beta_start
                            + (1 - args.per_beta_start) * step / max(args.total_steps, 1))
-            alpha = log_alpha.exp()
             for _ in range(args.updates_per_step):
                 b = buf.sample_sac(args.batch_size, args.per_alpha, per_beta)
                 if b is None:
                     break
+                alpha = log_alpha.exp().detach()     # const for critic/actor; tuned separately below
                 zb = encode_obs(wm, b["px"], b["prop"], device)
                 znb = encode_obs(wm, b["px_n"], b["prop_n"], device)
                 with torch.no_grad():
@@ -498,11 +502,14 @@ def main(args):
                 q1p, q2p = critic(zb, ap)
                 actor_loss = (alpha * logpp - torch.min(q1p, q2p)).mean()
                 actor_opt.zero_grad(); actor_loss.backward(); actor_opt.step()
+                if alpha_opt is not None:            # SAC auto-temperature: drive entropy -> target
+                    alpha_loss = -(log_alpha * (logpp + target_entropy).detach()).mean()
+                    alpha_opt.zero_grad(); alpha_loss.backward(); alpha_opt.step()
                 with torch.no_grad():
                     for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
                         pt.mul_(1 - args.tau).add_(args.tau * p)
                 last_zb = zb.detach()
-                last_sac = (float(critic_loss.item()), float(actor_loss.item()))
+                last_sac = (float(critic_loss.item()), float(actor_loss.item()), float(logpp.mean().item()))
         return h_fwd
 
     for step in range(args.total_steps):
@@ -634,7 +641,8 @@ def main(args):
                           "wm/identity_baseline": last_wm[2]})
             if last_sac is not None:
                 d.update({"sac/critic_loss": last_sac[0], "sac/actor_loss": last_sac[1],
-                          "sac/alpha": float(log_alpha.exp().item())})
+                          "sac/alpha": float(log_alpha.exp().item()),
+                          "sac/policy_entropy": -last_sac[2], "sac/target_entropy": target_entropy})
             wlog(d, step)
             with open(out_dir / "metrics.jsonl", "a") as f:    # local metrics record (esp. when --no-wandb)
                 f.write(json.dumps({"step": step, **{k: float(v) for k, v in d.items()}}) + "\n")
@@ -751,7 +759,12 @@ def parse_args():
     p.add_argument("--safety-delta", type=float, default=0.05, help="delta deadband (README '?'; sweep)")
     # SAC (README)
     p.add_argument("--gamma", type=float, default=0.9)
-    p.add_argument("--alpha", type=float, default=0.2, help="fixed entropy temperature")
+    p.add_argument("--alpha", type=float, default=0.2, help="entropy temperature (initial value if --auto-alpha)")
+    p.add_argument("--auto-alpha", action="store_true",
+                   help="learn the entropy temperature (standard SAC auto-tuning toward --target-entropy)")
+    p.add_argument("--alpha-lr", type=float, default=3e-4, help="lr for the learnable log-alpha")
+    p.add_argument("--target-entropy", type=float, default=None,
+                   help="SAC target entropy (default: -action_dim = -n_dof*action_block)")
     p.add_argument("--tau", type=float, default=0.005, help="Polyak rate")
     p.add_argument("--actor-lr", type=float, default=3e-4)
     p.add_argument("--critic-lr", type=float, default=3e-4)
