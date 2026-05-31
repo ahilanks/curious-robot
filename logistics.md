@@ -40,7 +40,8 @@ arm-contact set empty → all interaction metrics were silently 0; now verified 
       δ (0.05). Watch `reward/safe_cur_ratio`, `interact/contacts_per_step`, pred/persist.
       (β is pinned at 0.3, no longer swept.)
 - [ ] **TD-priority ablation** — `--per-priority td` vs `curiosity` (see Ablations).
-- [ ] Pin the swept `?` values into `README.md` — **ask the maintainer before editing it.**
+- [x] Pin the swept `?` values into `README.md` — **done 2026-05-31 (maintainer-approved):**
+      δ=15, λ_safe=0.1, τ_max=3.35, h_fwd_max=1, r_cur→per-dim-mean. (λ_cur still `?` — at 20, unswept.)
 
 ## What to read off the logs (W&B `curious-robot`)
 
@@ -61,6 +62,7 @@ The remaining README `?` constants (λ_cur, δ) are swept here before being pinn
 |-----|---|-------|---|-------|---------------|--------------|-------|
 | newarch | 0.3 | 15.0 | 0.05 | 10000 | 0.00 | 0.50 | WM learns (pred/persist 0.50, h_fwd→11, eff_rank 4.4→7.8) but policy never contacts blocks; curiosity harvested from non-contact motion |
 | lcur20 | 0.3 | 20.0 | 0.05 | 55250\* | 0.00 | 0.14 | per-dim-MEAN `r_cur` (`5824b7a`) → r_cur≈0.75 (was ≈188); **λ_safe=0** (safety ablated), `h_fwd_max=1`. WM learns *very* well (pred/persist 0.14, eff_rank 30, probe 8.1) but policy still never contacts blocks (contacts/step≈0.002). \*crashed 55250/100k (pod, not code). W&B `199jzlil` |
+| safe15 | 0.3 | 20.0 | **15** | 100000 | 0.00 | 0.13 | **first run with corrected safety: δ=15 + λ_safe=0.1.** Safety balanced (actual safe:cur **0.28–0.32:1**, reward/total **+8**, no freeze); r_safe falls **−51.5→−30** (policy smooths). WM excellent (pred/persist 0.13, eff_rank 33.6). Block interaction still collapses post-warmup (contacts 0.34→**0.001**) — explore-toward-objects unsolved, orthogonal to safety. W&B `4zn95btc` |
 
 ## Ablations
 
@@ -133,3 +135,31 @@ _(add a dated entry per run)_
   is confirmed mis-scaled** post-per-dim-mean. 700 steps is too short to judge policy freezing
   (newarch/lcur20 needed ≥10k) — the bracket validates the *weighting magnitude*, not long-run
   dynamics. **Next:** a full run at λ_safe=0.1 (rest = lcur20 config) is the recommended baseline.
+- 2026-05-31 — **deadband δ pinned via physics analysis.** A multi-lens study of the safety
+  deadband on `-τ·q̈` (units N·m·rad/s²; the per-joint quantity δ gates): empirical real-contact
+  measurement (δ=10–15), analytical torque-limit derivation (δ=28), STS3215-datasheet/gear-shock
+  lens (δ=25), and an adversarial false-positive/false-negative verifier (**δ=12, range [10,15]**).
+  Verifier key findings: **0% false-negatives on genuine shock events** (term>30 ∧ |τ|>0.6·τ_max)
+  at *every* δ∈[5,28] — so damage detection does **not** bound δ from above; the binding constraint
+  is false-positives on **calm free motion** (knee at δ≈8–10: 15.5%@8 → 4.7%@10 → 3.7%@15). Light
+  pickup/push are penalty-free for any δ≥10. **Shipped δ=15** (conservative top of [10,15] → lowest
+  benign FP, best serving "no penalty for gentle pickup/push", ~15% less damage-gradient resolution
+  than δ=10–12 — minor). The old **δ=0.05 penalized essentially all motion** (calm r_safe −2.8 → freeze).
+  README + code reconciled (maintainer-approved): δ?→15, add λ_safe=0.1, `r_cur` → per-dim mean
+  `(1/d_z)‖ẑ−z‖²`, τ_max 2.94–3.35 → 3.35 (all joints), `H_fwd,max` 20 → 1 (curriculum off by default).
+  Branch `safety/deadband-and-lambda-safe`. Still stale, left as-is: README `Δt_safe`=10 timesteps vs
+  code 6 (`frame_skip·timestep`=0.030 s); δ=15 is calibrated to the actual 0.030 s.
+- 2026-05-31 — **`safe15`: first run with the corrected safety reward** (100k steps, ~10.4 h, 8 envs,
+  W&B `4zn95btc`; δ=15, λ_safe=0.1, λ_cur=20, β=0.3, h_fwd_max=1 — the lcur20 config + re-enabled
+  safety at the right weight). **Result — safety weighting validated:** actual safety:curiosity
+  settles to **~0.28–0.32:1** from 25k on (warmup 1.08:1), reward/total stays **positive** (+5.7→+8.3)
+  — **no freeze** (cf. λ_safe=1 → −55 in the bracket). **r_safe falls monotonically −51.5→−30** over
+  training = the policy learns smoother, less motor-fighting motion (the safety term's intended effect).
+  **WM stays excellent** — pred/persist 4.08(warmup)→**0.13**, eff_rank 3.4→**33.6**, z_std 0.98,
+  feat_corr 0.13 (no collapse); the safety reward did **not** hurt WM learning. **But block interaction
+  still collapses post-warmup** — contacts/step 0.335 (random warmup) → **~0.001–0.008** (learned policy),
+  object_motion ≈0.0006 — the same non-interaction failure as `newarch`/`lcur20`: random actions hit
+  blocks, the curiosity-driven policy doesn't. **So the corrected safety reward is balanced /
+  non-freezing / WM-safe, but does not by itself solve explore-toward-objects** — that remains THE open
+  problem (curiosity gradient points away from blocks; reward-shaping / λ_cur / intrinsic-exploration
+  territory, orthogonal to the safety weighting). Final ckpt on HF (`safe15/ckpt_0100000.pt`).
