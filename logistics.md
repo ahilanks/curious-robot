@@ -60,6 +60,7 @@ The remaining README `?` constants (λ_cur, δ) are swept here before being pinn
 | run | β | λ_cur | δ | steps | contacts/step | pred/persist | notes |
 |-----|---|-------|---|-------|---------------|--------------|-------|
 | newarch | 0.3 | 15.0 | 0.05 | 10000 | 0.00 | 0.50 | WM learns (pred/persist 0.50, h_fwd→11, eff_rank 4.4→7.8) but policy never contacts blocks; curiosity harvested from non-contact motion |
+| lcur20 | 0.3 | 20.0 | 0.05 | 55250\* | 0.00 | 0.14 | per-dim-MEAN `r_cur` (`5824b7a`) → r_cur≈0.75 (was ≈188); **λ_safe=0** (safety ablated), `h_fwd_max=1`. WM learns *very* well (pred/persist 0.14, eff_rank 30, probe 8.1) but policy still never contacts blocks (contacts/step≈0.002). \*crashed 55250/100k (pod, not code). W&B `199jzlil` |
 
 ## Ablations
 
@@ -98,3 +99,37 @@ _(add a dated entry per run)_
   from blocks → exploration-toward-objects is now the open problem (reward shaping / λ_cur, not WM
   arch). The modest `eff_rank`≈8 likely reflects the low-dim experience (arm-only, blocks static)
   more than encoder health — a fixed diverse probe-set eff_rank would disentangle the two.
+- 2026-05-29 (later runs; logged 2026-05-31) — **after `newarch`, two arch changes landed,
+  then the last batch of runs went out.** (1) Curiosity `r_cur` switched to the **per-dim MEAN**
+  squared pred error (`5824b7a`, was the d_z-summed version) → `r_cur` fell ≈**188 → ≈0.75**, so
+  `symlog(r_cur)` now sits in its sensitive region; (2) **safety ablated by default** (`λ_safe=0`,
+  `79520f3`, "verified-working config") to isolate pure curiosity, and `h_fwd_max` pinned to 1
+  (curriculum off, perf PR). Intervening runs: `nosafe`, `meancur`, `autoalpha` (all λ_safe=0).
+  **Latest run `lcur20`** (W&B `199jzlil`; λ_cur=20, λ_safe=0, β=0.3, δ=0.05; **crashed at
+  55250/100000** — pod/session death, not a code fault; an earlier 10k `lcur20` `vskepn3w` also
+  died at 9150). **Result:** the WM now learns *very* well — `pred_loss/identity` ≈ **0.14**
+  (newarch was 0.50), `eff_rank`≈30 (probe 8.1), `z_std`≈0.97, `feat_corr`≈0.14 (no collapse).
+  **But the policy still never interacts** — `contacts/step`≈**0.002**, `object_motion`≈0.002,
+  `frac_touch_block`≈0.0016 — the same non-interaction failure as `newarch`, now with safety
+  entirely off, confirming it's a curiosity-doesn't-point-at-objects problem, not a safety-freeze.
+  **Implication for re-enabling safety:** with per-dim-mean `r_cur`, raw `safe_cur_ratio`≈**5**
+  (raw |r_safe|≈54 ≫ cur_contrib≈11), so the README weight `λ_safe=1` would now over-weight safety
+  ~5:1 (freeze risk); the correctly-weighted value for the documented ~0.5:1 balance is
+  **λ_safe≈0.1** (≈0.05 to match newarch's actual 0.22:1).
+- 2026-05-31 — **safety-weight bracket** (3× ~10-min test runs, 700 steps, on the `lcur20` config
+  = λ_cur=20, β=0.3, δ=0.05, h_fwd_max=1; only λ_safe varied; W&B `curious-robot`). Goal: re-enable
+  the safety reward at a *correct* weight after the per-dim-mean rescale (see entry above). Results
+  (final-step actual safety:curiosity = λ_safe × raw `safe_cur_ratio`):
+  - `safe_p05` (λ_safe=0.05, `wtzyzu8g`) → **0.61:1**, reward/total +1.9
+  - `safe_p10` (λ_safe=0.10, `5cwdmp8k`) → **1.37:1**, reward/total −1.7
+  - `safe_1p0` (λ_safe=1.00, `d5f76dqm`) → **13.6:1**, reward/total **−55.6** (reward is essentially
+    the pure safety penalty — curiosity invisible; this is the freeze-inducing regime).
+
+  All launched/ran clean (no crash); WM already beats persistence by 700 steps (`p/p`≈0.57–0.74).
+  **Note on horizon:** raw `safe_cur_ratio`≈**13** at 700 steps vs ≈**5** at lcur20's 55k steps —
+  `r_cur` (hence `cur_contrib`) ramps as the WM learns, so the actual ratio *falls* over a run.
+  ⇒ **λ_safe=0.1 is the correct weight for the long run** (converges to the documented ~0.5:1 at
+  steady-state magnitudes); λ_safe=0.05 only looks on-target early and settles to ~0.25:1. **λ_safe=1.0
+  is confirmed mis-scaled** post-per-dim-mean. 700 steps is too short to judge policy freezing
+  (newarch/lcur20 needed ≥10k) — the bracket validates the *weighting magnitude*, not long-run
+  dynamics. **Next:** a full run at λ_safe=0.1 (rest = lcur20 config) is the recommended baseline.

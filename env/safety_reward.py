@@ -23,7 +23,7 @@ def safety_reward_np(
     qvel_prev: np.ndarray,        # qdot_{t - dt_safe}
     tau_max: np.ndarray,          # per-joint torque limit, (n_dof,)
     dt_safe: float = 0.030,       # accel finite-diff window (README: Delta t_safe)
-    delta: float = 0.05,          # safety deadband (README: delta)
+    delta: float = 15.0,          # safety deadband on -tau*qddot (README: delta)
 ) -> np.ndarray:
     """Vectorised numpy version. Inputs broadcast over the trailing dim n_dof."""
     tau_max = np.asarray(tau_max, dtype=np.float32)
@@ -39,7 +39,7 @@ def safety_reward_torch(
     qvel_prev: torch.Tensor,
     tau_max: torch.Tensor,
     dt_safe: float = 0.030,
-    delta: float = 0.05,
+    delta: float = 15.0,
 ) -> torch.Tensor:
     accel = (qvel - qvel_prev) / max(float(dt_safe), 1e-8)
     weight = applied_torque.abs() / tau_max.clamp_min(1e-6)
