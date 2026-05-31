@@ -17,7 +17,7 @@ $$\hat z_{t+1}=f\big(z_{t-H_{\text{bwd}}+1:t},\,a_t\big)$$
 
 $$\mathcal{L}_{\text{wm}}=\underbrace{\frac{1}{\sum_{k=1}^{H_{\text{fwd}}}\gamma_{\text{wm}}^{k}}\sum_{k=1}^{H_{\text{fwd}}}\gamma_{\text{wm}}^{k}\,\tfrac{1}{d_z}\lVert \hat z_{t+k}-z_{t+k}\rVert_2^2}_{\text{autoregressive rollout (LeWM plain MSE, no symlog): }\hat z\text{ re-fed with real }a_{t+k}}+\ \beta\,\mathrm{SIGReg}(z_{\text{batch}})$$
 
-Rollout-on variant (vs. the single-horizon loss that scores one sampled $h$ against the real target). $H_{\text{fwd}}$ starts at $1$ and bumps to $H_{\text{fwd}}{+}1$ when the pred term's mean relative change over the last $200$ WM updates falls below tol, capped at $H_{\text{fwd,max}}=20$.
+Rollout-on variant (vs. the single-horizon loss that scores one sampled $h$ against the real target). $H_{\text{fwd}}$ starts at $1$ and bumps to $H_{\text{fwd}}{+}1$ when the pred term's mean relative change over the last $200$ WM updates falls below tol, capped at $H_{\text{fwd,max}}$ (default $1$ — curriculum off; raise to re-enable, e.g.\ $20$).
 
 ## Actor + actuation
 
@@ -27,10 +27,12 @@ $$\tau_t=\mathrm{clip}\!\big(K_p\,\Delta q_t-K_d\,\dot q_t,\ -\tau_i^{\max},\ \t
 
 ## Rewards
 
-$$r_t^{\text{cur}}=\lVert \hat z_{t+1}-z_{t+1}\rVert_2^2,\qquad
+$$r_t^{\text{cur}}=\tfrac{1}{d_z}\lVert \hat z_{t+1}-z_{t+1}\rVert_2^2,\qquad
 r_t^{\text{safe}}=-\sum_{i=1}^{n}\frac{|\tau_{i,t}|}{\tau_i^{\max}}\,\max\!\big(0,\,-\tau_{i,t}\,\ddot q_{i,t}-\delta\big),\quad \ddot q_{i,t}=\frac{\dot q_{i,t}-\dot q_{i,t-\Delta t_{\text{safe}}}}{\Delta t_{\text{safe}}}$$
 
-$$r_t=r_t^{\text{safe}}+\lambda_{\text{cur}}\,\mathrm{symlog}\!\big(r_t^{\text{cur}}\big),\qquad (o_{t+1},\,r_t^{\text{safe}})=\mathrm{Env}(a_t)$$
+$$r_t=\lambda_{\text{safe}}\,r_t^{\text{safe}}+\lambda_{\text{cur}}\,\mathrm{symlog}\!\big(r_t^{\text{cur}}\big),\qquad (o_{t+1},\,r_t^{\text{safe}})=\mathrm{Env}(a_t)$$
+
+The curiosity error is the **per-dim mean** squared error $\tfrac{1}{d_z}\lVert\cdot\rVert_2^2$ (same normalization as $\mathcal L_{\text{wm}}$), so $r^{\text{cur}}\!\sim\!O(0.1\text{–}1)$ and $\mathrm{symlog}$ stays in its discriminative region. The safety penalty carries its own weight $\lambda_{\text{safe}}$ (not pinned to $1$): under the per-dim-mean $r^{\text{cur}}$ the raw $|r^{\text{safe}}|$ is $\approx5\times$ the curiosity term, so $\lambda_{\text{safe}}\!=\!0.1$ restores a safety:curiosity ratio of $\approx0.5\!:\!1$.
 
 ## SAC objective &nbsp; [le-wm]
 
@@ -48,7 +50,7 @@ Real $z_{t+1}$, no WM rollout in the target; $d_t$ via truncation-as-done. Buffe
 | $d_z$ ($d_{\text{vis}},d_{\text{prop}}$) | state dim (vis, proprio) | 256 (192, 64) |
 | $n$ | DOF / action dim | 6 |
 | $H_{\text{bwd}}$ | predictor context (history) | 3 |
-| $H_{\text{fwd}}$ / $H_{\text{fwd,max}}$ | rollout horizon: start / max | 1 / 20 |
+| $H_{\text{fwd}}$ / $H_{\text{fwd,max}}$ | rollout horizon: start / max | 1 / 1 (curriculum off by default; was 20) |
 | $\gamma_{\text{wm}}$ | WM rollout discount | 0.95 |
 | $\beta$ | SIGReg weight | 0.3 |
 | batch | WM batch | 128 |
@@ -56,10 +58,11 @@ Real $z_{t+1}$, no WM rollout in the target; $d_t$ via truncation-as-done. Buffe
 | $\alpha$ | entropy coef (fixed) | 0.2 |
 | $\rho$ | Polyak target rate | 0.005 |
 | $\lambda_{\text{cur}}$ | curiosity weight | ? |
+| $\lambda_{\text{safe}}$ | safety-penalty weight | 0.1 |
 | $K_p,K_d$ | PD gains | ? |
 | $\Delta q^{\max}$ | per-joint delta clip | large ($\approx\infty$) |
-| $\tau_i^{\max}$ | motor torque limit | 2.94–3.35 N·m |
-| $\delta$ | safety deadband | ? |
+| $\tau_i^{\max}$ | motor torque limit | 3.35 N·m (all joints) |
+| $\delta$ | safety deadband (on $-\tau\,\ddot q$) | 15 |
 | $\Delta t_{\text{safe}}$ | accel finite-diff window | 10 timesteps |
 | action_block | env steps / decision | 5 |
 | action_max | actor output scale | 0.3 |

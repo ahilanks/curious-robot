@@ -67,7 +67,7 @@ class MujocoSO101Env:
         frame_skip: int = 6,                     # 30 Hz at timestep 0.005
         action_max: float = 0.3,                 # README action_max (delta scale)
         dq_max: float = 100.0,                   # README dq_max ~= inf
-        safety_delta: float = 0.05,              # README delta (safety deadband)
+        safety_delta: float = 15.0,             # README delta (safety deadband on -tau*qddot)
         n_objects: int = 10,
         n_cubes: int = 6,
         cube_size_range: tuple[float, float] = (0.012, 0.020),
