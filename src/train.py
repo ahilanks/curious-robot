@@ -742,13 +742,19 @@ def parse_args():
     p.add_argument("--flatline-window", type=int, default=200)
     p.add_argument("--flatline-tol", type=float, default=0.03)
     # reward ('?' values; sweepable)
-    p.add_argument("--lambda-safe", type=float, default=0.0,
-                   help="weight on the safety penalty r_safe in the reward; 0 (default) ablates safety "
-                        "(reward = pure curiosity), set 1.0 for the README r = r_safe + lambda_cur*symlog(r_cur)")
+    p.add_argument("--lambda-safe", type=float, default=0.1,
+                   help="weight on the safety penalty r_safe: r = lambda_safe*r_safe + lambda_cur*symlog(r_cur). "
+                        "Default 0.1 keeps safety:curiosity ~0.5:1 at steady state under the per-dim-mean r_cur "
+                        "(the literal README weight 1.0 over-weights safety ~5:1 now and freezes the policy); "
+                        "0 ablates safety.")
     p.add_argument("--lambda-cur", type=float, default=1.0,
                    help="curiosity weight on symlog(r_cur). r_cur is the per-dim MEAN squared pred error "
                         "(~O(0.1-1)), so lambda_cur~1 keeps cur_term O(1) in symlog's sensitive region. README '?'")
-    p.add_argument("--safety-delta", type=float, default=0.05, help="delta deadband (README '?'; sweep)")
+    p.add_argument("--safety-delta", type=float, default=15.0,
+                   help="delta: safety-reward deadband on the per-joint -tau*qddot (N*m*rad/s^2). Default 15 "
+                        "leaves gentle reaching / light contact / pickup (-tau*qddot<~15) penalty-free while "
+                        "penalizing hard impacts and violent high-torque reversals (~40-560). The old 0.05 "
+                        "penalized essentially all motion -> safety dominates -> policy freezes.")
     # SAC (README)
     p.add_argument("--gamma", type=float, default=0.9)
     p.add_argument("--alpha", type=float, default=0.2, help="fixed entropy temperature")
