@@ -34,8 +34,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from lewm.module import SIGReg                       # noqa: E402
 from model.state_encoder import WorldModel           # noqa: E402
-from env.parallel_env import VectorMujocoEnv, SubprocVectorMujocoEnv   # noqa: E402
 from src.probe import load_probe_hf                  # noqa: E402
+# Env backends are imported lazily in main() so the `hardware` backend does not require mujoco.
 
 try:
     import wandb
@@ -331,6 +331,25 @@ def resolve_ckpt(ckpt=None, name="baseline", step=None, hf_repo=None):
     return hf_hub_download(repo_id=repo, filename=target, token=token)
 
 
+def load_init_ckpt(args, wm, actor, critic, critic_tgt, device):
+    """Warm-start / resume: load WM + SAC weights so the online loop CONTINUES a prior run
+    instead of starting cold (train.py otherwise only ever SAVES checkpoints, never loads).
+    Resolves a local --init-ckpt or an HF --resume-name[/--resume-step]. Returns
+    (log_alpha on device, h_fwd) to overwrite the freshly-initialised values. NOTE: optimizer
+    state is not in the checkpoint, so Adam moments restart — lower LRs for bring-up if needed."""
+    path = resolve_ckpt(args.init_ckpt, args.resume_name or args.name, args.resume_step, args.hf_repo)
+    ck = torch.load(path, map_location=device, weights_only=False)
+    wm.load_state_dict(ck["wm"])
+    actor.load_state_dict(ck["actor"])
+    critic.load_state_dict(ck["critic"])
+    critic_tgt.load_state_dict(ck["critic_tgt"])
+    log_alpha = ck["log_alpha"].to(device)
+    h_fwd = int(ck.get("h_fwd", args.h_fwd_start))
+    print(f"[resume] loaded wm+actor+critic from {path} "
+          f"(saved step {ck.get('step', '?')}, h_fwd={h_fwd})", flush=True)
+    return log_alpha, h_fwd
+
+
 def tile_frames(imgs):
     """Tile (n_envs, H, W, 3) per-env camera frames into one (rows*H, cols*W, 3) grid,
     so a single train-video clip shows all parallel envs at once."""
@@ -356,7 +375,17 @@ def main(args):
     except ImportError:
         pass
 
-    VecEnv = SubprocVectorMujocoEnv if args.env_backend == "subproc" else VectorMujocoEnv
+    if args.env_backend == "hardware":
+        if args.n_envs != 1:
+            print(f"[hardware] forcing n_envs=1 (was {args.n_envs}; one physical arm)", flush=True)
+            args.n_envs = 1
+        from env.hardware_env import HardwareSO101Env
+        VecEnv = HardwareSO101Env
+    else:
+        from env.parallel_env import VectorMujocoEnv, SubprocVectorMujocoEnv
+        VecEnv = SubprocVectorMujocoEnv if args.env_backend == "subproc" else VectorMujocoEnv
+    if args.start_steps < 0:                      # default-aware: skip random warmup on a real arm
+        args.start_steps = 0 if args.env_backend == "hardware" else 1000
     env = VecEnv(n_envs=args.n_envs, frame_skip=args.frame_skip,
                  action_max=args.action_max, dq_max=args.dq_max,
                  safety_delta=args.safety_delta, seed=args.seed,
@@ -390,6 +419,11 @@ def main(args):
     wm_opt = torch.optim.AdamW([p for p in wm.parameters() if p.requires_grad],
                                lr=args.wm_lr, weight_decay=1e-3)
 
+    # --- resume / warm-start: load wm+sac weights BEFORE the loop (else cold start) ---
+    resume_h_fwd = None
+    if args.init_ckpt or args.resume_name:
+        log_alpha, resume_h_fwd = load_init_ckpt(args, wm, actor, critic, critic_tgt, device)
+
     cap = int(np.clip(args.buffer_frac * args.total_steps, 1000, 50_000))
     cap_per_env = max(cap // args.n_envs, args.history_size + args.h_fwd_max + 8)
     buf = ReplayBuffer(args.n_envs, cap_per_env, env.wrist_resolution, a_dim, prop_dim, device)
@@ -400,6 +434,20 @@ def main(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     n_params = sum(p.numel() for p in wm.parameters())
     print(f"[run] name={run_name}  out_dir={out_dir}  wm_params={n_params/1e6:.2f}M", flush=True)
+    if args.env_backend == "hardware":
+        loaded = bool(args.init_ckpt or args.resume_name)
+        warns = []
+        if args.action_max > 0.15:
+            warns.append(f"action_max={args.action_max} is large for a real arm")
+        if args.start_steps > 0:
+            warns.append(f"{args.start_steps} random-warmup steps will move the arm randomly")
+        if not loaded:
+            warns.append("no policy loaded (random actor)")
+        print(f"[hardware] SAFETY: n_envs=1, control_dt={env.dt_safe}s, "
+              f"action_max={args.action_max} (<= +/-{args.action_max} rad/joint/step), "
+              f"start_steps={args.start_steps}, policy={'loaded' if loaded else 'RANDOM'}. "
+              f"Keep the e-stop within reach." + ("  [!] " + "; ".join(warns) if warns else ""),
+              flush=True)
 
     run = None
     if not args.no_wandb and wandb is not None and os.environ.get("WANDB_API_KEY"):
@@ -424,7 +472,7 @@ def main(args):
     ep_len = np.zeros(args.n_envs, np.int64)
     ep_ret = np.zeros(args.n_envs, np.float32)
 
-    h_fwd = args.h_fwd_start                          # curriculum horizon
+    h_fwd = resume_h_fwd if resume_h_fwd is not None else args.h_fwd_start   # curriculum horizon (resumed if warm-started)
     pred_hist = deque(maxlen=args.flatline_window)    # for the flatline bump trigger
     updates_at_stage = 0
     recent = {k: deque(maxlen=400) for k in
@@ -687,17 +735,26 @@ def parse_args():
     p = argparse.ArgumentParser(description="Curious Robot: JEPA+SIGReg WM + SAC curiosity on SO-ARM101")
     # schedule / infra
     p.add_argument("--total-steps", type=int, default=200_000)
-    p.add_argument("--start-steps", type=int, default=1000, help="random-action warmup (decision steps)")
+    p.add_argument("--start-steps", type=int, default=-1,
+                   help="random-action warmup (decision steps); default-aware: 0 on hardware, 1000 in sim")
     p.add_argument("--n-envs", type=int, default=8)
     p.add_argument("--env-threads", type=int, default=0,
                    help=">0 steps envs on a thread pool (inproc backend only)")
-    p.add_argument("--env-backend", choices=("subproc", "inproc"), default="subproc",
+    p.add_argument("--env-backend", choices=("subproc", "inproc", "hardware"), default="subproc",
                    help="subproc: each env in a CUDA-free worker process, needed on "
                         "GPU+EGL to avoid the MuJoCo-render/CUDA SIGABRT; "
-                        "inproc: envs in this process (sequential or --env-threads)")
+                        "inproc: envs in this process (sequential or --env-threads); "
+                        "hardware: one physical SO-ARM101 via env/hardware_env.py (forces n_envs=1)")
     p.add_argument("--frame-skip", type=int, default=6)
     p.add_argument("--max-episode-steps", type=int, default=200, help="decision steps before truncation-as-done")
     p.add_argument("--seed", type=int, default=0)
+    # resume / warm-start (train.py otherwise never loads a checkpoint)
+    p.add_argument("--init-ckpt", default=None,
+                   help="local .pt to warm-start wm+actor+critic+critic_tgt+log_alpha+h_fwd before the loop")
+    p.add_argument("--resume-name", default=None,
+                   help="resume from an HF run name (e.g. safe15) instead of a local --init-ckpt")
+    p.add_argument("--resume-step", type=int, default=None,
+                   help="checkpoint step for --resume-name (default: latest available)")
     p.add_argument("--name", default="baseline",
                    help="short run keyword; drives the W&B run name, runs/<name>/, and HF "
                         "<name>/ckpt_*.pt. Keep it short and identifiable -- every constant/var "
