@@ -2,6 +2,7 @@
   "offsets_ticks": [2013, 1981, 2246, 1941, 1991, 2010],
   "signs": [1, 1, 1, 1, 1, 1],
   "vel_scale": 0.00153,
-  "p_gain": 64,
+  "p_gain": 16,
+  "d_gain": 32,
   "goal_speed": 2000
 }

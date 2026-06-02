@@ -281,8 +281,9 @@ class FeetechBus:
 
     STS3215 control table (protocol_end=0): Torque_Enable 40, Goal_Position 42, Present_Position
     56, Present_Speed 58 (sign-magnitude), Mode 33, P_gain 21. The SO-101 ships Mode=0 (position)
-    (position mode). The shipped P_gain=16 is too soft to track the 30 ms control loop, so we raise
-    it (default 64) and set GoalSpeed at construction (register config, no motion); enable_torque()
+    (position mode). P-gain/D-gain default to the shipped-stable 16/32 (tunable via the calib json;
+    raising them did NOT smooth safe15's real-arm jerk — that is policy-side, see logistics.md) and
+    GoalSpeed is set at construction (register config, no motion); enable_torque()
     then sets each goal to the CURRENT position BEFORE enabling torque, so the arm HOLDS where it is
     instead of snapping to the stale Goal_Position register (0 at boot).
     """
@@ -292,13 +293,14 @@ class FeetechBus:
     ADDR_PRESENT_SPEED = 58
     ADDR_MODE = 33
     ADDR_P_GAIN = 21
+    ADDR_D_GAIN = 22
     ADDR_GOAL_SPEED = 46
     TICKS_PER_REV = 4096          # STS3215 12-bit absolute encoder
     _RAD_PER_TICK = 2.0 * np.pi / TICKS_PER_REV
 
     def __init__(self, port: str, motor_ids=(1, 2, 3, 4, 5, 6),
                  offsets_ticks=None, signs=None, vel_scale: float | None = None,
-                 p_gain: int = 64, goal_speed: int = 2000,
+                 p_gain: int = 16, d_gain: int = 32, goal_speed: int = 2000,
                  enable_torque: bool = True, max_step_ticks: int = 300):
         if offsets_ticks is None or signs is None or vel_scale is None:
             raise RuntimeError(
@@ -328,6 +330,8 @@ class FeetechBus:
                 raise RuntimeError(f"FeetechBus: servo {sid} Mode={mode}, need 0 (position).")
             if self.pk.read1ByteTxRx(self.port, sid, self.ADDR_P_GAIN)[0] != int(p_gain):
                 self.pk.write1ByteTxRx(self.port, sid, self.ADDR_P_GAIN, int(p_gain))      # tracking stiffness (EEPROM)
+            if self.pk.read1ByteTxRx(self.port, sid, self.ADDR_D_GAIN)[0] != int(d_gain):
+                self.pk.write1ByteTxRx(self.port, sid, self.ADDR_D_GAIN, int(d_gain))      # damping: kills start-stop jerk
             self.pk.write2ByteTxRx(self.port, sid, self.ADDR_GOAL_SPEED, int(goal_speed))  # SRAM, resets on power-cycle
         if enable_torque:
             self.enable_torque()
