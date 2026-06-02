@@ -282,6 +282,35 @@ def collapse_metrics(z):
 
 
 # ----------------------------------------------------------------- checkpointing
+def save_buffer(buf, out_dir):
+    """Dump the collected transitions (chronological, per env) to out_dir/buffer_<N>.npz
+    for offline training (e.g. ship to a RunPod GPU). Reconstructs each env's ring into
+    oldest->newest order via start=(head-count)%C; is_start marks episode boundaries so a
+    consumer never builds a WM window across a reset."""
+    px, prop, act, r, d, isx, lengths = [], [], [], [], [], [], []
+    for e in range(buf.n_envs):
+        n = int(buf.count[e])
+        if n == 0:
+            continue
+        start = (int(buf.head[e]) - n) % buf.C
+        idx = (start + np.arange(n)) % buf.C
+        px.append(buf.pixels[e, idx]); prop.append(buf.proprio[e, idx])
+        act.append(buf.action[e, idx]); r.append(buf.r[e, idx])
+        d.append(buf.d[e, idx]); isx.append(buf.is_start[e, idx]); lengths.append(n)
+    if not lengths:
+        print("[frozen] buffer empty -> nothing to save", flush=True)
+        return None
+    path = out_dir / f"buffer_{sum(lengths):07d}.npz"
+    np.savez_compressed(path,
+                        pixels=np.concatenate(px), proprio=np.concatenate(prop),
+                        action=np.concatenate(act), r=np.concatenate(r),
+                        d=np.concatenate(d), is_start=np.concatenate(isx),
+                        env_lengths=np.asarray(lengths, np.int64))
+    print(f"[frozen] saved {sum(lengths)} transitions -> {path} "
+          f"({path.stat().st_size / 1e6:.1f} MB)", flush=True)
+    return path
+
+
 def save_and_upload(state, out_dir, step, repo_id, run_name, enable_hf, keep_local):
     """Save a checkpoint, upload to HF under <run_name>/ckpt_<step>.pt, then (unless
     keep_local) delete the local copy once the upload succeeds -- so disk stays
@@ -424,8 +453,28 @@ def main(args):
     if args.init_ckpt or args.resume_name:
         log_alpha, resume_h_fwd = load_init_ckpt(args, wm, actor, critic, critic_tgt, device)
 
+    # --- frozen-policy data collection: act + buffer, NO gradient updates ---
+    policy_loaded = bool(args.init_ckpt or args.resume_name)
+    if args.frozen_policy and not policy_loaded:
+        msg = ("--frozen-policy with no --init-ckpt/--resume-name -> a RANDOM-init actor "
+               "would drive the arm with no learning to correct it")
+        if args.env_backend == "hardware":
+            raise SystemExit(f"[frozen] REFUSING on hardware: {msg}. "
+                             "Load a policy, e.g. --resume-name safe15 --resume-step 100000.")
+        print(f"[frozen] WARNING: {msg}.", flush=True)
+    if args.frozen_policy:
+        print("[frozen] data-collection mode: NO gradient updates (WM/SAC/alpha/curriculum "
+              "all skipped); acting + buffering only. Buffer -> out_dir/buffer_<N>.npz on exit.",
+              flush=True)
+
     cap = int(np.clip(args.buffer_frac * args.total_steps, 1000, 50_000))
     cap_per_env = max(cap // args.n_envs, args.history_size + args.h_fwd_max + 8)
+    if args.frozen_policy or args.save_buffer:   # collection KEEPS everything -> size the ring to the whole run
+        keep = min(args.total_steps, 50_000)     # (the per-env ring otherwise overwrites the oldest in place)
+        if args.total_steps > 50_000:
+            print(f"[frozen] WARNING: requested {args.total_steps} steps but the buffer holds {keep}/env; "
+                  f"oldest will be overwritten. Split into shorter runs to keep all transitions.", flush=True)
+        cap_per_env = max(cap_per_env, keep)
     buf = ReplayBuffer(args.n_envs, cap_per_env, env.wrist_resolution, a_dim, prop_dim, device)
     print(f"[buffer] {args.n_envs} x {cap_per_env} = {args.n_envs * cap_per_env} transitions", flush=True)
 
@@ -553,7 +602,22 @@ def main(args):
                 last_sac = (float(critic_loss.item()), float(actor_loss.item()))
         return h_fwd
 
+    # graceful stop for data-collection runs: 1st Ctrl-C finishes the in-flight decision and
+    # saves; a 2nd Ctrl-C (default handler restored) force-quits.
+    _stop = {"flag": False}
+    if args.frozen_policy or args.save_buffer:
+        import signal
+        def _on_sigint(signum, frame):
+            _stop["flag"] = True
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            print("\n[frozen] stop requested -> finishing this decision then saving "
+                  "(Ctrl-C again to force-quit).", flush=True)
+        signal.signal(signal.SIGINT, _on_sigint)
+
     for step in range(args.total_steps):
+        if _stop["flag"]:
+            print(f"[frozen] graceful stop at step {step} ({buf.total} transitions).", flush=True)
+            break
         cur_px, cur_prop = obs["image"], obs["proprio"]          # o_t (before acting)
 
         # --- act ---
@@ -568,7 +632,8 @@ def main(args):
         # --- async actor-learner: launch the env rollout for this decision, then run
         #     the GPU updates on buffered data WHILE the workers render -> overlap CPU/GPU ---
         env.step_block_async(a_env)
-        h_fwd = learner_updates(step, h_fwd)
+        if not args.frozen_policy:                # frozen: skip ALL gradient work (data collection only)
+            h_fwd = learner_updates(step, h_fwd)
         obs, sub_infos = env.step_block_wait()
 
         # --- accumulate safety reward + interaction stats over the action_block ---
@@ -718,13 +783,16 @@ def main(args):
                     print(f"[video] {tag} failed (non-fatal): {ex}", flush=True)
             wrist_buf.clear(); over_buf.clear()
 
-    # --- final checkpoint ---
-    state = {"step": args.total_steps, "wm": wm.state_dict(), "actor": actor.state_dict(),
-             "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
-             "log_alpha": log_alpha.detach().cpu(), "h_fwd": h_fwd, "args": vars(args)}
-    save_and_upload(state, out_dir, args.total_steps,
-                    args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
-                    run_name, not args.no_hf, args.keep_local_ckpts)
+    # --- final: collected data (frozen / --save-buffer) and/or model checkpoint ---
+    if args.frozen_policy or args.save_buffer:
+        save_buffer(buf, out_dir)
+    if not args.frozen_policy:                    # frozen: weights are unchanged, skip the re-upload
+        state = {"step": args.total_steps, "wm": wm.state_dict(), "actor": actor.state_dict(),
+                 "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
+                 "log_alpha": log_alpha.detach().cpu(), "h_fwd": h_fwd, "args": vars(args)}
+        save_and_upload(state, out_dir, args.total_steps,
+                        args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
+                        run_name, not args.no_hf, args.keep_local_ckpts)
     env.close()
     if run is not None:
         run.finish()
@@ -831,6 +899,12 @@ def parse_args():
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--wandb-project", default=None)
     p.add_argument("--no-hf", action="store_true", help="disable HF checkpoint upload")
+    p.add_argument("--frozen-policy", action="store_true",
+                   help="data-collection/eval: act with the loaded policy, NO gradient updates "
+                        "(much higher cadence, learner removed). Refuses on hardware without a loaded policy.")
+    p.add_argument("--save-buffer", action="store_true",
+                   help="dump the replay buffer to out_dir/buffer_<N>.npz on exit (implied by "
+                        "--frozen-policy); enables graceful Ctrl-C save.")
     p.add_argument("--hf-repo", default=None, help="HF repo id (else $HF_UPLOAD_REPO_ID)")
     return p.parse_args()
 
