@@ -40,6 +40,9 @@ arm-contact set empty → all interaction metrics were silently 0; now verified 
       δ (0.05). Watch `reward/safe_cur_ratio`, `interact/contacts_per_step`, pred/persist.
       (β is pinned at 0.3, no longer swept.)
 - [ ] **TD-priority ablation** — `--per-priority td` vs `curiosity` (see Ablations).
+- [ ] **Hardware: adapt WM/policy on real data** — safe15 is OOD-jerky on the real arm (see 2026-06-01/02
+      log); offline adaptation on collected `buffer_*.npz` (frozen-collect → train → sync weights) is the
+      smoothness fix, not config/gain tuning. Calibration + bus are done (`so101_calib.json`, `FeetechBus`).
 - [x] Pin the swept `?` values into `README.md` — **done 2026-05-31 (maintainer-approved):**
       δ=15, λ_safe=0.1, τ_max=3.35, h_fwd_max=1, r_cur→per-dim-mean. (λ_cur still `?` — at 20, unswept.)
 
@@ -163,3 +166,42 @@ _(add a dated entry per run)_
   non-freezing / WM-safe, but does not by itself solve explore-toward-objects** — that remains THE open
   problem (curiosity gradient points away from blocks; reward-shaping / λ_cur / intrinsic-exploration
   territory, orthogonal to the safety weighting). Final ckpt on HF (`safe15/ckpt_0100000.pt`).
+- 2026-06-01/02 — **first hardware deployment: `safe15` onto the physical SO-ARM101** (on the M4 Mac,
+  branch `safety/deadband-and-lambda-safe`). Stood up the whole real-arm path and ran safe15 frozen on
+  it. Headline: a clean **sim→real gap on motion smoothness**.
+  - **Bring-up (new, committed):** `FeetechBus` in `env/hardware_env.py` via Feetech `scservo_sdk`
+    (replaced the LeRobot stub — LeRobot wasn't installed and its import path was stale). STS3215 over
+    the TTL bus `/dev/cu.usbmodem5AA90245791` (model 777, 1 Mbps, protocol_end 0); wrist cam = OpenCV
+    **index 0** (generic UVC). Safe energize: set `Goal_Position`=current **before** `Torque_Enable`
+    (boot goal=0 would slam every joint to tick 0); `read()` keeps last-good on a dropped serial read
+    (never 0 → no phantom slam); per-command jump clamp. Added **`--frozen-policy`** collection mode to
+    `src/train.py` (no grad updates; dumps the replay buffer → `out_dir/buffer_<N>.npz` for offline /
+    RunPod training; `--save-buffer`; graceful Ctrl-C save; refuses on hw without a loaded policy).
+  - **Calibration → `so101_calib.json`** (checkpoint-independent — the collection still loads safe15):
+    `offsets_ticks [2013,1981,2246,1941,1991,2010]`, `signs [1,1,1,1,1,1]` (all +, verified by sim
+    render-match **and** under-torque pokes), `vel_scale 0.00153` (empirical; STS3215 Present_Speed is
+    sign-magnitude, bit15). Method: hand-pose to the rendered zero for offsets, per-joint render-matched
+    pushes for signs. Reference renders in `calib_refs/`.
+  - **Matched the safe15 training config** (read from the ckpt `args`, == W&B `4zn95btc`): action_max
+    **0.3**, λ_cur **20**, λ_safe **0.1**, δ **15**, action_block 5, history_size 3; `total_steps=100000`
+    so **step 100000 is the final/last**. (First mis-deployed at action_max 0.05 + λ_cur 1.)
+  - **KEY FINDING — safe15 is JERKY on the real arm; it's the sim→real gap, not the rig.** Real frozen
+    runs: r_safe ≈ **−100** at action_max 0.05, ≈ **−190** at 0.3 (vs sim's −30→−51), visually **"very
+    jerky"** (user-confirmed). NOT a sensor artifact (q̇=q̈=0 dead-clean at rest). NOT fixable by servo
+    PD (a P/D sweep cut a *synthetic* stressor's r_safe 3× but did nothing for real safe15; P=64/D=96 was
+    "very jerky" → reverted to shipped-stable **P=16/D=32**, now the default) NOR by action_max (bigger =
+    worse). Root cause: safe15 learned smooth, motor-compliant motion *for sim proprio + rendered images*;
+    the real arm's proprio/images are mildly OOD so it doesn't reproduce that smoothness (the very effect
+    that drives r_safe −51.5→−30 *in sim training* just doesn't transfer) → motor-fighting → large `−τ·q̈`.
+    With λ_cur 20 / λ_safe 0.1, curiosity (~+11) only wins when r_safe is small (reward ≈ +2 at 0.05); at
+    0.3 the −190 penalty dominates (reward ≈ −8).
+  - **Misc:** M4 frozen-collection cadence ~**5 sps** (the M4 is the deploy machine — USB bus + cam live
+    on it; RunPod stays for the 8-env sim + offline training). Post-run pan "shaking" = creep toward a
+    stale `Goal_Position` (goal=current parks it), not a gain issue. Verified `--frozen-policy` end-to-end
+    on mock + real (buffer npz saves; safe:cur balance correct under λ_cur 20).
+  - **Conclusion / next:** bring-up + calibration done and validated; the frozen safe15 run collects
+    valid (jerky-but-bounded, **safe**) real data. **The smoothness fix is policy/WM ADAPTATION on real
+    data (offline), not config tuning** — safe15 only moves smoothly on hardware after it has seen real
+    transitions. Gentler-collection levers if needed: soft gains (now default), lower action_max,
+    low-pass the action stream. This is the **same class of problem** as the sim explore-toward-objects
+    gap — the policy is OOD on real inputs. All on branch `safety/deadband-and-lambda-safe`.
