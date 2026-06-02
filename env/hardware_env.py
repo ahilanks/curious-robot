@@ -263,7 +263,7 @@ def _default_bus() -> "ServoBus":
     if os.environ.get("SOARM_CALIB"):
         with open(os.environ["SOARM_CALIB"]) as f:
             calib = json.load(f)
-    return LeRobotFeetechBus(port=port, **calib)
+    return FeetechBus(port=port, **calib)
 
 
 def _default_camera(hw: int) -> "Camera":
@@ -273,55 +273,116 @@ def _default_camera(hw: int) -> "Camera":
     return UsbCamera(index=int(os.environ.get("SOARM_CAM", "0")), hw=hw)
 
 
-class LeRobotFeetechBus:
-    """Real STS3215 bus via HuggingFace LeRobot's FeetechMotorsBus.
+class FeetechBus:
+    """Real STS3215 bus via Feetech's scservo_sdk (the same wire protocol LeRobot uses under
+    the hood). Speaks raw 0-4095 ticks, mapped into the MuJoCo joint frame by the calibration
+    (offsets_ticks, signs, vel_scale) measured against the so101_new_calib.xml model and stored
+    in SOARM_CALIB json. This is the ONE place the real arm is energized.
 
-    YOU MUST run LeRobot's calibration first and supply offsets_ticks + signs so that the
-    returned q matches the MuJoCo joint convention (zero pose AND direction). If it doesn't,
-    proprio and the recomputed torque are in the wrong frame and r_safe is meaningless.
-
-    The exact LeRobot import path / register names vary by version — adapt the two TODO
-    lines to the lerobot you installed (Present_Position / Present_Speed / Goal_Position are
-    the standard Feetech control-table fields). This is the ONE place the real arm is touched.
+    STS3215 control table (protocol_end=0): Torque_Enable 40, Goal_Position 42, Present_Position
+    56, Present_Speed 58 (sign-magnitude), Mode 33, P_gain 21. The SO-101 ships Mode=0 (position)
+    (position mode). The shipped P_gain=16 is too soft to track the 30 ms control loop, so we raise
+    it (default 64) and set GoalSpeed at construction (register config, no motion); enable_torque()
+    then sets each goal to the CURRENT position BEFORE enabling torque, so the arm HOLDS where it is
+    instead of snapping to the stale Goal_Position register (0 at boot).
     """
+    ADDR_TORQUE_ENABLE = 40
+    ADDR_GOAL_POSITION = 42
+    ADDR_PRESENT_POSITION = 56
+    ADDR_PRESENT_SPEED = 58
+    ADDR_MODE = 33
+    ADDR_P_GAIN = 21
+    ADDR_GOAL_SPEED = 46
     TICKS_PER_REV = 4096          # STS3215 12-bit absolute encoder
     _RAD_PER_TICK = 2.0 * np.pi / TICKS_PER_REV
 
     def __init__(self, port: str, motor_ids=(1, 2, 3, 4, 5, 6),
                  offsets_ticks=None, signs=None, vel_scale: float | None = None,
-                 p_gain: int = 16):
+                 p_gain: int = 64, goal_speed: int = 2000,
+                 enable_torque: bool = True, max_step_ticks: int = 300):
         if offsets_ticks is None or signs is None or vel_scale is None:
             raise RuntimeError(
-                "LeRobotFeetechBus needs calibration: offsets_ticks[6], signs[6], vel_scale "
-                "(rad/s per raw velocity unit). Run LeRobot calibration and pass them "
-                "(or via SOARM_CALIB json). Refusing to run uncalibrated on a real arm.")
+                "FeetechBus needs calibration: offsets_ticks[6], signs[6], vel_scale "
+                "(rad/s per raw velocity unit). Run the so101 calibration and pass them via "
+                "SOARM_CALIB json. Refusing to run uncalibrated on a real arm.")
+        from scservo_sdk import PortHandler, PacketHandler, COMM_SUCCESS
+        self._OK = COMM_SUCCESS
         self.motor_ids = list(motor_ids)
         self.offsets = np.asarray(offsets_ticks, np.float64)
         self.signs = np.asarray(signs, np.float64)
         self.vel_scale = float(vel_scale)
-        # TODO[lerobot]: construct the bus for your version, e.g.
-        #   from lerobot.common.robot_devices.motors.feetech import FeetechMotorsBus
-        #   self.bus = FeetechMotorsBus(port=port, motors={...STS3215...}); self.bus.connect()
-        #   put every servo in position mode, set P-gain=p_gain, enable torque.
-        from lerobot.common.robot_devices.motors.feetech import FeetechMotorsBus  # noqa: F401  (lazy)
-        raise NotImplementedError(
-            "Wire FeetechMotorsBus construction + position-mode/P-gain setup for your "
-            "lerobot version here (see the TODO). The conversion math below is ready.")
+        self.max_step_ticks = int(max_step_ticks)    # backstop: cap any single commanded jump
+        self._last_pos = None                         # last good Present_Position (set by enable_torque)
+        self._torque = False
+        self.port = PortHandler(port)
+        if not self.port.openPort():
+            raise RuntimeError(f"FeetechBus: could not open port {port}")
+        self.port.setBaudRate(1_000_000)
+        self.pk = PacketHandler(0)
+        for sid in self.motor_ids:                       # presence check + config (P-gain/speed; no motion)
+            _, comm, _ = self.pk.ping(self.port, sid)
+            if comm != COMM_SUCCESS:
+                raise RuntimeError(f"FeetechBus: servo id {sid} not responding on {port}")
+            mode = self.pk.read1ByteTxRx(self.port, sid, self.ADDR_MODE)[0]
+            if mode != 0:
+                raise RuntimeError(f"FeetechBus: servo {sid} Mode={mode}, need 0 (position).")
+            if self.pk.read1ByteTxRx(self.port, sid, self.ADDR_P_GAIN)[0] != int(p_gain):
+                self.pk.write1ByteTxRx(self.port, sid, self.ADDR_P_GAIN, int(p_gain))      # tracking stiffness (EEPROM)
+            self.pk.write2ByteTxRx(self.port, sid, self.ADDR_GOAL_SPEED, int(goal_speed))  # SRAM, resets on power-cycle
+        if enable_torque:
+            self.enable_torque()
+
+    def enable_torque(self) -> None:
+        """SAFE energize: set each Goal_Position to its CURRENT Present_Position, THEN enable
+        torque, so the arm holds where it is rather than snapping to a stale goal (= 0 at boot)."""
+        cur_pos = []
+        for sid in self.motor_ids:
+            cur, c, _ = self.pk.read2ByteTxRx(self.port, sid, self.ADDR_PRESENT_POSITION)
+            if c != self._OK:
+                raise RuntimeError(f"FeetechBus: read failed on servo {sid} before torque-on")
+            self.pk.write2ByteTxRx(self.port, sid, self.ADDR_GOAL_POSITION, int(cur))
+            self.pk.write1ByteTxRx(self.port, sid, self.ADDR_TORQUE_ENABLE, 1)
+            cur_pos.append(cur)
+        self._last_pos = np.asarray(cur_pos, np.float64)   # seed last-good for read()/write_goal guards
+        self._torque = True
+
+    def disable_torque(self) -> None:
+        for sid in self.motor_ids:
+            self.pk.write1ByteTxRx(self.port, sid, self.ADDR_TORQUE_ENABLE, 0)
+        self._torque = False
 
     def read(self) -> tuple[np.ndarray, np.ndarray]:
-        pos_ticks = np.asarray(self.bus.read("Present_Position"), np.float64)   # TODO[lerobot] field name
-        vel_raw = np.asarray(self.bus.read("Present_Speed"), np.float64)        # TODO[lerobot] field name
-        q = (pos_ticks - self.offsets) * self._RAD_PER_TICK * self.signs
-        qd = vel_raw * self.vel_scale * self.signs
+        pos, spd = [], []
+        for i, sid in enumerate(self.motor_ids):
+            p, cp, _ = self.pk.read2ByteTxRx(self.port, sid, self.ADDR_PRESENT_POSITION)
+            if cp != self._OK:
+                p, cp, _ = self.pk.read2ByteTxRx(self.port, sid, self.ADDR_PRESENT_POSITION)  # 1 retry
+            if cp != self._OK:                               # NEVER fall back to 0 -> phantom slam;
+                p = self._last_pos[i] if self._last_pos is not None else self.offsets[i]  # keep last good
+            pos.append(p)
+            s, cs, _ = self.pk.read2ByteTxRx(self.port, sid, self.ADDR_PRESENT_SPEED)
+            mag = (s & 0x7FFF) if cs == self._OK else 0      # Present_Speed sign-magnitude; 0 vel on drop
+            spd.append(-mag if (cs == self._OK and (s & 0x8000)) else mag)
+        pos = np.asarray(pos, np.float64); spd = np.asarray(spd, np.float64)
+        self._last_pos = pos.copy()                          # refresh last-good
+        q = (pos - self.offsets) * self._RAD_PER_TICK * self.signs
+        qd = spd * self.vel_scale * self.signs
         return q.astype(np.float32), qd.astype(np.float32)
 
     def write_goal(self, goal_rad: np.ndarray) -> None:
         ticks = np.asarray(goal_rad, np.float64) / self.signs / self._RAD_PER_TICK + self.offsets
-        self.bus.write("Goal_Position", ticks.round().astype(int))             # TODO[lerobot] field name
+        if self._last_pos is not None:                       # backstop: no single command may jump more
+            ticks = np.clip(ticks, self._last_pos - self.max_step_ticks,   # than max_step_ticks from the
+                            self._last_pos + self.max_step_ticks)          # current position
+        ticks = np.clip(np.round(ticks), 0, 4095).astype(int)   # final guard against out-of-range
+        for sid, t in zip(self.motor_ids, ticks):
+            self.pk.write2ByteTxRx(self.port, sid, self.ADDR_GOAL_POSITION, int(t))
 
     def close(self) -> None:
-        if hasattr(self, "bus"):
-            self.bus.disconnect()
+        # leave torque as-is (holding the last pose) so the arm does not drop on shutdown;
+        # call disable_torque() explicitly to free it.
+        if hasattr(self, "port"):
+            self.port.closePort()
 
 
 class UsbCamera:
