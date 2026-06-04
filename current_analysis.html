@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>safe15 · safety-reward & jerkiness telemetry</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600;12..96,700;12..96,800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#070a0f; --bg2:#0b0f16; --panel:#0c1119; --panel2:#0e141d;
+  --grid:rgba(126,148,178,0.07); --gridb:rgba(126,148,178,0.13);
+  --ink:#e9eef7; --ink2:#aeb9cb; --muted:#6f7d93; --faint:#46546a;
+  --danger:#ff6a45;    /* r_safe / jerk penalty */
+  --danger-dim:rgba(255,106,69,.16);
+  --cyan:#34dbe6;      /* curiosity */
+  --lime:#b6e84f;      /* total reward */
+  --amber:#ffb84d;     /* annotations / warning */
+  --line:rgba(126,148,178,0.16);
+  --maxw:1180px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  background:
+    radial-gradient(1200px 700px at 78% -8%, rgba(255,106,69,.10), transparent 60%),
+    radial-gradient(900px 600px at 8% 12%, rgba(52,219,230,.07), transparent 55%),
+    var(--bg);
+  color:var(--ink);
+  font-family:"Bricolage Grotesque",system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased; line-height:1.5;
+  overflow-x:hidden;
+}
+/* measurement grid + scanlines */
+body::before{
+  content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+  background-image:
+    linear-gradient(var(--grid) 1px,transparent 1px),
+    linear-gradient(90deg,var(--grid) 1px,transparent 1px);
+  background-size:46px 46px;
+  -webkit-mask-image:radial-gradient(120% 90% at 50% 0%,#000 55%,transparent 100%);
+          mask-image:radial-gradient(120% 90% at 50% 0%,#000 55%,transparent 100%);
+}
+body::after{
+  content:""; position:fixed; inset:0; z-index:0; pointer-events:none; opacity:.5;
+  background:repeating-linear-gradient(0deg,rgba(0,0,0,0) 0 2px,rgba(0,0,0,.16) 2px 3px);
+}
+.mono{font-family:"JetBrains Mono",monospace}
+.wrap{position:relative; z-index:1; max-width:var(--maxw); margin:0 auto; padding:0 28px}
+
+/* ---------- top status bar ---------- */
+.statusbar{
+  position:sticky; top:0; z-index:50;
+  backdrop-filter:blur(9px);
+  background:linear-gradient(180deg,rgba(7,10,15,.92),rgba(7,10,15,.62));
+  border-bottom:1px solid var(--line);
+}
+.statusbar .row{display:flex; align-items:center; justify-content:space-between; gap:18px;
+  height:46px; font-size:11px; letter-spacing:.16em; text-transform:uppercase}
+.live{display:flex; align-items:center; gap:9px; color:var(--ink2)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--danger);
+  box-shadow:0 0 0 0 rgba(255,106,69,.6); animation:pulse 2.1s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(255,106,69,.55)}70%{box-shadow:0 0 0 9px rgba(255,106,69,0)}100%{box-shadow:0 0 0 0 rgba(255,106,69,0)}}
+.statusbar .meta{display:flex; gap:22px; color:var(--muted)}
+.statusbar .meta b{color:var(--ink2); font-weight:500}
+@media(max-width:720px){.statusbar .meta span:nth-child(n+2){display:none}}
+
+/* ---------- hero ---------- */
+.hero{padding:74px 0 30px; position:relative}
+.eyebrow{font-family:"JetBrains Mono",monospace; font-size:12px; letter-spacing:.32em;
+  text-transform:uppercase; color:var(--danger); margin-bottom:22px; display:flex; gap:14px; align-items:center}
+.eyebrow .ln{height:1px; width:54px; background:linear-gradient(90deg,var(--danger),transparent)}
+h1{font-weight:800; font-size:clamp(2.5rem,6.4vw,5.4rem); line-height:.98;
+  letter-spacing:-.03em; max-width:14ch}
+h1 .hl{color:var(--danger)}
+.lede{margin-top:24px; max-width:62ch; color:var(--ink2); font-size:clamp(1rem,1.7vw,1.22rem)}
+.lede b{color:var(--ink); font-weight:600}
+.chiprow{display:flex; flex-wrap:wrap; gap:8px; margin-top:30px}
+.chip{font-family:"JetBrains Mono",monospace; font-size:11px; letter-spacing:.06em;
+  padding:6px 11px; border:1px solid var(--line); border-radius:2px; color:var(--ink2);
+  background:rgba(255,255,255,.015)}
+.chip b{color:var(--danger); font-weight:500}
+.watermark{position:absolute; right:-2%; top:30px; font-family:"JetBrains Mono",monospace;
+  font-size:clamp(5rem,17vw,15rem); font-weight:700; color:transparent;
+  -webkit-text-stroke:1px rgba(126,148,178,.07); user-select:none; pointer-events:none; z-index:-1;
+  letter-spacing:-.04em}
+
+/* ---------- stat readout strip ---------- */
+.readout{display:grid; grid-template-columns:repeat(5,1fr); gap:0;
+  border:1px solid var(--line); border-radius:3px; overflow:hidden;
+  background:linear-gradient(180deg,var(--panel),var(--bg2)); margin-top:46px}
+.stat{padding:22px 20px; border-right:1px solid var(--line); position:relative}
+.stat:last-child{border-right:0}
+.stat .k{font-family:"JetBrains Mono",monospace; font-size:10px; letter-spacing:.18em;
+  text-transform:uppercase; color:var(--muted)}
+.stat .v{font-family:"JetBrains Mono",monospace; font-weight:700; font-size:clamp(1.5rem,3vw,2.15rem);
+  margin-top:12px; letter-spacing:-.02em; font-variant-numeric:tabular-nums}
+.stat .v.neg{color:var(--danger)} .stat .v.pos{color:var(--lime)} .stat .v.cy{color:var(--cyan)}
+.stat .s{font-family:"JetBrains Mono",monospace; font-size:11px; color:var(--ink2); margin-top:7px}
+.stat .s .up{color:var(--lime)} .stat .s .dn{color:var(--danger)}
+@media(max-width:880px){.readout{grid-template-columns:repeat(2,1fr)}
+  .stat{border-bottom:1px solid var(--line)} .stat:nth-child(2n){border-right:0}}
+
+/* ---------- sections ---------- */
+section{padding:66px 0}
+.shead{display:flex; align-items:baseline; gap:16px; margin-bottom:8px}
+.shead .num{font-family:"JetBrains Mono",monospace; font-size:12px; color:var(--danger);
+  letter-spacing:.1em; padding-top:6px}
+.shead h2{font-weight:700; font-size:clamp(1.7rem,3.4vw,2.5rem); letter-spacing:-.025em; line-height:1.04}
+.sdesc{max-width:64ch; color:var(--ink2); margin:14px 0 30px; font-size:1.04rem}
+.sdesc b{color:var(--ink); font-weight:600}
+.sdesc .red{color:var(--danger); font-weight:600}
+
+/* ---------- panel + charts ---------- */
+.panel{position:relative; background:linear-gradient(180deg,var(--panel),var(--panel2));
+  border:1px solid var(--line); border-radius:4px; padding:20px 20px 16px}
+.panel .corner{position:absolute; width:11px; height:11px; border:1.5px solid var(--gridb)}
+.corner.tl{top:7px;left:7px;border-right:0;border-bottom:0}
+.corner.tr{top:7px;right:7px;border-left:0;border-bottom:0}
+.corner.bl{bottom:7px;left:7px;border-right:0;border-top:0}
+.corner.br{bottom:7px;right:7px;border-left:0;border-top:0}
+.phead{display:flex; align-items:center; justify-content:space-between; gap:12px;
+  margin:2px 4px 14px; flex-wrap:wrap}
+.phead .lbl{font-family:"JetBrains Mono",monospace; font-size:11px; letter-spacing:.18em;
+  text-transform:uppercase; color:var(--ink2)}
+.legend{display:flex; gap:16px; flex-wrap:wrap}
+.lg{display:flex; align-items:center; gap:7px; font-family:"JetBrains Mono",monospace;
+  font-size:11px; color:var(--muted)}
+.lg i{width:14px; height:3px; border-radius:2px; display:inline-block}
+svg{display:block; width:100%; height:auto; overflow:visible}
+.cap{font-family:"JetBrains Mono",monospace; font-size:11.5px; color:var(--muted);
+  margin-top:12px; padding-left:4px; line-height:1.6}
+.cap b{color:var(--ink2); font-weight:500}
+
+/* svg primitives */
+.gridln{stroke:var(--grid); stroke-width:1}
+.gridln.b{stroke:var(--gridb)}
+.axt{font-family:"JetBrains Mono",monospace; font-size:11px; fill:var(--muted)}
+.trace{fill:none; stroke-linejoin:round; stroke-linecap:round;
+  stroke-dasharray:var(--len); stroke-dashoffset:var(--len);
+  transition:stroke-dashoffset 1.7s cubic-bezier(.4,0,.15,1)}
+.in .trace{stroke-dashoffset:0}
+.anno{font-family:"JetBrains Mono",monospace; fill:var(--ink2)}
+.annoglow{filter:drop-shadow(0 0 6px rgba(255,106,69,.5))}
+
+/* ---------- windowed readout ---------- */
+.windows{margin-top:18px; border-top:1px dashed var(--line); padding-top:16px}
+.win{display:grid; grid-template-columns:78px 1fr 64px; align-items:center; gap:14px; padding:5px 4px}
+.win .wl{font-family:"JetBrains Mono",monospace; font-size:11px; color:var(--muted)}
+.win .bar{height:9px; background:rgba(255,106,69,.1); border-radius:2px; position:relative; overflow:hidden}
+.win .bar i{position:absolute; left:0; top:0; bottom:0; width:0;
+  background:linear-gradient(90deg,rgba(255,106,69,.35),var(--danger));
+  border-radius:2px; transition:width 1.2s cubic-bezier(.3,0,.1,1)}
+.in .win .bar i{width:var(--w)}
+.win .wv{font-family:"JetBrains Mono",monospace; font-size:12px; color:var(--danger); text-align:right; font-weight:500}
+
+/* ---------- reframe equation ---------- */
+.reframe{display:grid; grid-template-columns:1.1fr .9fr; gap:26px; align-items:center}
+@media(max-width:840px){.reframe{grid-template-columns:1fr}}
+.eqbox{background:linear-gradient(180deg,var(--panel),var(--panel2)); border:1px solid var(--line);
+  border-left:2px solid var(--danger); border-radius:4px; padding:26px 24px}
+.eqbox .tag{font-family:"JetBrains Mono",monospace; font-size:10px; letter-spacing:.2em;
+  text-transform:uppercase; color:var(--danger); margin-bottom:14px}
+.eq{font-family:"JetBrains Mono",monospace; font-size:clamp(.92rem,1.9vw,1.18rem); line-height:1.9;
+  color:var(--ink); letter-spacing:-.01em}
+.eq .v{color:var(--danger)} .eq .d{color:var(--amber)} .eq .o{color:var(--cyan)}
+.eq small{color:var(--muted); font-size:.8em}
+.confounds{display:flex; flex-direction:column; gap:12px}
+.cf{display:flex; gap:13px; align-items:flex-start; padding:14px 16px; border:1px solid var(--line);
+  border-radius:3px; background:rgba(255,255,255,.012)}
+.cf .ix{font-family:"JetBrains Mono",monospace; color:var(--amber); font-size:13px; flex-shrink:0; padding-top:1px}
+.cf p{font-size:.93rem; color:var(--ink2)} .cf p b{color:var(--ink); font-weight:600}
+
+/* ---------- gap callout ---------- */
+.bigfact{display:flex; gap:8px; align-items:baseline; margin:26px 0 6px; flex-wrap:wrap}
+.bigfact .n{font-family:"JetBrains Mono",monospace; font-weight:700; font-size:clamp(2.4rem,6vw,4rem);
+  color:var(--danger); letter-spacing:-.03em; line-height:1}
+.bigfact .t{color:var(--ink2); font-size:1.05rem; max-width:34ch}
+
+/* ---------- footnotes ---------- */
+.notes{display:grid; grid-template-columns:1fr 1fr; gap:18px; margin-top:8px}
+@media(max-width:760px){.notes{grid-template-columns:1fr}}
+.note{border:1px solid var(--line); border-radius:3px; padding:18px 18px;
+  background:linear-gradient(180deg,var(--panel),var(--bg2))}
+.note .h{font-family:"JetBrains Mono",monospace; font-size:11px; letter-spacing:.14em;
+  text-transform:uppercase; color:var(--amber); margin-bottom:10px; display:flex; gap:8px; align-items:center}
+.note p{color:var(--ink2); font-size:.95rem} .note p b{color:var(--ink)}
+.note.next{border-left:2px solid var(--cyan)} .note.next .h{color:var(--cyan)}
+
+/* ---------- footer ---------- */
+footer{border-top:1px solid var(--line); margin-top:30px; padding:34px 0 60px}
+footer .row{display:flex; justify-content:space-between; gap:20px; flex-wrap:wrap;
+  font-family:"JetBrains Mono",monospace; font-size:11px; color:var(--muted); letter-spacing:.04em}
+footer b{color:var(--ink2); font-weight:500}
+footer a{color:var(--danger); text-decoration:none}
+
+.reveal{opacity:0; transform:translateY(22px); transition:opacity .8s ease,transform .8s cubic-bezier(.2,.7,.2,1)}
+.reveal.in{opacity:1; transform:none}
+@media(prefers-reduced-motion:reduce){
+  .reveal,.trace,.win .bar i{transition:none!important; opacity:1!important; transform:none!important;
+    stroke-dashoffset:0!important; width:var(--w)!important}
+}
+</style>
+</head>
+<body>
+
+<div class="statusbar">
+  <div class="wrap row">
+    <div class="live"><span class="dot"></span> Live telemetry · replay</div>
+    <div class="meta mono">
+      <span><b>RUN</b> 4zn95btc</span>
+      <span><b>PROJ</b> curious-robot</span>
+      <span><b>STEPS</b> 100,000</span>
+      <span><b>SRC</b> W&amp;B API</span>
+    </div>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <!-- HERO -->
+  <header class="hero">
+    <div class="watermark mono">r_safe</div>
+    <div class="eyebrow"><span class="ln"></span> Safety reward × jerkiness · SO-ARM101</div>
+    <h1>safe15 learned to move <span class="hl">smoother</span> — then met the real arm.</h1>
+    <p class="lede">A 100k-step sim run on a MuJoCo 6-DOF arm. The safety reward <b class="mono">r_safe</b> — the motor-fighting penalty that <b>is</b> the only jerkiness signal logged — falls from <b>−51.5 to −31.2</b> as the policy smooths out. Deploy the very same frozen policy on the physical SO-ARM101 and that smoothness evaporates: real <b class="mono">r_safe</b> runs <b>−100 to −190</b>.</p>
+    <div class="chiprow">
+      <span class="chip mono">δ=<b>15</b></span>
+      <span class="chip mono">λ_safe=<b>0.1</b></span>
+      <span class="chip mono">λ_cur=<b>20</b></span>
+      <span class="chip mono">β=<b>0.3</b></span>
+      <span class="chip mono">action_max=<b>0.3</b></span>
+      <span class="chip mono">8 envs</span>
+      <span class="chip mono">γ=<b>0.9</b></span>
+    </div>
+
+    <!-- READOUT STRIP -->
+    <div class="readout reveal" id="readout">
+      <div class="stat">
+        <div class="k">r_safe · start→end</div>
+        <div class="v neg"><span class="count" data-to="-51.5" data-dec="1"></span>→<span class="count" data-to="-31.2" data-dec="1"></span></div>
+        <div class="s"><span class="up">▲ +20.3</span> · ~39% less penalty</div>
+      </div>
+      <div class="stat">
+        <div class="k">Worst (transient)</div>
+        <div class="v neg"><span class="count" data-to="-61.3" data-dec="1"></span></div>
+        <div class="s">spike @ step <b>1,600</b></div>
+      </div>
+      <div class="stat">
+        <div class="k">Steady-state</div>
+        <div class="v neg">≈<span class="count" data-to="-32" data-dec="0"></span></div>
+        <div class="s">plateau from <b>~30k</b> on</div>
+      </div>
+      <div class="stat">
+        <div class="k">reward/total</div>
+        <div class="v pos">+<span class="count" data-to="7.6" data-dec="1"></span></div>
+        <div class="s">stays <span class="up">positive</span> · no freeze</div>
+      </div>
+      <div class="stat">
+        <div class="k">sim → real gap</div>
+        <div class="v neg">~<span class="count" data-to="6" data-dec="0"></span>×</div>
+        <div class="s"><span class="dn">−32 vs −190</span> same policy</div>
+      </div>
+    </div>
+  </header>
+
+  <!-- SECTION 1 : SIGNAL -->
+  <section>
+    <div class="shead"><span class="num">01 /</span><h2>The signal: r_safe over training</h2></div>
+    <p class="sdesc">Just past the 1k-step random warmup the penalty sits at <b>−51.5</b>, then <span class="red">gets worse</span> — spiking to its global worst <b>−61.3 at step 1,600</b> as SAC first explores aggressively, with a secondary wobble near step 4k. From ~5k it settles fast and grinds down to a <b>~−32 plateau</b>. Less negative = smoother, lower-torque motion: the safety term doing its job.</p>
+    <div class="panel reveal" id="p-main">
+      <span class="corner tl"></span><span class="corner tr"></span><span class="corner bl"></span><span class="corner br"></span>
+      <div class="phead">
+        <span class="lbl">CH1 · reward/r_safe — torque-weighted motor-fighting penalty</span>
+        <div class="legend">
+          <span class="lg"><i style="background:rgba(255,106,69,.4)"></i>per-log (every 50 steps)</span>
+          <span class="lg"><i style="background:var(--danger)"></i>rolling mean</span>
+        </div>
+      </div>
+      <div id="chart-main"></div>
+      <div class="windows" id="windows"></div>
+      <div class="cap">Windowed means (above): the bars shrink toward zero — <b>−40.9 → −31.7</b> — the smoothing trend, with the early window still carrying the −61 transient.</div>
+    </div>
+  </section>
+
+  <!-- SECTION 2 : REFRAME -->
+  <section>
+    <div class="shead"><span class="num">02 /</span><h2>In sim, the safety reward <i>is</i> the jerkiness</h2></div>
+    <p class="sdesc">W&amp;B logs no <b class="mono">q̈</b>, no velocity, no torque, and there's no sim buffer dump — so <b>r_safe is the only smoothness-related quantity that exists</b>. "Jerkiness over training" and "r_safe over training" are the same curve. That makes it a powerful but <b>confounded</b> proxy:</p>
+    <div class="reframe reveal">
+      <div class="eqbox">
+        <div class="tag">Definition · env/safety_reward.py</div>
+        <div class="eq">
+          <span class="v">r_safe</span> = −<span style="color:var(--muted)">Σ<small>i</small></span>
+          <span style="color:var(--muted)">(</span>|<span class="v">τ<small>i</small></span>| / <span class="v">τ<small>max</small></span><span style="color:var(--muted)">)</span>
+          · max<span style="color:var(--muted)">(</span>0, −<span class="v">τ<small>i</small></span>·<span class="o">q̈<small>i</small></span> − <span class="d">δ</span><span style="color:var(--muted)">)</span>
+          <br><br>
+          <small>where</small> <span class="o">q̈<small>i</small></span> = (q̇<small>t</small> − q̇<small>t−Δt</small>) / <span class="d">Δt</span>,
+          &nbsp;<span class="d">δ</span>=15, &nbsp;Δt=0.030s
+          <br><br>
+          <small>// penalises driving a joint <b style="color:var(--ink)">against</b> its own acceleration<br>// — a motor fighting the link's momentum.</small>
+        </div>
+      </div>
+      <div class="confounds">
+        <div class="cf"><span class="ix">!</span><p><b>Acceleration, not jerk.</b> The term is −τ·q̈ (2nd derivative). The project calls it "jerk" colloquially — read the magnitude as motor-fighting, not literal 3rd-derivative jerk.</p></div>
+        <div class="cf"><span class="ix">!</span><p><b>Torque-weighted &amp; deadbanded.</b> r_safe can fall because the policy uses <b>less torque</b> or fewer joints cross <b>δ=15</b> — not only because motion is smoother.</p></div>
+        <div class="cf"><span class="ix">✓</span><p><b>Valid relative trend.</b> δ and τ_max are constant within the run, so the <b>shape</b> over training is trustworthy; the absolute number is the confounded part.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SECTION 3 : BALANCE -->
+  <section>
+    <div class="shead"><span class="num">03 /</span><h2>Balanced, not frozen</h2></div>
+    <p class="sdesc">Despite r_safe being persistently negative, <b>reward/total stays positive the entire run.</b> Curiosity (~+11) outweighs the λ-scaled safety penalty (0.1·r_safe ≈ −3) — exactly the balance λ_safe=0.1 was tuned for. Contrast λ_safe=1.0, which drives total to −55: the freeze regime.</p>
+    <div class="panel reveal" id="p-dec">
+      <span class="corner tl"></span><span class="corner tr"></span><span class="corner bl"></span><span class="corner br"></span>
+      <div class="phead">
+        <span class="lbl">CH2 · reward decomposition</span>
+        <div class="legend">
+          <span class="lg"><i style="background:var(--lime)"></i>reward/total</span>
+          <span class="lg"><i style="background:var(--cyan)"></i>curiosity contrib</span>
+          <span class="lg"><i style="background:var(--danger)"></i>λ_safe · r_safe</span>
+        </div>
+      </div>
+      <div id="chart-dec"></div>
+      <div class="cap"><b>+11</b> curiosity − <b>3</b> safety ≈ <b>+8</b> total. The safety reward shapes behaviour without ever dominating it — and it did <b>not</b> hurt the world model (pred/persist 0.13, eff_rank 33.6).</div>
+    </div>
+  </section>
+
+  <!-- SECTION 4 : THE GAP -->
+  <section>
+    <div class="shead"><span class="num">04 /</span><h2>The sim → real jerk gap</h2></div>
+    <p class="sdesc">The same frozen safe15 policy, run on the physical SO-ARM101. The smoothness it learned for sim proprio + rendered images <span class="red">does not transfer</span> — the real arm's slightly-OOD inputs break the compliant motion, the motor fights, and −τ·q̈ fires constantly. Bigger action_max makes it worse, not better.</p>
+    <div class="bigfact">
+      <span class="n mono">~6×</span>
+      <span class="t">worse on hardware. Sim plateaus near <b style="color:var(--ink)">−32</b>; the matched-config real run sits at <b style="color:var(--ink)">−190</b>.</span>
+    </div>
+    <div class="panel reveal" id="p-gap" style="margin-top:18px">
+      <span class="corner tl"></span><span class="corner tr"></span><span class="corner bl"></span><span class="corner br"></span>
+      <div class="phead">
+        <span class="lbl">CH3 · r_safe range — sim plateau vs frozen hardware runs</span>
+        <div class="legend">
+          <span class="lg"><i style="background:var(--cyan)"></i>simulation</span>
+          <span class="lg"><i style="background:var(--danger)"></i>hardware</span>
+        </div>
+      </div>
+      <div id="chart-gap"></div>
+      <div class="cap"><b>Caveat:</b> the |τ|/τ_max weight is sourced differently in sim (MuJoCo actuator force) vs hardware (STS3215 load estimate) — so part of the −32-vs-−190 gap may be apples-to-oranges, not pure physical jerk.</div>
+    </div>
+  </section>
+
+  <!-- SECTION 5 : NOTES -->
+  <section>
+    <div class="shead"><span class="num">05 /</span><h2>Reading &amp; what's next</h2></div>
+    <div class="notes reveal">
+      <div class="note">
+        <div class="h">⚠ terminology</div>
+        <p><b>"Jerk" here = −τ·q̈</b>, an acceleration-based motor-fighting penalty, torque-weighted and hinged past δ=15 then summed over 6 joints. It's a behavioural smoothness proxy, not a kinematic jerk measurement.</p>
+      </div>
+      <div class="note">
+        <div class="h">⚠ logistics correction</div>
+        <p>The log says r_safe "falls −51.5→−30" — accurate end-to-end, but it <b>misses the −61.3 transient spike</b> at step 1,600. The trajectory is a spike-then-smooth, not a clean monotone descent.</p>
+      </div>
+      <div class="note next">
+        <div class="h">→ next step</div>
+        <p>Finite-difference <b class="mono">q̇ → q̈</b> from the hardware <b class="mono">buffer_*.npz</b> dumps to get a <b>true</b> jerk measurement — independent of the torque weighting — and settle whether the real −190 is genuine jerk or a velocity-quantization artifact during fast motion.</p>
+      </div>
+      <div class="note next">
+        <div class="h">→ the fix</div>
+        <p>Not config or servo-gain tuning (both tried). The smoothness fix is <b>policy/WM adaptation on real data</b> — safe15 only moves smoothly on hardware once it has seen real transitions.</p>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<footer>
+  <div class="wrap row">
+    <span>SOURCE · W&amp;B Python API · run <b>4zn95btc</b> · <b>runs/analysis/safe15_reward_history.csv</b> (2,079 pts)</span>
+    <span>safe15 safety-reward / jerkiness telemetry · generated by <a href="#">Claude Code</a></span>
+  </div>
+</footer>
+
+<script>
+const DATA = {"r_safe_raw": [[1000, -51.55], [1200, -50.62], [1500, -58.84], [1800, -58.05], [2050, -50.36], [2300, -38.91], [2600, -34.7], [2900, -36.24], [3150, -36.72], [3450, -38.3], [3700, -40.92], [4000, -49.9], [4250, -47.25], [4550, -52.47], [4850, -40.39], [5050, -36.97], [5350, -35.57], [5650, -36.9], [5950, -36.87], [6150, -36.1], [6450, -38.91], [6750, -37.61], [7000, -36.91], [7300, -39.33], [7550, -37.19], [7850, -37.41], [8100, -36.7], [8400, -36.64], [8700, -36.78], [8950, -36.12], [9200, -37.53], [9500, -37.09], [9800, -37.63], [10050, -37.77], [10300, -36.89], [10600, -37.41], [10900, -37.81], [11150, -36.98], [11400, -37.13], [11700, -38.02], [12000, -39.4], [12250, -38.57], [12550, -36.47], [12800, -37.25], [13050, -39.1], [13350, -37.01], [13650, -37.57], [13950, -35.62], [14150, -35.42], [14450, -35.44], [14750, -35.82], [15000, -35.12], [15250, -34.75], [15550, -36.57], [15850, -36.04], [16100, -35.69], [16400, -36.56], [16650, -36.39], [16950, -36.05], [17200, -37.37], [17500, -35.76], [17800, -36.23], [18000, -37.56], [18300, -35.9], [18600, -37.2], [18900, -37.7], [19150, -37.96], [19400, -37.17], [19700, -35.84], [20000, -36.46], [20250, -35.62], [20500, -35.26], [20800, -36.53], [21050, -36.0], [21350, -35.9], [21650, -37.09], [21900, -36.39], [22150, -36.47], [22450, -36.16], [22750, -35.42], [23000, -35.44], [23250, -36.65], [23550, -35.18], [23850, -34.86], [24100, -36.01], [24400, -35.02], [24650, -34.19], [24950, -34.56], [25200, -34.1], [25500, -32.79], [25750, -34.52], [26000, -34.78], [26300, -33.65], [26600, -33.05], [26900, -32.89], [27100, -35.04], [27400, -33.6], [27700, -33.2], [28000, -33.76], [28250, -32.2], [28500, -34.12], [28800, -35.07], [29050, -34.94], [29350, -33.48], [29600, -33.11], [29900, -34.39], [30150, -32.97], [30450, -33.62], [30750, -32.81], [31000, -32.03], [31250, -31.91], [31550, -32.57], [31850, -31.38], [32100, -32.69], [32350, -32.47], [32650, -33.79], [32950, -30.95], [33200, -30.12], [33500, -32.44], [33750, -32.01], [34000, -32.74], [34300, -32.22], [34600, -31.98], [34850, -32.01], [35100, -32.67], [35400, -33.27], [35700, -34.45], [36000, -36.3], [36200, -36.85], [36500, -37.28], [36800, -34.99], [37050, -33.31], [37350, -33.98], [37600, -32.42], [37900, -31.09], [38150, -32.42], [38450, -35.21], [38700, -31.7], [39000, -27.73], [39250, -30.11], [39550, -31.48], [39850, -29.9], [40050, -30.37], [40350, -32.07], [40650, -31.48], [40950, -30.39], [41200, -30.89], [41450, -30.16], [41750, -32.45], [42000, -31.33], [42300, -31.44], [42600, -32.21], [42850, -31.64], [43100, -31.86], [43400, -31.4], [43700, -30.42], [43950, -30.99], [44200, -31.51], [44500, -30.64], [44800, -31.49], [45050, -30.6], [45300, -30.41], [45600, -31.63], [45900, -31.18], [46150, -31.21], [46450, -32.46], [46700, -31.15], [47000, -32.57], [47250, -31.96], [47550, -32.93], [47850, -33.35], [48050, -32.36], [48350, -33.72], [48650, -33.95], [48950, -34.43], [49150, -36.38], [49450, -34.52], [49750, -33.91], [50000, -32.62], [50300, -34.17], [50550, -34.63], [50850, -34.59], [51100, -35.28], [51400, -34.26], [51700, -32.13], [51950, -31.83], [52200, -32.36], [52500, -31.36], [52800, -32.72], [53000, -32.49], [53300, -32.26], [53600, -32.58], [53900, -31.63], [54150, -31.28], [54400, -31.87], [54700, -33.52], [55000, -33.33], [55250, -33.67], [55550, -33.05], [55800, -32.9], [56050, -33.78], [56350, -34.13], [56650, -34.24], [56950, -32.5], [57150, -32.52], [57450, -34.71], [57750, -35.04], [58000, -34.42], [58250, -33.64], [58550, -34.0], [58850, -33.47], [59100, -32.19], [59400, -34.57], [59650, -33.88], [59950, -32.57], [60200, -33.32], [60500, -33.73], [60800, -31.73], [61000, -32.07], [61300, -31.18], [61600, -30.58], [61900, -31.44], [62150, -31.27], [62400, -31.57], [62700, -30.42], [63000, -31.26], [63250, -30.61], [63500, -30.21], [63800, -30.58], [64050, -33.07], [64350, -33.21], [64650, -33.64], [64900, -32.35], [65150, -31.36], [65450, -33.57], [65750, -33.63], [66000, -32.1], [66250, -31.04], [66550, -32.0], [66850, -33.95], [67100, -33.97], [67350, -34.78], [67650, -32.77], [67950, -31.94], [68200, -31.1], [68500, -31.86], [68750, -32.8], [69000, -34.12], [69300, -31.68], [69600, -31.36], [69900, -30.33], [70100, -30.29], [70400, -30.95], [70700, -32.09], [71000, -30.96], [71250, -30.84], [71500, -32.36], [71800, -33.38], [72050, -33.43], [72350, -32.24], [72600, -32.57], [72900, -33.59], [73150, -32.81], [73450, -32.79], [73750, -30.28], [74000, -31.78], [74250, -33.85], [74550, -32.66], [74850, -31.72], [75100, -29.33], [75350, -31.71], [75650, -33.73], [75950, -32.3], [76200, -31.13], [76450, -30.9], [76750, -31.85], [77000, -32.59], [77300, -33.21], [77600, -31.14], [77850, -28.73], [78100, -29.37], [78400, -32.12], [78700, -32.98], [79000, -33.11], [79200, -30.65], [79500, -28.18], [79800, -31.82], [80050, -32.87], [80350, -31.66], [80600, -30.63], [80900, -28.3], [81150, -29.86], [81450, -33.58], [81700, -35.7], [82000, -32.43], [82250, -30.07], [82550, -29.05], [82850, -32.98], [83050, -33.81], [83350, -32.06], [83650, -32.27], [83950, -31.26], [84200, -31.34], [84450, -32.32], [84750, -32.65], [85000, -32.26], [85300, -29.4], [85600, -31.21], [85850, -31.82], [86100, -32.4], [86400, -31.38], [86700, -31.15], [86950, -33.14], [87200, -33.59], [87500, -33.49], [87800, -31.32], [88050, -31.41], [88300, -34.3], [88600, -35.8], [88900, -33.61], [89150, -32.63], [89450, -32.56], [89700, -32.36], [90000, -32.63], [90250, -31.3], [90550, -28.85], [90800, -30.09], [91050, -31.23], [91350, -31.75], [91650, -32.95], [91950, -32.08], [92150, -32.98], [92450, -33.96], [92750, -33.75], [93000, -31.25], [93300, -30.38], [93550, -31.0], [93850, -31.82], [94100, -31.14], [94400, -29.52], [94700, -30.63], [94950, -29.35], [95200, -27.97], [95500, -28.39], [95800, -28.89], [96000, -30.42], [96300, -31.47], [96600, -30.4], [96900, -31.12], [97150, -32.76], [97400, -32.32], [97700, -31.95], [98000, -31.32], [98250, -31.02], [98550, -33.3], [98800, -33.06], [99050, -32.36], [99350, -32.54], [99650, -32.27], [99950, -31.2]], "r_safe_mean": [[1000, -55.41], [1200, -54.25], [1500, -51.28], [1800, -48.74], [2050, -46.71], [2300, -44.98], [2600, -42.08], [2900, -39.68], [3150, -39.53], [3450, -41.06], [3700, -43.12], [4000, -43.89], [4250, -43.84], [4550, -43.49], [4850, -42.69], [5050, -41.18], [5350, -39.45], [5650, -37.56], [5950, -37.01], [6150, -37.09], [6450, -37.61], [6750, -37.68], [7000, -37.72], [7300, -37.75], [7550, -37.5], [7850, -37.33], [8100, -37.18], [8400, -36.94], [8700, -36.93], [8950, -36.97], [9200, -37.14], [9500, -37.15], [9800, -37.24], [10050, -37.48], [10300, -37.45], [10600, -37.42], [10900, -37.54], [11150, -37.71], [11400, -37.96], [11700, -37.89], [12000, -37.84], [12250, -38.05], [12550, -38.03], [12800, -37.96], [13050, -37.54], [13350, -37.04], [13650, -36.82], [13950, -36.54], [14150, -36.08], [14450, -35.73], [14750, -35.62], [15000, -35.62], [15250, -35.63], [15550, -35.78], [15850, -35.92], [16100, -36.07], [16400, -36.41], [16650, -36.35], [16950, -36.41], [17200, -36.59], [17500, -36.5], [17800, -36.58], [18000, -36.74], [18300, -36.82], [18600, -36.85], [18900, -36.72], [19150, -36.67], [19400, -36.6], [19700, -36.37], [20000, -36.26], [20250, -36.01], [20500, -35.91], [20800, -36.05], [21050, -36.02], [21350, -36.17], [21650, -36.3], [21900, -36.19], [22150, -36.09], [22450, -36.23], [22750, -36.04], [23000, -35.88], [23250, -35.81], [23550, -35.65], [23850, -35.52], [24100, -35.42], [24400, -35.04], [24650, -34.73], [24950, -34.68], [25200, -34.52], [25500, -34.3], [25750, -34.11], [26000, -33.8], [26300, -33.91], [26600, -34.02], [26900, -33.84], [27100, -33.72], [27400, -33.53], [27700, -33.72], [28000, -34.1], [28250, -34.09], [28500, -34.04], [28800, -34.05], [29050, -34.07], [29350, -34.1], [29600, -34.01], [29900, -33.69], [30150, -33.26], [30450, -33.03], [30750, -32.9], [31000, -32.59], [31250, -32.53], [31550, -32.48], [31850, -32.57], [32100, -32.42], [32350, -32.19], [32650, -32.15], [32950, -32.24], [33200, -32.27], [33500, -32.14], [33750, -31.88], [34000, -31.94], [34300, -32.26], [34600, -32.38], [34850, -32.65], [35100, -33.14], [35400, -33.77], [35700, -34.54], [36000, -34.99], [36200, -35.1], [36500, -35.2], [36800, -34.93], [37050, -34.25], [37350, -33.69], [37600, -33.39], [37900, -32.75], [38150, -31.95], [38450, -31.42], [38700, -31.29], [39000, -31.11], [39250, -30.86], [39550, -30.51], [39850, -30.56], [40050, -30.9], [40350, -31.05], [40650, -30.95], [40950, -31.28], [41200, -31.33], [41450, -31.23], [41750, -31.31], [42000, -31.5], [42300, -31.63], [42600, -31.75], [42850, -31.53], [43100, -31.47], [43400, -31.49], [43700, -31.31], [43950, -31.27], [44200, -31.08], [44500, -30.93], [44800, -31.03], [45050, -31.02], [45300, -30.98], [45600, -31.17], [45900, -31.19], [46150, -31.48], [46450, -31.7], [46700, -31.89], [47000, -32.23], [47250, -32.45], [47550, -32.64], [47850, -32.94], [48050, -33.16], [48350, -33.77], [48650, -34.02], [48950, -34.06], [49150, -34.06], [49450, -34.13], [49750, -34.23], [50000, -34.28], [50300, -34.11], [50550, -34.02], [50850, -33.81], [51100, -33.71], [51400, -33.43], [51700, -33.03], [51950, -32.79], [52200, -32.4], [52500, -32.13], [52800, -32.18], [53000, -32.16], [53300, -32.08], [53600, -32.2], [53900, -32.32], [54150, -32.47], [54400, -32.65], [54700, -32.74], [55000, -32.89], [55250, -33.21], [55550, -33.49], [55800, -33.6], [56050, -33.51], [56350, -33.37], [56650, -33.59], [56950, -33.89], [57150, -33.98], [57450, -33.94], [57750, -33.91], [58000, -33.96], [58250, -33.96], [58550, -33.93], [58850, -33.74], [59100, -33.48], [59400, -33.41], [59650, -33.35], [59950, -33.15], [60200, -33.09], [60500, -32.62], [60800, -32.14], [61000, -31.95], [61300, -31.7], [61600, -31.4], [61900, -31.13], [62150, -30.99], [62400, -30.91], [62700, -30.88], [63000, -30.85], [63250, -31.07], [63500, -31.23], [63800, -31.68], [64050, -31.9], [64350, -32.03], [64650, -32.5], [64900, -32.84], [65150, -32.79], [65450, -32.51], [65750, -32.34], [66000, -32.56], [66250, -32.88], [66550, -33.07], [66850, -32.98], [67100, -32.91], [67350, -32.94], [67650, -32.95], [67950, -32.87], [68200, -32.86], [68500, -32.5], [68750, -32.27], [69000, -32.03], [69300, -31.88], [69600, -31.75], [69900, -31.56], [70100, -31.19], [70400, -31.01], [70700, -31.19], [71000, -31.65], [71250, -32.06], [71500, -32.17], [71800, -32.32], [72050, -32.7], [72350, -32.97], [72600, -32.98], [72900, -32.54], [73150, -32.31], [73450, -32.54], [73750, -32.55], [74000, -32.28], [74250, -31.77], [74550, -31.71], [74850, -32.16], [75100, -32.23], [75350, -31.9], [75650, -31.59], [75950, -31.62], [76200, -32.03], [76450, -32.19], [76750, -31.87], [77000, -31.35], [77300, -31.1], [77600, -31.28], [77850, -31.44], [78100, -31.59], [78400, -31.25], [78700, -30.84], [79000, -31.29], [79200, -31.71], [79500, -31.73], [79800, -31.31], [80050, -30.59], [80350, -30.52], [80600, -31.14], [80900, -31.75], [81150, -31.72], [81450, -31.48], [81700, -31.34], [82000, -31.91], [82250, -32.48], [82550, -32.33], [82850, -31.78], [83050, -31.59], [83350, -31.66], [83650, -32.09], [83950, -32.14], [84200, -31.85], [84450, -31.52], [84750, -31.36], [85000, -31.45], [85300, -31.66], [85600, -31.53], [85850, -31.35], [86100, -31.52], [86400, -32.11], [86700, -32.42], [86950, -32.35], [87200, -32.2], [87500, -32.6], [87800, -33.26], [88050, -33.32], [88300, -33.19], [88600, -33.06], [88900, -33.2], [89150, -33.37], [89450, -32.89], [89700, -32.07], [90000, -31.55], [90250, -31.36], [90550, -31.31], [90800, -31.36], [91050, -31.33], [91350, -31.51], [91650, -32.17], [91950, -32.59], [92150, -32.57], [92450, -32.35], [92750, -32.07], [93000, -31.98], [93300, -31.71], [93550, -31.23], [93850, -30.8], [94100, -30.54], [94400, -30.24], [94700, -29.89], [94950, -29.58], [95200, -29.52], [95500, -29.79], [95800, -29.77], [96000, -29.96], [96300, -30.58], [96600, -31.13], [96900, -31.55], [97150, -31.61], [97400, -31.53], [97700, -31.87], [98000, -32.12], [98250, -32.08], [98550, -32.13], [98800, -32.18], [99050, -32.21], [99350, -32.41], [99650, -32.29], [99950, -32.19]], "dec_total": [[1000, -0.25], [1500, 1.23], [2050, 2.69], [2600, 4.64], [3150, 5.48], [3750, 5.37], [4250, 5.4], [4850, 5.75], [5350, 6.4], [5950, 6.72], [6500, 6.57], [7000, 6.31], [7600, 6.16], [8100, 6.0], [8700, 5.98], [9250, 5.88], [9800, 5.77], [10350, 5.63], [10900, 5.65], [11450, 5.5], [12000, 5.52], [12550, 5.66], [13100, 5.91], [13700, 6.09], [14200, 6.31], [14800, 6.38], [15300, 6.49], [15900, 6.58], [16450, 6.69], [17000, 6.81], [17550, 6.96], [18050, 6.96], [18650, 6.84], [19200, 6.85], [19750, 6.82], [20300, 7.05], [20850, 7.1], [21400, 7.07], [22000, 6.94], [22500, 6.9], [23050, 6.9], [23600, 7.17], [24150, 7.34], [24750, 7.42], [25250, 7.38], [25850, 7.3], [26400, 7.29], [26950, 7.28], [27500, 7.28], [28000, 7.17], [28600, 7.14], [29150, 6.97], [29700, 7.01], [30250, 7.12], [30800, 7.35], [31350, 7.66], [31950, 7.88], [32450, 8.09], [33000, 8.22], [33550, 8.25], [34100, 8.33], [34700, 8.38], [35200, 8.75], [35800, 9.41], [36300, 9.29], [36900, 8.93], [37450, 7.71], [38000, 7.46], [38550, 7.6], [39100, 7.97], [39650, 8.58], [40200, 8.73], [40750, 8.86], [41300, 8.83], [41900, 8.74], [42400, 8.68], [43000, 8.73], [43500, 8.69], [44050, 8.74], [44650, 8.72], [45150, 8.74], [45750, 8.73], [46250, 8.76], [46850, 8.77], [47400, 8.69], [47950, 8.51], [48500, 7.93], [49000, 7.76], [49600, 7.51], [50150, 7.65], [50700, 7.93], [51250, 8.2], [51850, 8.48], [52350, 8.55], [52950, 8.56], [53450, 8.6], [54000, 8.5], [54600, 8.44], [55100, 8.2], [55700, 7.67], [56200, 7.42], [56800, 7.04], [57350, 7.02], [57900, 7.2], [58450, 7.54], [59000, 7.9], [59550, 8.15], [60100, 8.29], [60650, 8.41], [61200, 8.53], [61750, 8.62], [62300, 8.6], [62900, 8.65], [63400, 8.44], [64000, 8.25], [64550, 8.15], [65050, 7.79], [65650, 7.99], [66150, 8.01], [66750, 8.18], [67300, 8.28], [67850, 8.3], [68400, 8.28], [68950, 8.27], [69500, 8.2], [70050, 8.13], [70600, 8.14], [71150, 8.09], [71700, 8.08], [72250, 8.05], [72850, 8.04], [73350, 8.0], [73950, 7.94], [74450, 7.96], [75000, 7.78], [75600, 7.75], [76100, 7.58], [76700, 7.53], [77250, 7.58], [77800, 7.43], [78350, 7.43], [78900, 7.52], [79450, 7.54], [80000, 7.75], [80550, 7.6], [81100, 7.36], [81650, 7.48], [82200, 7.5], [82800, 7.79], [83300, 7.78], [83900, 7.72], [84400, 7.68], [85000, 7.66], [85550, 7.65], [86050, 7.71], [86650, 7.64], [87150, 7.71], [87750, 7.63], [88300, 7.56], [88850, 7.48], [89400, 7.33], [90000, 7.42], [90500, 7.47], [91050, 7.51], [91600, 7.37], [92150, 7.33], [92750, 7.39], [93250, 7.54], [93850, 7.74], [94350, 7.75], [94950, 7.87], [95500, 7.78], [96000, 7.85], [96600, 7.62], [97100, 7.48], [97700, 7.34], [98250, 7.32], [98800, 7.4], [99350, 7.45], [99950, 7.6]], "dec_cur": [[1000, 5.29], [1500, 6.36], [2050, 7.36], [2600, 8.85], [3150, 9.43], [3750, 9.71], [4250, 9.79], [4850, 10.01], [5350, 10.35], [5950, 10.42], [6500, 10.34], [7000, 10.08], [7600, 9.9], [8100, 9.72], [8700, 9.67], [9250, 9.59], [9800, 9.49], [10350, 9.37], [10900, 9.4], [11450, 9.3], [12000, 9.3], [12550, 9.46], [13100, 9.66], [13700, 9.77], [14200, 9.91], [14800, 9.94], [15300, 10.06], [15900, 10.17], [16450, 10.33], [17000, 10.46], [17550, 10.61], [18050, 10.63], [18650, 10.53], [19200, 10.52], [19750, 10.46], [20300, 10.65], [20850, 10.71], [21400, 10.7], [22000, 10.55], [22500, 10.53], [23050, 10.48], [23600, 10.73], [24150, 10.87], [24750, 10.89], [25250, 10.82], [25850, 10.7], [26400, 10.68], [26950, 10.66], [27500, 10.63], [28000, 10.59], [28600, 10.54], [29150, 10.37], [29700, 10.41], [30250, 10.44], [30800, 10.64], [31350, 10.92], [31950, 11.14], [32450, 11.31], [33000, 11.44], [33550, 11.46], [34100, 11.53], [34700, 11.62], [35200, 12.08], [35800, 12.89], [36300, 12.8], [36900, 12.4], [37450, 11.06], [38000, 10.71], [38550, 10.74], [39100, 11.07], [39650, 11.63], [40200, 11.84], [40750, 11.97], [41300, 11.95], [41900, 11.88], [42400, 11.85], [43000, 11.87], [43500, 11.83], [44050, 11.86], [44650, 11.81], [45150, 11.83], [45750, 11.84], [46250, 11.92], [46850, 11.98], [47400, 11.95], [47950, 11.81], [48500, 11.33], [49000, 11.17], [49600, 10.93], [50150, 11.07], [50700, 11.33], [51250, 11.56], [51850, 11.77], [52350, 11.77], [52950, 11.78], [53450, 11.81], [54000, 11.73], [54600, 11.71], [55100, 11.5], [55700, 11.03], [56200, 10.76], [56800, 10.41], [57350, 10.42], [57900, 10.6], [58450, 10.93], [59000, 11.26], [59550, 11.49], [60100, 11.6], [60650, 11.65], [61200, 11.71], [61750, 11.75], [62300, 11.69], [62900, 11.73], [63400, 11.56], [64000, 11.43], [64550, 11.38], [65050, 11.07], [65650, 11.23], [66150, 11.28], [66750, 11.49], [67300, 11.58], [67850, 11.59], [68400, 11.55], [68950, 11.48], [69500, 11.38], [70050, 11.25], [70600, 11.25], [71150, 11.28], [71700, 11.3], [72250, 11.34], [72850, 11.3], [73350, 11.24], [73950, 11.18], [74450, 11.13], [75000, 11.01], [75600, 10.91], [76100, 10.76], [76700, 10.73], [77250, 10.69], [77800, 10.57], [78350, 10.57], [78900, 10.63], [79450, 10.71], [80000, 10.82], [80550, 10.7], [81100, 10.53], [81650, 10.62], [82200, 10.74], [82800, 10.97], [83300, 10.95], [83900, 10.94], [84400, 10.84], [85000, 10.81], [85550, 10.81], [86050, 10.86], [86650, 10.88], [87150, 10.93], [87750, 10.95], [88300, 10.88], [88850, 10.8], [89400, 10.63], [90000, 10.58], [90500, 10.6], [91050, 10.64], [91600, 10.57], [92150, 10.59], [92750, 10.6], [93250, 10.72], [93850, 10.82], [94350, 10.78], [94950, 10.82], [95500, 10.76], [96000, 10.84], [96600, 10.73], [97100, 10.64], [97700, 10.53], [98250, 10.52], [98800, 10.62], [99350, 10.69], [99950, 10.81]], "dec_safe": [[1000, -5.54], [1500, -5.13], [2050, -4.67], [2600, -4.21], [3150, -3.95], [3750, -4.34], [4250, -4.38], [4850, -4.27], [5350, -3.95], [5950, -3.7], [6500, -3.77], [7000, -3.77], [7600, -3.74], [8100, -3.72], [8700, -3.69], [9250, -3.71], [9800, -3.72], [10350, -3.74], [10900, -3.75], [11450, -3.8], [12000, -3.79], [12550, -3.8], [13100, -3.74], [13700, -3.68], [14200, -3.6], [14800, -3.56], [15300, -3.57], [15900, -3.59], [16450, -3.64], [17000, -3.65], [17550, -3.65], [18050, -3.67], [18650, -3.68], [19200, -3.66], [19750, -3.63], [20300, -3.6], [20850, -3.61], [21400, -3.62], [22000, -3.61], [22500, -3.62], [23050, -3.59], [23600, -3.56], [24150, -3.54], [24750, -3.47], [25250, -3.45], [25850, -3.4], [26400, -3.4], [26950, -3.38], [27500, -3.35], [28000, -3.41], [28600, -3.4], [29150, -3.41], [29700, -3.39], [30250, -3.31], [30800, -3.28], [31350, -3.25], [31950, -3.25], [32450, -3.22], [33000, -3.23], [33550, -3.21], [34100, -3.2], [34700, -3.24], [35200, -3.33], [35800, -3.48], [36300, -3.51], [36900, -3.47], [37450, -3.35], [38000, -3.25], [38550, -3.14], [39100, -3.1], [39650, -3.05], [40200, -3.1], [40750, -3.1], [41300, -3.13], [41900, -3.14], [42400, -3.17], [43000, -3.14], [43500, -3.14], [44050, -3.12], [44650, -3.09], [45150, -3.1], [45750, -3.12], [46250, -3.16], [46850, -3.21], [47400, -3.26], [47950, -3.3], [48500, -3.4], [49000, -3.41], [49600, -3.42], [50150, -3.42], [50700, -3.39], [51250, -3.36], [51850, -3.29], [52350, -3.22], [52950, -3.22], [53450, -3.21], [54000, -3.24], [54600, -3.27], [55100, -3.3], [55700, -3.36], [56200, -3.34], [56800, -3.37], [57350, -3.4], [57900, -3.39], [58450, -3.39], [59000, -3.36], [59550, -3.34], [60100, -3.31], [60650, -3.23], [61200, -3.18], [61750, -3.13], [62300, -3.09], [62900, -3.08], [63400, -3.12], [64000, -3.19], [64550, -3.23], [65050, -3.29], [65650, -3.24], [66150, -3.28], [66750, -3.3], [67300, -3.29], [67850, -3.29], [68400, -3.26], [68950, -3.21], [69500, -3.18], [70050, -3.13], [70600, -3.11], [71150, -3.2], [71700, -3.22], [72250, -3.29], [72850, -3.26], [73350, -3.25], [73950, -3.24], [74450, -3.16], [75000, -3.23], [75600, -3.16], [76100, -3.19], [76700, -3.2], [77250, -3.11], [77800, -3.14], [78350, -3.13], [78900, -3.11], [79450, -3.18], [80000, -3.07], [80550, -3.1], [81100, -3.17], [81650, -3.13], [82200, -3.24], [82800, -3.19], [83300, -3.16], [83900, -3.22], [84400, -3.16], [85000, -3.14], [85550, -3.16], [86050, -3.15], [86650, -3.24], [87150, -3.22], [87750, -3.32], [88300, -3.32], [88850, -3.32], [89400, -3.3], [90000, -3.15], [90500, -3.13], [91050, -3.13], [91600, -3.21], [92150, -3.26], [92750, -3.21], [93250, -3.18], [93850, -3.08], [94350, -3.03], [94950, -2.96], [95500, -2.98], [96000, -3.0], [96600, -3.11], [97100, -3.16], [97700, -3.19], [98250, -3.21], [98800, -3.22], [99350, -3.24], [99950, -3.22]], "windows": [{"label": "1k\u201310k", "mean": -40.9, "min": -61.3, "max": -34.6}, {"label": "10\u201325k", "mean": -36.5, "min": -39.7, "max": -34.2}, {"label": "25\u201350k", "mean": -32.7, "min": -37.7, "max": -27.6}, {"label": "50\u201375k", "mean": -32.6, "min": -35.4, "max": -29.8}, {"label": "75\u2013100k", "mean": -31.7, "min": -36.3, "max": -27.9}], "stats": {"start": -51.5, "min": -61.3, "min_step": 1600, "end": -31.2, "plateau": -32.0, "total_start": 2.3, "total_end": 7.6, "cur_end": 10.7, "delta": 20.3, "pct": 39.0}, "gap": {"sim": {"label": "sim safe15 (plateau)", "vals": [-27.6, -32.0, -37.7], "amax": "closed-loop"}, "hw_validate": {"label": "hw_validate", "vals": [-31.0, -106.0, -116.0], "amax": "a_max 0.05"}, "hw_dval": {"label": "hw_dval", "vals": [-69.0, -111.0, -109.0, -96.0], "amax": "a_max 0.05"}, "hw_safe15_match": {"label": "hw_safe15_match", "vals": [-192.0, -175.0, -181.0, -193.0, -187.0], "amax": "a_max 0.30"}}};
+const NS="http://www.w3.org/2000/svg";
+
+/* ---- scale helpers ---- */
+const lerp=(v,d0,d1,r0,r1)=>r0+(v-d0)/(d1-d0)*(r1-r0);
+function pathD(pts,sx,sy){return pts.map((p,i)=>(i?"L":"M")+sx(p[0]).toFixed(1)+" "+sy(p[1]).toFixed(1)).join(" ");}
+
+/* ============ CHART 1 : r_safe ============ */
+function chartMain(){
+  const W=1000,H=440,L=60,R=18,T=26,B=42;
+  const x0=1000,x1=100000,y0=-64,y1=-26;
+  const sx=v=>lerp(v,x0,x1,L,W-R), sy=v=>lerp(v,y0,y1,H-B,T);
+  let g="";
+  // horizontal grid + y labels
+  [-30,-40,-50,-60].forEach(t=>{const y=sy(t);
+    g+=`<line class="gridln${t==-30?' b':''}" x1="${L}" y1="${y}" x2="${W-R}" y2="${y}"/>`;
+    g+=`<text class="axt" x="${L-10}" y="${y+4}" text-anchor="end">${t}</text>`;});
+  // vertical grid + x labels
+  [0,20000,40000,60000,80000,100000].forEach(t=>{const xx=sx(Math.max(t,x0));
+    if(t>=x0)g+=`<line class="gridln" x1="${xx}" y1="${T}" x2="${xx}" y2="${H-B}"/>`;
+    g+=`<text class="axt" x="${xx}" y="${H-B+20}" text-anchor="middle">${t/1000}k</text>`;});
+  g+=`<text class="axt" x="${L-44}" y="${T-8}" transform="rotate(0)">r_safe</text>`;
+  g+=`<text class="axt" x="${W-R}" y="${H-B+20}" text-anchor="end">step →</text>`;
+  // warmup gutter note
+  g+=`<rect x="${L}" y="${T}" width="${sx(2200)-L}" height="${H-B-T}" fill="rgba(255,184,77,.05)"/>`;
+  g+=`<text class="axt" x="${sx(1100)}" y="${T+16}" style="fill:var(--amber)">post-warmup</text>`;
+  // area under mean
+  const area=pathD(DATA.r_safe_mean,sx,sy)+` L ${sx(DATA.r_safe_mean[DATA.r_safe_mean.length-1][0])} ${sy(y0)} L ${sx(DATA.r_safe_mean[0][0])} ${sy(y0)} Z`;
+  g+=`<path d="${area}" fill="url(#gMain)"/>`;
+  // raw trace (faint)
+  g+=`<path class="trace" d="${pathD(DATA.r_safe_raw,sx,sy)}" stroke="rgba(255,106,69,.38)" stroke-width="1"/>`;
+  // mean trace (bold glow)
+  g+=`<path class="trace annoglow" d="${pathD(DATA.r_safe_mean,sx,sy)}" stroke="var(--danger)" stroke-width="2.6"/>`;
+  // plateau line
+  g+=`<line x1="${sx(28000)}" y1="${sy(-32)}" x2="${W-R}" y2="${sy(-32)}" stroke="var(--lime)" stroke-width="1" stroke-dasharray="4 4" opacity=".7"/>`;
+  g+=`<text class="anno" x="${sx(30000)}" y="${sy(-32)-8}" style="fill:var(--lime)" font-size="11">plateau ≈ −32</text>`;
+  // spike marker
+  const spx=sx(1600),spy=sy(-61.3);
+  g+=`<circle cx="${spx}" cy="${spy}" r="4.5" fill="var(--danger)" class="annoglow"/>`;
+  g+=`<line x1="${spx}" y1="${spy}" x2="${sx(15000)}" y2="${sy(-60)}" stroke="var(--danger)" stroke-width="1" opacity=".5"/>`;
+  g+=`<text class="anno" x="${sx(15800)}" y="${sy(-61.5)}" font-size="11.5" style="fill:var(--danger)">▲ transient spike −61.3 @ 1.6k</text>`;
+  g+=`<text class="anno" x="${sx(15800)}" y="${sy(-61.5)+15}" font-size="10.5" style="fill:var(--muted)">SAC first explores past warmup</text>`;
+  const defs=`<defs><linearGradient id="gMain" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="rgba(255,106,69,.22)"/><stop offset="1" stop-color="rgba(255,106,69,0)"/></linearGradient></defs>`;
+  document.getElementById("chart-main").innerHTML=`<svg viewBox="0 0 ${W} ${H}">${defs}${g}</svg>`;
+}
+
+/* ============ CHART 2 : decomposition ============ */
+function chartDec(){
+  const W=1000,H=320,L=52,R=18,T=22,B=40;
+  const x0=1000,x1=100000,y0=-6,y1=14;
+  const sx=v=>lerp(v,x0,x1,L,W-R), sy=v=>lerp(v,y0,y1,H-B,T);
+  let g="";
+  [-4,0,4,8,12].forEach(t=>{const y=sy(t);
+    g+=`<line class="gridln${t==0?' b':''}" x1="${L}" y1="${y}" x2="${W-R}" y2="${y}"/>`;
+    g+=`<text class="axt" x="${L-10}" y="${y+4}" text-anchor="end">${t>0?'+':''}${t}</text>`;});
+  [0,20000,40000,60000,80000,100000].forEach(t=>{const xx=sx(Math.max(t,x0));
+    g+=`<text class="axt" x="${xx}" y="${H-B+20}" text-anchor="middle">${t/1000}k</text>`;});
+  g+=`<path class="trace" d="${pathD(DATA.dec_total,sx,sy)}" stroke="var(--lime)" stroke-width="2.4" style="filter:drop-shadow(0 0 5px rgba(182,232,79,.4))"/>`;
+  g+=`<path class="trace" d="${pathD(DATA.dec_cur,sx,sy)}" stroke="var(--cyan)" stroke-width="2"/>`;
+  g+=`<path class="trace" d="${pathD(DATA.dec_safe,sx,sy)}" stroke="var(--danger)" stroke-width="2"/>`;
+  // labels at right
+  const last=a=>a[a.length-1][1];
+  g+=`<text class="axt" x="${W-R+2}" y="${sy(last(DATA.dec_total))+4}" style="fill:var(--lime)">total</text>`;
+  g+=`<text class="axt" x="${W-R+2}" y="${sy(last(DATA.dec_cur))+4}" style="fill:var(--cyan)">cur</text>`;
+  g+=`<text class="axt" x="${W-R+2}" y="${sy(last(DATA.dec_safe))+4}" style="fill:var(--danger)">safe</text>`;
+  document.getElementById("chart-dec").innerHTML=`<svg viewBox="0 0 ${W} ${H}">${g}</svg>`;
+}
+
+/* ============ CHART 3 : sim->real gap ============ */
+function chartGap(){
+  const W=1000,H=330,L=210,R=70,T=30,B=42;
+  const x0=-210,x1=8;
+  const sx=v=>lerp(v,x0,x1,L,W-R);
+  const rows=[DATA.gap.sim,DATA.gap.hw_validate,DATA.gap.hw_dval,DATA.gap.hw_safe15_match];
+  const rh=(H-T-B)/rows.length;
+  let g="";
+  // x grid
+  [-200,-150,-100,-50,0].forEach(t=>{const xx=sx(t);
+    g+=`<line class="gridln${t==0?' b':''}" x1="${xx}" y1="${T}" x2="${xx}" y2="${H-B}"/>`;
+    if(t!==0)g+=`<text class="axt" x="${xx}" y="${H-B+20}" text-anchor="middle">${t}</text>`;});
+  g+=`<text class="axt" x="${sx(0)+6}" y="${T-12}" style="fill:var(--lime)">0 = perfectly smooth</text>`;
+  g+=`<text class="axt" x="${W-R}" y="${H-B+20}" text-anchor="end">r_safe →</text>`;
+  rows.forEach((row,i)=>{
+    const cy=T+rh*i+rh/2;
+    const isSim=i===0; const col=isSim?"var(--cyan)":"var(--danger)";
+    const mn=Math.min(...row.vals), mx=Math.max(...row.vals);
+    // range bar
+    g+=`<line x1="${sx(mn)}" y1="${cy}" x2="${sx(mx)}" y2="${cy}" stroke="${col}" stroke-width="7" stroke-linecap="round" opacity=".4"/>`;
+    row.vals.forEach(v=>{g+=`<circle cx="${sx(v)}" cy="${cy}" r="4.5" fill="${col}" ${isSim?'class="annoglow"':''}/>`;});
+    // label
+    g+=`<text x="${L-16}" y="${cy-3}" text-anchor="end" class="anno" font-size="13" style="fill:${isSim?'var(--cyan)':'var(--ink)'}">${row.label}</text>`;
+    g+=`<text x="${L-16}" y="${cy+13}" text-anchor="end" class="axt">${row.amax}</text>`;
+    // value at far point
+    const ext=isSim?mx:mn;
+    g+=`<text x="${sx(ext)+(isSim?12:-12)}" y="${cy-9}" text-anchor="${isSim?'start':'end'}" class="axt" style="fill:${col}">${mn==mx?mn:mn+'…'+mx}</text>`;
+  });
+  // gap bracket sim(-32) -> match(-190)
+  const ya=T+rh*0+rh/2, yb=T+rh*3+rh/2;
+  const bx=sx(-200)-26;
+  g+=`<path d="M ${sx(-32)} ${ya+14} C ${sx(-32)} ${(ya+yb)/2}, ${sx(-190)} ${(ya+yb)/2}, ${sx(-190)} ${yb-14}" fill="none" stroke="var(--amber)" stroke-width="1" stroke-dasharray="3 3" opacity=".6"/>`;
+  g+=`<text class="anno" x="${sx(-120)}" y="${(ya+yb)/2-6}" text-anchor="middle" font-size="12" style="fill:var(--amber)">~6× wider</text>`;
+  document.getElementById("chart-gap").innerHTML=`<svg viewBox="0 0 ${W} ${H}">${g}</svg>`;
+}
+
+/* ---- windowed readout ---- */
+function windows(){
+  const el=document.getElementById("windows");
+  const maxAbs=Math.max(...DATA.windows.map(w=>Math.abs(w.mean)));
+  el.innerHTML=DATA.windows.map(w=>`
+    <div class="win"><span class="wl">${w.label}</span>
+      <div class="bar"><i style="--w:${(Math.abs(w.mean)/maxAbs*100).toFixed(1)}%"></i></div>
+      <span class="wv">${w.mean}</span></div>`).join("");
+}
+
+/* ---- counters ---- */
+function runCounters(scope){
+  scope.querySelectorAll(".count").forEach(el=>{
+    if(el.dataset.done)return; el.dataset.done=1;
+    const to=parseFloat(el.dataset.to), dec=+el.dataset.dec||0; const dur=1100; const t0=performance.now();
+    (function step(now){const k=Math.min(1,(now-t0)/dur); const e=1-Math.pow(1-k,3);
+      el.textContent=(to*e).toFixed(dec); if(k<1)requestAnimationFrame(step); else el.textContent=to.toFixed(dec);})(t0);
+  });
+}
+
+/* ---- reveal + draw triggers ---- */
+function init(){
+  chartMain(); chartDec(); chartGap(); windows();
+  // set dash lengths for draw animation
+  document.querySelectorAll(".trace").forEach(p=>{const len=p.getTotalLength();p.style.setProperty("--len",len);});
+  const io=new IntersectionObserver((ents)=>{ents.forEach(e=>{if(e.isIntersecting){
+    e.target.classList.add("in");
+    if(e.target.id==="readout")runCounters(e.target);
+    io.unobserve(e.target);}});},{threshold:.25});
+  document.querySelectorAll(".panel,.reveal,.reframe,.notes").forEach(el=>io.observe(el));
+  // hero counters fire immediately if above fold
+  setTimeout(()=>{const r=document.getElementById("readout");
+    if(r.getBoundingClientRect().top<innerHeight){r.classList.add("in");runCounters(r);}},300);
+}
+if(document.readyState!=="loading")init(); else document.addEventListener("DOMContentLoaded",init);
+</script>
+</body>
+</html>

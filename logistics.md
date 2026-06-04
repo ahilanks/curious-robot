@@ -10,6 +10,12 @@ learning dynamics?*
   `model/` (ViT-tiny state encoder), `src/` (train · play_policy · eval_predictor).
 - **Backends** — W&B project `curious-robot` · HF `a5ilank/curious-robot` · GitHub
   `ahilanks/curious-robot` (private). Creds in `.env` (auto-loaded; gitignored — keep local).
+- **W&B — ALWAYS read via the Python API** (`wandb.Api()`), never scrape the web UI. Load
+  `.env`, then `Api().run(f"{WANDB_ENTITY}/{WANDB_PROJECT}/<run_id>")`. Entity =
+  `ahilan-uc-berkeley-electrical-engineering-computer-sciences` (a *personal* entity, **not**
+  `models`); run IDs are in the Sweeps table (e.g. **safe15 = `4zn95btc`**). Use
+  `run.history(keys=[...], samples=N)` or `run.scan_history()` for the full per-step time-series
+  (the `runs/<name>/metrics.jsonl` files are *hardware* runs only — sim training lives in W&B).
 - **Train** — `python src/train.py --name <kw> --n-envs 8 --env-threads 8`. `--name` is
   a short keyword → W&B run name + `runs/<name>/` + HF `<name>/ckpt_*.pt`; every constant
   lives in the W&B config table, not the name. Pod bootstrap: `bash setup.sh`.
