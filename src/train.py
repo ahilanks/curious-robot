@@ -262,6 +262,47 @@ def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device):
     return float(pred_loss.item()), float(sig.item()), float(idl)
 
 
+def sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt, log_alpha,
+               args, step, device):
+    """Run args.updates_per_step SAC gradient steps on PER samples from buf (the
+    encoder is frozen w.r.t. SAC: z is encoded under no_grad from the CURRENT wm).
+    Returns {"critic_loss", "actor_loss", "zb"} from the last completed update, or
+    None if the gate is closed (warmup / buffer below batch) or sampling came up dry.
+    Shared by the online loop here and offline fine-tuning (offline_train.py)."""
+    if step < args.start_steps or buf.total < args.batch_size:
+        return None
+    per_beta = min(1.0, args.per_beta_start
+                   + (1 - args.per_beta_start) * step / max(args.total_steps, 1))
+    alpha = log_alpha.exp()
+    out = None
+    for _ in range(args.updates_per_step):
+        b = buf.sample_sac(args.batch_size, args.per_alpha, per_beta)
+        if b is None:
+            break
+        zb = encode_obs(wm, b["px"], b["prop"], device)
+        znb = encode_obs(wm, b["px_n"], b["prop_n"], device)
+        with torch.no_grad():
+            an, logpn, _ = actor.sample(znb)
+            q1n, q2n = critic_tgt(znb, an)
+            y = b["r"] + (1 - b["d"]) * args.gamma * (torch.min(q1n, q2n) - alpha * logpn)
+        q1, q2 = critic(zb, b["a"])
+        critic_loss = (b["w"] * ((q1 - y).pow(2) + (q2 - y).pow(2))).mean()
+        critic_opt.zero_grad(); critic_loss.backward(); critic_opt.step()
+        if args.per_priority == "td":   # ablation: replace curiosity priority with |TD error|
+            td = (0.5 * (q1 + q2) - y).abs().detach().squeeze(1).cpu().numpy()
+            buf.update_priorities(b["e"], b["i"], td)
+        ap, logpp, _ = actor.sample(zb)
+        q1p, q2p = critic(zb, ap)
+        actor_loss = (alpha * logpp - torch.min(q1p, q2p)).mean()
+        actor_opt.zero_grad(); actor_loss.backward(); actor_opt.step()
+        with torch.no_grad():
+            for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
+                pt.mul_(1 - args.tau).add_(args.tau * p)
+        out = {"critic_loss": float(critic_loss.item()),
+               "actor_loss": float(actor_loss.item()), "zb": zb.detach()}
+    return out
+
+
 @torch.no_grad()
 def collapse_metrics(z):
     """Encoder-collapse diagnostics on a batch of latents z (B, D), computed on CPU
@@ -571,35 +612,11 @@ def main(args):
                         h_fwd += 1; updates_at_stage = 0; pred_hist.clear()
                         print(f"[curriculum] step={step} H_fwd -> {h_fwd}", flush=True)
         # --- SAC updates (PER; encoder is frozen w.r.t. SAC, z encoded under no_grad) ---
-        if step >= args.start_steps and buf.total >= args.batch_size:
-            per_beta = min(1.0, args.per_beta_start
-                           + (1 - args.per_beta_start) * step / max(args.total_steps, 1))
-            alpha = log_alpha.exp()
-            for _ in range(args.updates_per_step):
-                b = buf.sample_sac(args.batch_size, args.per_alpha, per_beta)
-                if b is None:
-                    break
-                zb = encode_obs(wm, b["px"], b["prop"], device)
-                znb = encode_obs(wm, b["px_n"], b["prop_n"], device)
-                with torch.no_grad():
-                    an, logpn, _ = actor.sample(znb)
-                    q1n, q2n = critic_tgt(znb, an)
-                    y = b["r"] + (1 - b["d"]) * args.gamma * (torch.min(q1n, q2n) - alpha * logpn)
-                q1, q2 = critic(zb, b["a"])
-                critic_loss = (b["w"] * ((q1 - y).pow(2) + (q2 - y).pow(2))).mean()
-                critic_opt.zero_grad(); critic_loss.backward(); critic_opt.step()
-                if args.per_priority == "td":   # ablation: replace curiosity priority with |TD error|
-                    td = (0.5 * (q1 + q2) - y).abs().detach().squeeze(1).cpu().numpy()
-                    buf.update_priorities(b["e"], b["i"], td)
-                ap, logpp, _ = actor.sample(zb)
-                q1p, q2p = critic(zb, ap)
-                actor_loss = (alpha * logpp - torch.min(q1p, q2p)).mean()
-                actor_opt.zero_grad(); actor_loss.backward(); actor_opt.step()
-                with torch.no_grad():
-                    for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
-                        pt.mul_(1 - args.tau).add_(args.tau * p)
-                last_zb = zb.detach()
-                last_sac = (float(critic_loss.item()), float(actor_loss.item()))
+        res = sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
+                         log_alpha, args, step, device)
+        if res is not None:
+            last_sac = (res["critic_loss"], res["actor_loss"])
+            last_zb = res["zb"]
         return h_fwd
 
     # graceful stop for data-collection runs: 1st Ctrl-C finishes the in-flight decision and
