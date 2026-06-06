@@ -264,6 +264,7 @@ def main(args):
     is_start = True
     ep_len = 0
     press_run = 0
+    hot_polls = 0
     decisions = chunks_done = 0
     last_poll = last_beat = time.time()
     sat_window, rsafe_window = [], []
@@ -339,7 +340,10 @@ def main(args):
         # --- watchdog signals (tau_meas is hardware-only; mock provides it too) ----
         taus = np.stack([i["tau_meas"][0] for i in sub_infos])          # (block, 6)
         qvels = np.stack([i["qvel"][0] for i in sub_infos])
-        pressed = (np.abs(taus).max(1) > args.press_tau) & (np.abs(qvels).max(1) < args.press_vel)
+        # PER-JOINT press: the pinned joint has pegged tau AND ~zero velocity while the
+        # rest of the arm may still wander (the 2026-06-06 organic press had arm-wide
+        # |qd|max 0.09 — an arm-quiet predicate would miss every real press).
+        pressed = ((np.abs(taus) > args.press_tau) & (np.abs(qvels) < args.press_vel)).any(1)
         press_run = press_run + 1 if pressed.mean() > 0.5 else 0
         sat_window.append(float(np.abs(a_env).mean()))
         rsafe_window.append(r_safe)
@@ -374,10 +378,14 @@ def main(args):
                 probation = None
                 save_state()
 
-        # --- temp gate ---------------------------------------------------------------
+        # --- temp gate (debounced: the sensor sits near the driver FETs and can spike
+        #     ~15 degC transiently under heavy drive — drill 2026-06-06 saw 46->33 in 32 s.
+        #     Require 2 consecutive hot polls (~16 s apart) before parking.) -------------
         if decisions % args.temp_every == 0:
             temps = env.bus.read_temps()
-            if max(temps) > args.temp_gate:
+            hot_polls = hot_polls + 1 if max(temps) > args.temp_gate else 0
+            if hot_polls >= 2:
+                hot_polls = 0
                 if len(chunk) >= args.min_chunk:
                     uploader.submit(chunk.dump()); chunks_done += 1
                 park_and_rest(temps)
@@ -451,7 +459,10 @@ def parse_args():
     p.add_argument("--temp-gate", type=float, default=50.0)
     p.add_argument("--temp-resume", type=float, default=42.0)
     p.add_argument("--temp-every", type=int, default=20, help="decisions between temp polls")
-    p.add_argument("--press-tau", type=float, default=3.0)
+    p.add_argument("--press-tau", type=float, default=2.5,
+                   help="N*m; tau_meas clips at 3.35 so 3.0 left little headroom — 2.5 is "
+                        "still well above benign interaction loads (~1.9 peak measured), "
+                        "and the per-joint qd gate filters moving contacts")
     p.add_argument("--press-vel", type=float, default=0.05)
     p.add_argument("--press-decisions", type=int, default=5, help="~2 s at 2.6 sps")
     p.add_argument("--retreat-decisions", type=int, default=3)
