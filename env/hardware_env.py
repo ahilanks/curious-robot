@@ -64,9 +64,11 @@ import numpy as np
 
 from .safety_reward import safety_reward_np
 
-# Must mirror env/parallel_env.py::_INFO_KEYS (kept local so this module needs no mujoco).
+# Superset of env/parallel_env.py::_INFO_KEYS (kept local so this module needs no mujoco).
+# "tau_meas" is hardware-only: the measured torque the live r_safe scored — consumed by
+# collect_daemon's press watchdog (train.py reads by key and ignores extras).
 _INFO_KEYS = ("applied_torque", "qvel", "qvel_prev", "qpos", "safety_reward",
-              "object_contacts", "table_contacts", "object_motion")
+              "object_contacts", "table_contacts", "object_motion", "tau_meas")
 
 # --- SO-101 actuation constants (env/SO101/so101_new_calib.xml) ------------------
 # <position kp="998.22" kv="2.731" ...> on every joint; per-joint forcerange +/-3.35.
@@ -465,6 +467,18 @@ class FeetechBus:
         tau = cur * self._AMPS_PER_LSB * self.kt * self.signs   # measured joint torque [N*m]
         return q.astype(np.float32), qd.astype(np.float32), tau.astype(np.float32)
 
+    ADDR_PRESENT_TEMPERATURE = 63
+
+    def read_temps(self) -> np.ndarray:
+        """Per-servo temperature [deg C] (reg 63, 1 byte). READ-ONLY and OFF the hot
+        read()/write_goal() path — collect_daemon polls it sparsely (every ~20 decisions)
+        for the unattended temp gate. -1 on a dropped read (caller treats as unknown)."""
+        out = []
+        for sid in self.motor_ids:
+            t, c, _ = self.pk.read1ByteTxRx(self.port, sid, self.ADDR_PRESENT_TEMPERATURE)
+            out.append(float(t) if c == self._OK else -1.0)
+        return np.asarray(out, np.float32)
+
     @staticmethod
     def _pace_speed(delta_ticks: float, pace_dt: float, cap: int) -> int:
         """Goal_Speed [ticks/s] that traverses |delta_ticks| in exactly pace_dt: the firmware
@@ -545,6 +559,21 @@ class MockServoBus:
     def write_goal(self, goal_rad: np.ndarray) -> None:
         self.goal = np.clip(goal_rad, JOINT_LOW, JOINT_HIGH).astype(float)
         self.goals_written.append(self.goal.copy())
+
+    def read_temps(self) -> np.ndarray:
+        """Fake temperatures. SOARM_MOCK_TEMP can be a comma list (e.g. \"60,40\") consumed
+        one value per call (last repeats) so tests can script a temp-gate trip + recovery."""
+        spec = os.environ.get("SOARM_MOCK_TEMP", "35")
+        vals = spec.split(",")
+        idx = min(getattr(self, "_temp_calls", 0), len(vals) - 1)
+        self._temp_calls = getattr(self, "_temp_calls", 0) + 1
+        return np.full(N_DOF, float(vals[idx]), np.float32)
+
+    def disable_torque(self) -> None:    # parity with FeetechBus for the daemon's temp rest
+        pass
+
+    def enable_torque(self) -> None:
+        pass
 
     def close(self) -> None:
         pass

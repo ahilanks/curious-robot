@@ -73,6 +73,42 @@ mixing buffers with different action_max or λs poisons the reward/dynamics sema
   `hw_validate`/`hw_dval`/`hw_safe15_match` (old recompute-metric rewards, pre-P0), or the
   `_sim_safe15_*`/`_probe_*` stats buffers (λ_cur=1).
 
+## Autonomous 24/7 loop (supersedes manual rounds when running)
+
+Two daemons over the same HF rendezvous; campaign constants are their defaults.
+
+```bash
+# Mac — collector (frozen acting, chunk uploads, hot-swap with probation, watchdogs)
+export SOARM_PORT=/dev/cu.usbmodem5AA90245791 SOARM_CALIB=so101_calib.json
+python src/collect_daemon.py --name auto1 --warmstart-name safe15 --warmstart-step 100000
+
+# RunPod (1x A100 SXM) — learner (chunk sync, capped pool, governed fine-tune)
+bash setup.sh
+python src/learner_daemon.py --name auto1 --warmstart-name safe15 --warmstart-step 100000
+```
+
+How it stays safe unattended (collect_daemon):
+- **Acceptance probation**: every new learner ckpt drives ~30 watched decisions before
+  adoption; trips (press, mean|a|>0.9, r_safe<−5, NaN) ⇒ reject + revert to the
+  champion (`runs/auto1/champion.pt` — survives cache loss). Rejects are logged loudly.
+- **Temp gate** (reg 63, polled every ~20 decisions): >50 °C ⇒ park in the gravity fold,
+  torque off, resume <42 °C. Verify the register + the park pose once on the arm before
+  the first unattended run.
+- **Press watchdog**: ~2 s of pegged τ + no motion ⇒ retreat to joint midpoints
+  (static presses score r_safe=0 by spec — the reward will never fix them).
+- **Disk bound**: chunks delete locally on confirmed upload; backlog >20 drops oldest.
+
+Learner knobs that matter: `--replay-ratio` (default 16 grad-steps per collected
+transition — keep LOW early; an A100 outruns the arm ~100:1 and will overfit a small
+pool), `--pool-cap` 60k (~9 GB RAM), `--archive-cap` 300k (~45 GB pod disk; hub chunks
+are deleted after download by default). Heartbeats + events: `runs/auto1/daemon.jsonl`
+(Mac) and `runs/auto1_learner/daemon.jsonl` (pod).
+
+**Before leaving it alone, run the failure-path drill (attended, ~15 min):** force a
+temp trip (set --temp-gate below current temp), force a press (hand-block a link),
+watch one good ckpt promote, then upload a deliberately-broken ckpt and watch the gate
+REJECT it. The happy path proves nothing about unattended safety.
+
 ## Guardrails
 
 - **≥ a few hundred real transitions/round** — SAC valid pairs = stream_len−1; under
