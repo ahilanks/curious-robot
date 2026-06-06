@@ -1,9 +1,24 @@
 # Round campaign runbook — hardware → cloud adaptation
 
 One **round** = collect real (Mac, frozen) → upload → fine-tune offline (RunPod) → redeploy.
-Round 0 policy = `safe15 @ 100000`. Success = **measured r_safe trending less negative across
-the collected buffers, round over round** (real-to-real; never compare against sim's −35 —
-the metrics differ by construction).
+Round 0 policy = `safe15 @ 100000`.
+
+**Baseline (bench 2026-06-06, the 2×2 probe):** with the measured-τ metric, safe15 at
+action_max 0.1 / P=16 scores **r_safe ≈ 0.0** — the old −50…−190 was entirely the
+recompute artifact (same motions scored −144 by the old metric and 0 by real current;
+|τ_meas| peaked 0.44 N·m). Pacing on vs off was indistinguishable at this config (soft
+P self-smooths policy-scale deltas); it stays on as wear insurance.
+
+**Success criterion, reframed:** r_safe can't improve from 0 — adaptation success is now
+(a) reward/r_cur + interaction stats (contacts, object_motion once objects are in the
+workspace) growing across rounds as the WM/policy de-OOD on real observations, with
+(b) r_safe staying ≈ 0 as the now-truthful guardrail (it should only fire when the policy
+starts genuinely fighting — stalls/collisions), and (c) q̇-reversal % trending toward
+sim's ~34% in the buffer stats. Never compare r_safe against sim's −35 — different τ.
+
+**Open δ item:** the deadband's stall case (deliberate hand-block ≫ δ) is still
+unexercised — run it when physically at the arm (hold a link ~2 s mid-motion during any
+collect; the dbg line should go clearly negative). Rest + slow-motion cases verified = 0.
 
 ## Pinned campaign constants (do not change mid-campaign)
 
