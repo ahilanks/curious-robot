@@ -6,15 +6,24 @@ difference: identical reset/reset_one/step_block_async/step_block_wait/render_ov
 API, identical obs {"image","proprio"}, identical per-substep info dict, identical
 .n_dof/.tau_max/.wrist_resolution.
 
-Three things make it match the sim distribution the safe15 weights were trained on:
+Four things make it match the sim distribution the safe15 weights were trained on:
 
-1. TORQUE IS RECOMPUTED from the position-actuator PD law, never read off the servo.
-   In MuJoCo, proprio[2*n_dof:] and r_safe both consume `data.actuator_force` — the
-   realized <position>-actuator output  tau = clip(kp*(goal-q) - kv*qdot, +/-tau_max).
-   We evaluate that SAME formula (kp=998.22, kv=2.731, tau_max=3.35 — the SO-101 XML /
-   STS3215-at-P-gain-16 values) from the MEASURED q, qdot and the COMMANDED goal. The
-   servo's Present_Load is a duty-cycle proxy (~3x off via gearbox friction) and is NOT
-   used — feeding it would silently corrupt both proprio and r_safe.
+1. OBS TORQUE IS RECOMPUTED, REWARD TORQUE IS MEASURED — two torques, deliberately split.
+   - proprio[2*n_dof:] (and info["applied_torque"]) use the sim position-actuator PD law
+     tau = clip(kp*(goal-q) - kv*qdot, +/-tau_max) with kp=998.22 / kv=2.731 / tau_max=3.35
+     (the SO-101 XML values) from MEASURED q, qdot and the COMMANDED goal. This keeps the
+     OBSERVATION distribution the sim-trained encoder saw (sim's `data.actuator_force`
+     saturates ~87% of moving samples; the recompute ~90% — measured 2026-06-03).
+   - r_safe uses tau_meas = kt * Present_Current (measured motor effort, joint-frame sign,
+     EMA-filtered like qdot). The recompute is a COUNTERFACTUAL on hardware: kp=998 saturates
+     at 0.19 deg of tracking error, so a P=16 servo chasing 30 ms goals pegs |tau|=tau_max
+     whenever moving, and every arrival/stall (qdot drops while error > 0.2 deg) scored as a
+     max-weight "fight" — that artifact dominated the sim->real r_safe gap (-35 vs -190 at
+     matched config). Measured current's sign tracks the REAL drive direction, so normal
+     servo arrivals score compliant, as they do in sim where the scored torque is the one
+     actually braking the joint. Both r_safe variants are logged per control step
+     (info["safety_reward"] = measured-live, info["r_safe_recompute"] = old diagnostic) so a
+     bench A/B can attribute improvements. (Present_Load remains unused: duty-cycle proxy.)
 
 2. REAL-TIME PACING: each control step is held to dt_safe = 0.030 s (read-to-read), so the
    safety reward's qddot = (qdot - qdot_prev)/dt_safe finite-diff spans the same window as
@@ -23,6 +32,14 @@ Three things make it match the sim distribution the safe15 weights were trained 
    step_block_async/step_block_wait). If the learner is slower than the 0.030 s/step pace
    (likely on a laptop), only the GAP BETWEEN decisions stretches — each control step still
    reads exactly dt_safe after it commanded, so qddot stays valid.
+
+2b. TARGET PACING (Goal_Speed): sim alpha-interpolates each delta-target across the 30 ms
+   window (6 x 5 ms substeps, mujoco_env step); with the servo's factory Acceleration=0 +
+   static GoalSpeed=2000 the real arm instead RACED to each goal and dead-stopped — a
+   move-stop sawtooth 5x per decision (the physically-confirmed start-stop jerk). FeetechBus
+   now writes a per-step Goal_Speed = |delta_ticks|/pace_dt so the firmware executes each
+   move as a constant-velocity ramp spanning the window — sim's target ramp by construction.
+   Disable for A/B with SOARM_NO_PACE=1 (or pace_dt=0 in the calib json).
 
 3. NO PHYSICAL RESET. reset()/reset_one() READ the current servo state and return the obs
    WITHOUT moving the arm. "End of episode every n steps" (--max-episode-steps) is purely a
@@ -38,6 +55,7 @@ in for the real arm; this module imports neither lerobot nor mujoco at top level
 """
 from __future__ import annotations
 
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Protocol
@@ -83,7 +101,8 @@ class HardwareSO101Env:
         camera: "Camera | None" = None,
         control_dt: float = DT_SAFE,
         vel_lowpass: float = 0.5,         # EMA on qdot (raw servo velocity is noisy -> qddot blows up r_safe)
-    ):
+        cur_lowpass: float | None = None,  # EMA on measured torque; None = vel_lowpass so tau_meas and the
+    ):                                     # qddot it multiplies share a time constant (mismatch can flip -tau*qddot)
         if n_envs != 1:
             raise ValueError(f"HardwareSO101Env is a single physical arm; n_envs must be 1 (got {n_envs})")
         self.n_envs = 1
@@ -96,6 +115,7 @@ class HardwareSO101Env:
         self.safety_delta = float(safety_delta)
         self.dt_safe = float(control_dt)
         self.vel_lowpass = float(vel_lowpass)
+        self.cur_lowpass = float(cur_lowpass) if cur_lowpass is not None else float(vel_lowpass)
 
         self.bus = bus if bus is not None else _default_bus()
         self.camera = camera if camera is not None else _default_camera(wrist_resolution)
@@ -105,16 +125,23 @@ class HardwareSO101Env:
         self._q = np.zeros(N_DOF, np.float32)            # last commanded-from joint angles (pre-step q)
         self._qd_prev = np.zeros(N_DOF, np.float32)      # qdot at the previous control-step read
         self._qd_filt = np.zeros(N_DOF, np.float32)      # EMA velocity state
+        self._tau_filt = np.zeros(N_DOF, np.float32)     # EMA measured-torque state (kt * Present_Current)
         self._last_frame = None
+        self._ctrl_steps = 0                             # control-step counter (for SOARM_DEBUG prints)
+        self._debug_every = int(os.environ.get("SOARM_DEBUG", "0"))   # print both r_safe variants every N steps
 
     # --- observation assembly -------------------------------------------------
-    def _read(self) -> tuple[np.ndarray, np.ndarray]:
-        """Read (q, qdot) in SI (rad, rad/s) and low-pass qdot."""
-        q, qd_raw = self.bus.read()
+    def _read(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Read (q, qdot, tau_meas) in SI (rad, rad/s, N*m); low-pass qdot and tau_meas
+        with matched time constants. tau_meas is clipped to +/-tau_max so the r_safe
+        weight |tau|/tau_max stays <= 1 (strict sim form parity)."""
+        q, qd_raw, tau_raw = self.bus.read()
         q = np.asarray(q, np.float32)
         qd_raw = np.asarray(qd_raw, np.float32)
+        tau_raw = np.asarray(tau_raw, np.float32)
         self._qd_filt = self.vel_lowpass * qd_raw + (1.0 - self.vel_lowpass) * self._qd_filt
-        return q, self._qd_filt.copy()
+        self._tau_filt = self.cur_lowpass * tau_raw + (1.0 - self.cur_lowpass) * self._tau_filt
+        return q, self._qd_filt.copy(), np.clip(self._tau_filt, -TAU_MAX, TAU_MAX).astype(np.float32)
 
     @staticmethod
     def _obs(image: np.ndarray, q: np.ndarray, qd: np.ndarray, tau: np.ndarray) -> dict:
@@ -125,8 +152,9 @@ class HardwareSO101Env:
     # --- lifecycle: READ-ONLY reset (never commands the arm) -------------------
     def reset(self) -> dict[str, np.ndarray]:
         """Read current state; do NOT move the arm. Returns stacked (n_envs=1) obs."""
-        q, qd_raw = self.bus.read()                      # seed the velocity EMA from the live reading
+        q, qd_raw, tau_raw = self.bus.read()             # seed the EMA filters from the live reading
         self._qd_filt = np.asarray(qd_raw, np.float32).copy()
+        self._tau_filt = np.asarray(tau_raw, np.float32).copy()
         self._q = np.asarray(q, np.float32)
         self._qd_prev = self._qd_filt.copy()
         tau = np.clip(-KV * self._qd_prev, -TAU_MAX, TAU_MAX).astype(np.float32)  # goal==q => tau=-kv*qdot
@@ -149,13 +177,25 @@ class HardwareSO101Env:
         t_start = time.perf_counter()
         self.bus.write_goal(goal)                         # servo's internal PD realizes the target
         _sleep_until(t_start + self.dt_safe)              # hold dt_safe so qddot finite-diff matches sim
-        q_new, qd_new = self._read()                      # read AFTER the wait -> read-to-read == dt_safe
+        q_new, qd_new, tau_meas = self._read()            # read AFTER the wait -> read-to-read == dt_safe
 
-        # RECOMPUTE torque from the same PD law MuJoCo applies (NOT Present_Load).
+        # OBS torque: the sim PD-law recompute (distribution-match for the sim-trained
+        # encoder; see module docstring #1). NOT used for the reward.
         tau = np.clip(KP * (goal - q_new) - KV * qd_new, -TAU_MAX, TAU_MAX).astype(np.float32)
-        r_safe = float(safety_reward_np(tau, qd_new, self._qd_prev, TAU_MAX,
+        # REWARD torque: measured motor effort (kt * Present_Current). Its sign tracks the
+        # real drive direction, so servo arrivals/stalls are not billed as max-torque fights.
+        r_safe = float(safety_reward_np(tau_meas, qd_new, self._qd_prev, TAU_MAX,
                                         dt_safe=self.dt_safe, delta=self.safety_delta))
+        r_safe_rec = float(safety_reward_np(tau, qd_new, self._qd_prev, TAU_MAX,
+                                            dt_safe=self.dt_safe, delta=self.safety_delta))
         self._last_frame = self.camera.read()
+        self._ctrl_steps += 1
+        if self._debug_every and self._ctrl_steps % self._debug_every == 0:
+            spd = getattr(self.bus, "_last_speeds", None)   # per-step paced Goal_Speed (FeetechBus)
+            print(f"[hw dbg] ctrl_step={self._ctrl_steps} r_safe meas={r_safe:.1f} "
+                  f"recomp={r_safe_rec:.1f} |tau_meas|max={np.abs(tau_meas).max():.2f} "
+                  f"|qd|max={np.abs(qd_new).max():.2f}"
+                  + (f" pace={list(spd)}" if spd is not None else ""), flush=True)
         info = {
             "applied_torque": tau,
             "qvel": qd_new,
@@ -165,6 +205,10 @@ class HardwareSO101Env:
             "object_contacts": np.int64(0),               # logging-only on hardware -> stubbed
             "table_contacts": np.int64(0),
             "object_motion": np.float32(0.0),
+            # diagnostics (not in _INFO_KEYS -> dropped by step_block_wait stacking; for
+            # bench scripts calling _control_step directly and the SOARM_DEBUG print):
+            "tau_meas": tau_meas,                         # the torque the live r_safe scored
+            "r_safe_recompute": r_safe_rec,               # old recompute-metric r_safe (A/B attribution)
         }
         obs = self._obs(self._last_frame, q_new, qd_new, tau)
         self._q = q_new
@@ -222,10 +266,12 @@ def _sleep_until(deadline: float) -> None:
 
 # ============================================================ hardware I/O contracts
 class ServoBus(Protocol):
-    def read(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return (q, qdot): joint angles [rad] and velocities [rad/s], each shape (6,),
-        in the SAME zero pose + sign convention as the MuJoCo model (this is what the
-        per-joint tick<->radian CALIBRATION establishes)."""
+    def read(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (q, qdot, tau_meas): joint angles [rad], velocities [rad/s] and MEASURED
+        joint torques [N*m] (kt * Present_Current on real hardware), each shape (6,), in
+        the SAME zero pose + sign convention as the MuJoCo model (this is what the
+        per-joint tick<->radian CALIBRATION establishes). tau_meas feeds ONLY r_safe;
+        the observation torque is recomputed env-side from the sim PD law."""
         ...
 
     def write_goal(self, goal_rad: np.ndarray) -> None:
@@ -245,12 +291,14 @@ class Camera(Protocol):
 
 def _default_bus() -> "ServoBus":
     """Build the real bus from env vars when none is injected.
-        SOARM_MOCK=1 dry-run the whole loop with the in-process MockServoBus (no hardware)
-        SOARM_PORT   serial port of the TTL bus adapter (e.g. /dev/tty.usbmodemXXXX)
-        SOARM_CALIB  path to a JSON of {offsets_ticks:[...6], signs:[...6], vel_scale: float}
+        SOARM_MOCK=1    dry-run the whole loop with the in-process MockServoBus (no hardware)
+        SOARM_PORT      serial port of the TTL bus adapter (e.g. /dev/tty.usbmodemXXXX)
+        SOARM_CALIB     path to a JSON of {offsets_ticks:[...6], signs:[...6], vel_scale: float,
+                        p_gain, d_gain, goal_speed, pace_dt, acceleration, kt} (later keys optional)
+        SOARM_NO_PACE=1 disable per-step Goal_Speed pacing (A/B against the legacy race-and-stop)
+        SOARM_DEBUG=N   print both r_safe variants + pacing every N control steps (env-side)
     """
     import json
-    import os
     if os.environ.get("SOARM_MOCK") or os.environ.get("SOARM_PORT") == "mock":
         print("[hardware] SOARM_MOCK set -> MockServoBus (no real arm; dry-run only)", flush=True)
         return MockServoBus()
@@ -263,6 +311,9 @@ def _default_bus() -> "ServoBus":
     if os.environ.get("SOARM_CALIB"):
         with open(os.environ["SOARM_CALIB"]) as f:
             calib = json.load(f)
+    if os.environ.get("SOARM_NO_PACE"):
+        calib["pace_dt"] = 0.0
+        print("[hardware] SOARM_NO_PACE set -> legacy static Goal_Speed (no per-step pacing)", flush=True)
     return FeetechBus(port=port, **calib)
 
 
@@ -279,29 +330,46 @@ class FeetechBus:
     (offsets_ticks, signs, vel_scale) measured against the so101_new_calib.xml model and stored
     in SOARM_CALIB json. This is the ONE place the real arm is energized.
 
-    STS3215 control table (protocol_end=0): Torque_Enable 40, Goal_Position 42, Present_Position
-    56, Present_Speed 58 (sign-magnitude), Mode 33, P_gain 21. The SO-101 ships Mode=0 (position)
-    (position mode). P-gain/D-gain default to the shipped-stable 16/32 (tunable via the calib json;
-    raising them did NOT smooth safe15's real-arm jerk — that is policy-side, see logistics.md) and
-    GoalSpeed is set at construction (register config, no motion); enable_torque()
-    then sets each goal to the CURRENT position BEFORE enabling torque, so the arm HOLDS where it is
-    instead of snapping to the stale Goal_Position register (0 at boot).
+    STS3215 control table (protocol_end=0): Torque_Enable 40, Acceleration 41, Goal_Position 42,
+    Goal_Speed 46, Present_Position 56, Present_Speed 58 (sign-magnitude), Present_Current 69
+    (sign-magnitude, ~6.5 mA/LSB), Mode 33, P_gain 21. The SO-101 ships Mode=0 (position mode).
+    P-gain/D-gain default to the shipped-stable 16/32 (tunable via the calib json; raising them
+    did NOT smooth safe15's real-arm jerk — that was the unpaced goal staircase, see logistics.md).
+
+    PACING: with pace_dt > 0 (default: DT_SAFE) every write_goal also writes a per-servo
+    Goal_Speed = |delta_ticks|/pace_dt (clamped [1, goal_speed]) so the firmware ramps each move
+    across the control window instead of racing at the static cap and dead-stopping — the
+    hardware analog of sim's alpha-interpolated target. `goal_speed` doubles as the pacing CAP
+    and as the static value when pacing is off. Speed is written BEFORE position (the position
+    write triggers the move). Goal_Speed=0 means MAX on Feetech, hence the >=1 clamp.
+    `acceleration` (reg 41, ~100 ticks/s^2 per LSB, 0 = no firmware ramp = factory default) is
+    written at construction for optional bench experiments; note a finite value caps how fast
+    the servo reaches its paced speed — too low adds lag, so it stays 0 unless the bench says
+    otherwise. kt [N*m/A] scales Present_Current to joint torque for r_safe (placeholder 1.0
+    until bench-calibrated; it sits in the calib json next to vel_scale — both sensor scales).
+
+    enable_torque() sets each goal to the CURRENT position BEFORE enabling torque, so the arm
+    HOLDS where it is instead of snapping to the stale Goal_Position register (0 at boot).
     """
     ADDR_TORQUE_ENABLE = 40
+    ADDR_ACCELERATION = 41
     ADDR_GOAL_POSITION = 42
     ADDR_PRESENT_POSITION = 56
     ADDR_PRESENT_SPEED = 58
+    ADDR_PRESENT_CURRENT = 69
     ADDR_MODE = 33
     ADDR_P_GAIN = 21
     ADDR_D_GAIN = 22
     ADDR_GOAL_SPEED = 46
     TICKS_PER_REV = 4096          # STS3215 12-bit absolute encoder
     _RAD_PER_TICK = 2.0 * np.pi / TICKS_PER_REV
+    _AMPS_PER_LSB = 0.0065        # Present_Current unit (Feetech STS3215 datasheet)
 
     def __init__(self, port: str, motor_ids=(1, 2, 3, 4, 5, 6),
                  offsets_ticks=None, signs=None, vel_scale: float | None = None,
                  p_gain: int = 16, d_gain: int = 32, goal_speed: int = 2000,
-                 enable_torque: bool = True, max_step_ticks: int = 300):
+                 enable_torque: bool = True, max_step_ticks: int = 300,
+                 pace_dt: float = DT_SAFE, acceleration: int = 0, kt: float = 1.0):
         if offsets_ticks is None or signs is None or vel_scale is None:
             raise RuntimeError(
                 "FeetechBus needs calibration: offsets_ticks[6], signs[6], vel_scale "
@@ -314,7 +382,11 @@ class FeetechBus:
         self.signs = np.asarray(signs, np.float64)
         self.vel_scale = float(vel_scale)
         self.max_step_ticks = int(max_step_ticks)    # backstop: cap any single commanded jump
+        self.goal_speed = int(goal_speed)            # pacing cap / static speed when pacing off
+        self.pace_dt = float(pace_dt)                # 0 disables per-step Goal_Speed pacing
+        self.kt = float(kt)                          # N*m per A: Present_Current -> joint torque
         self._last_pos = None                         # last good Present_Position (set by enable_torque)
+        self._last_speeds = None                      # last paced Goal_Speed values (SOARM_DEBUG)
         self._torque = False
         self.port = PortHandler(port)
         if not self.port.openPort():
@@ -331,8 +403,9 @@ class FeetechBus:
             if self.pk.read1ByteTxRx(self.port, sid, self.ADDR_P_GAIN)[0] != int(p_gain):
                 self.pk.write1ByteTxRx(self.port, sid, self.ADDR_P_GAIN, int(p_gain))      # tracking stiffness (EEPROM)
             if self.pk.read1ByteTxRx(self.port, sid, self.ADDR_D_GAIN)[0] != int(d_gain):
-                self.pk.write1ByteTxRx(self.port, sid, self.ADDR_D_GAIN, int(d_gain))      # damping: kills start-stop jerk
+                self.pk.write1ByteTxRx(self.port, sid, self.ADDR_D_GAIN, int(d_gain))      # damping
             self.pk.write2ByteTxRx(self.port, sid, self.ADDR_GOAL_SPEED, int(goal_speed))  # SRAM, resets on power-cycle
+            self.pk.write1ByteTxRx(self.port, sid, self.ADDR_ACCELERATION, int(acceleration))  # 0 = factory (no ramp)
         if enable_torque:
             self.enable_torque()
 
@@ -355,8 +428,8 @@ class FeetechBus:
             self.pk.write1ByteTxRx(self.port, sid, self.ADDR_TORQUE_ENABLE, 0)
         self._torque = False
 
-    def read(self) -> tuple[np.ndarray, np.ndarray]:
-        pos, spd = [], []
+    def read(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        pos, spd, cur = [], [], []
         for i, sid in enumerate(self.motor_ids):
             p, cp, _ = self.pk.read2ByteTxRx(self.port, sid, self.ADDR_PRESENT_POSITION)
             if cp != self._OK:
@@ -367,11 +440,24 @@ class FeetechBus:
             s, cs, _ = self.pk.read2ByteTxRx(self.port, sid, self.ADDR_PRESENT_SPEED)
             mag = (s & 0x7FFF) if cs == self._OK else 0      # Present_Speed sign-magnitude; 0 vel on drop
             spd.append(-mag if (cs == self._OK and (s & 0x8000)) else mag)
+            c, cc, _ = self.pk.read2ByteTxRx(self.port, sid, self.ADDR_PRESENT_CURRENT)
+            cmag = (c & 0x7FFF) if cc == self._OK else 0     # Present_Current sign-magnitude; 0 on drop
+            cur.append(-cmag if (cc == self._OK and (c & 0x8000)) else cmag)   # (EMA env-side smooths drops)
         pos = np.asarray(pos, np.float64); spd = np.asarray(spd, np.float64)
+        cur = np.asarray(cur, np.float64)
         self._last_pos = pos.copy()                          # refresh last-good
         q = (pos - self.offsets) * self._RAD_PER_TICK * self.signs
         qd = spd * self.vel_scale * self.signs
-        return q.astype(np.float32), qd.astype(np.float32)
+        tau = cur * self._AMPS_PER_LSB * self.kt * self.signs   # measured joint torque [N*m]
+        return q.astype(np.float32), qd.astype(np.float32), tau.astype(np.float32)
+
+    @staticmethod
+    def _pace_speed(delta_ticks: float, pace_dt: float, cap: int) -> int:
+        """Goal_Speed [ticks/s] that traverses |delta_ticks| in exactly pace_dt: the firmware
+        executes the move as a constant-velocity ramp spanning the control window (sim's
+        alpha-interpolated target, done in firmware). ceil -> arrive marginally early rather
+        than late; clamp >= 1 because Goal_Speed=0 means MAX speed on Feetech."""
+        return int(min(cap, max(1, np.ceil(abs(delta_ticks) / max(pace_dt, 1e-6)))))
 
     def write_goal(self, goal_rad: np.ndarray) -> None:
         ticks = np.asarray(goal_rad, np.float64) / self.signs / self._RAD_PER_TICK + self.offsets
@@ -379,7 +465,13 @@ class FeetechBus:
             ticks = np.clip(ticks, self._last_pos - self.max_step_ticks,   # than max_step_ticks from the
                             self._last_pos + self.max_step_ticks)          # current position
         ticks = np.clip(np.round(ticks), 0, 4095).astype(int)   # final guard against out-of-range
-        for sid, t in zip(self.motor_ids, ticks):
+        pace = self.pace_dt > 0 and self._last_pos is not None
+        if pace:
+            self._last_speeds = [self._pace_speed(t - lp, self.pace_dt, self.goal_speed)
+                                 for t, lp in zip(ticks, self._last_pos)]
+        for i, (sid, t) in enumerate(zip(self.motor_ids, ticks)):
+            if pace:   # speed BEFORE position: the position write triggers the move
+                self.pk.write2ByteTxRx(self.port, sid, self.ADDR_GOAL_SPEED, self._last_speeds[i])
             self.pk.write2ByteTxRx(self.port, sid, self.ADDR_GOAL_POSITION, int(t))
 
     def close(self) -> None:
@@ -415,9 +507,11 @@ class UsbCamera:
 # ====================================================================== mock drivers
 class MockServoBus:
     """In-process fake STS3215 bus: a 1st-order approach toward the last commanded goal
-    (+ small noise), so the env's pacing / torque recompute / safety / threading are
+    (+ small noise), so the env's pacing / torque split / safety / threading are
     testable without hardware. Records every commanded goal so a test can assert that
-    READ-ONLY reset issues no motion command."""
+    READ-ONLY reset issues no motion command. read() returns a fake measured torque whose
+    SIGN tracks the drive direction (goal - q), ~0 at rest — the property the current-based
+    r_safe relies on (real source: kt * Present_Current)."""
 
     def __init__(self, q0=None, seed: int = 0):
         self.q = np.zeros(N_DOF) if q0 is None else np.asarray(q0, float).copy()
@@ -426,11 +520,13 @@ class MockServoBus:
         self.goals_written: list[np.ndarray] = []
         self.rng = np.random.default_rng(seed)
 
-    def read(self) -> tuple[np.ndarray, np.ndarray]:
+    def read(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         err = self.goal - self.q                        # advance a fraction toward the goal
         self.qd = 0.3 * err / DT_SAFE + self.rng.normal(0, 0.02, N_DOF)
         self.q = self.q + self.qd * DT_SAFE
-        return self.q.copy(), self.qd.copy()
+        tau = np.clip(3.35 * np.tanh(8.0 * err) - 0.5 * self.qd, -3.35, 3.35) \
+            + self.rng.normal(0, 0.05, N_DOF)           # drive-direction effort, ~0 at rest
+        return self.q.copy(), self.qd.copy(), tau.astype(np.float32)
 
     def write_goal(self, goal_rad: np.ndarray) -> None:
         self.goal = np.clip(goal_rad, JOINT_LOW, JOINT_HIGH).astype(float)
@@ -491,10 +587,37 @@ def _self_test() -> None:
     assert action_block * env.dt_safe - 0.01 <= dt, f"block ran too fast ({dt:.3f}s); pacing broken"
     assert len(bus.goals_written) == n_goals + action_block, "expected one Goal_Position per control step"
 
+    # obs/reward torque DECOUPLING (load-bearing: a swap silently reintroduces the OOD-proprio
+    # or fake-fight bug). applied_torque must be EXACTLY the sim PD-law recompute, and must
+    # NOT be the measured torque the live r_safe scored.
+    q_before = env._q.copy()
+    a_one = np.full(N_DOF, 0.5, np.float32)
+    o_one, info = env._control_step(a_one)
+    assert "tau_meas" in info and "r_safe_recompute" in info
+    goal_exp = np.clip(q_before + np.clip(np.clip(a_one, -1, 1) * env.action_max,
+                                          -env.dq_max, env.dq_max), JOINT_LOW, JOINT_HIGH)
+    tau_exp = np.clip(KP * (goal_exp - info["qpos"]) - KV * info["qvel"], -TAU_MAX, TAU_MAX)
+    assert np.allclose(info["applied_torque"], tau_exp, atol=1e-5), \
+        "proprio torque must stay the sim PD-law recompute"
+    assert not np.allclose(info["applied_torque"], info["tau_meas"]), \
+        "applied_torque == tau_meas: obs/reward torque split was lost"
+    assert np.all(np.abs(info["tau_meas"]) <= 3.35 + 1e-4) and np.isfinite(info["r_safe_recompute"])
+    assert np.allclose(o_one["proprio"][2 * N_DOF:], info["applied_torque"])   # proprio carries the recompute
+
+    # Goal_Speed pacing math (single source used by FeetechBus.write_goal; the mock never
+    # exercises the register path, so pin the function here)
+    ps = FeetechBus._pace_speed
+    assert ps(0.0, DT_SAFE, 2000) == 1                      # no move -> min (0 would mean MAX speed)
+    assert ps(-30.0, DT_SAFE, 2000) == 1000                 # 30 ticks over 30 ms -> 1000 ticks/s (sign-free)
+    assert ps(45.0, DT_SAFE, 2000) == 1500
+    assert ps(90.0, DT_SAFE, 2000) == 2000                  # capped at goal_speed
+    assert ps(65.0, 0.030, 2000) == 2000                    # action_max 0.1-ish full step -> caps
+
     env.close()
     print(f"[selftest] OK — block of {action_block} steps in {dt*1000:.0f} ms "
           f"(expected >= {action_block*env.dt_safe*1000:.0f} ms), proprio=(1,18), "
-          f"{len(_INFO_KEYS)} info keys, torque clipped to +/-3.35, reset is read-only.")
+          f"{len(_INFO_KEYS)} info keys, torque clipped to +/-3.35, reset is read-only, "
+          f"obs-torque=PD-recompute / reward-torque=measured split verified, pacing math pinned.")
 
 
 if __name__ == "__main__":
