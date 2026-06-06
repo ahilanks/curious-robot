@@ -4,5 +4,8 @@
   "vel_scale": 0.00153,
   "p_gain": 16,
   "d_gain": 32,
-  "goal_speed": 2000
+  "goal_speed": 2400,
+  "pace_dt": 0.030,
+  "acceleration": 0,
+  "kt": 1.0
 }
