@@ -7,5 +7,5 @@
   "goal_speed": 2400,
   "pace_dt": 0.030,
   "acceleration": 0,
-  "kt": 1.0
+  "kt": 10.0
 }

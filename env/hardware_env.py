@@ -331,8 +331,9 @@ class FeetechBus:
     in SOARM_CALIB json. This is the ONE place the real arm is energized.
 
     STS3215 control table (protocol_end=0): Torque_Enable 40, Acceleration 41, Goal_Position 42,
-    Goal_Speed 46, Present_Position 56, Present_Speed 58 (sign-magnitude), Present_Current 69
-    (sign-magnitude, ~6.5 mA/LSB), Mode 33, P_gain 21. The SO-101 ships Mode=0 (position mode).
+    Goal_Speed 46, Present_Position 56, Present_Speed 58 (sign-magnitude), Present_Load 60
+    (bit 10 = drive direction), Present_Current 69 (magnitude-only on this fw, ~6.5 mA/LSB),
+    Mode 33, P_gain 21. The SO-101 ships Mode=0 (position mode).
     P-gain/D-gain default to the shipped-stable 16/32 (tunable via the calib json; raising them
     did NOT smooth safe15's real-arm jerk — that was the unpaced goal staircase, see logistics.md).
 
@@ -356,6 +357,7 @@ class FeetechBus:
     ADDR_GOAL_POSITION = 42
     ADDR_PRESENT_POSITION = 56
     ADDR_PRESENT_SPEED = 58
+    ADDR_PRESENT_LOAD = 60
     ADDR_PRESENT_CURRENT = 69
     ADDR_MODE = 33
     ADDR_P_GAIN = 21
@@ -364,6 +366,12 @@ class FeetechBus:
     TICKS_PER_REV = 4096          # STS3215 12-bit absolute encoder
     _RAD_PER_TICK = 2.0 * np.pi / TICKS_PER_REV
     _AMPS_PER_LSB = 0.0065        # Present_Current unit (Feetech STS3215 datasheet)
+    # Bench finding (2026-06-06, this arm's firmware): Present_Current is MAGNITUDE-ONLY
+    # (bit 15 never set either drive direction; not two's-complement). Present_Load's
+    # bit 10 (0x400) IS the drive-direction bit (PWM polarity) and flips perfectly with
+    # direction (verified against Present_Speed's known-good bit-15 on a pan sweep).
+    # tau_meas therefore marries the two: |Present_Current| * sign(load bit 10).
+    _LOAD_SIGN_BIT = 0x400
 
     def __init__(self, port: str, motor_ids=(1, 2, 3, 4, 5, 6),
                  offsets_ticks=None, signs=None, vel_scale: float | None = None,
@@ -440,9 +448,15 @@ class FeetechBus:
             s, cs, _ = self.pk.read2ByteTxRx(self.port, sid, self.ADDR_PRESENT_SPEED)
             mag = (s & 0x7FFF) if cs == self._OK else 0      # Present_Speed sign-magnitude; 0 vel on drop
             spd.append(-mag if (cs == self._OK and (s & 0x8000)) else mag)
+            # measured torque = |Present_Current| (true magnitude, unsigned on this fw)
+            #                   * sign(Present_Load bit 10) (true PWM drive direction)
             c, cc, _ = self.pk.read2ByteTxRx(self.port, sid, self.ADDR_PRESENT_CURRENT)
-            cmag = (c & 0x7FFF) if cc == self._OK else 0     # Present_Current sign-magnitude; 0 on drop
-            cur.append(-cmag if (cc == self._OK and (c & 0x8000)) else cmag)   # (EMA env-side smooths drops)
+            ld, cl, _ = self.pk.read2ByteTxRx(self.port, sid, self.ADDR_PRESENT_LOAD)
+            if cc == self._OK and cl == self._OK:
+                cmag = c & 0x7FFF
+                cur.append(cmag if (ld & self._LOAD_SIGN_BIT) else -cmag)
+            else:
+                cur.append(0)                                # dropped read -> 0 torque (benign; EMA smooths)
         pos = np.asarray(pos, np.float64); spd = np.asarray(spd, np.float64)
         cur = np.asarray(cur, np.float64)
         self._last_pos = pos.copy()                          # refresh last-good
