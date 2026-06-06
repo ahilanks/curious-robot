@@ -16,9 +16,11 @@ workspace) growing across rounds as the WM/policy de-OOD on real observations, w
 starts genuinely fighting — stalls/collisions), and (c) q̇-reversal % trending toward
 sim's ~34% in the buffer stats. Never compare r_safe against sim's −35 — different τ.
 
-**Open δ item:** the deadband's stall case (deliberate hand-block ≫ δ) is still
-unexercised — run it when physically at the arm (hold a link ~2 s mid-motion during any
-collect; the dbg line should go clearly negative). Rest + slow-motion cases verified = 0.
+**δ protocol: fully verified (2026-06-06).** Rest + slow-motion = 0 (bench replay); stall
+case fired ORGANICALLY in a 200-decision run — the arm pressed into something at full
+effort (τ_meas pegged 3.35, |q̇| 0.09): measured r_safe went negative (−0.003 window mean)
+while the recompute scored that exact event −0.0 (and scored −107.9 on free motion
+elsewhere — the old metric misses real fights and invents fake ones). δ=15 + kt=10 final.
 
 ## Pinned campaign constants (do not change mid-campaign)
 
