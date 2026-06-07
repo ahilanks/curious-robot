@@ -46,8 +46,10 @@ from src.train import Actor, curiosity_reward, encode_obs, resolve_ckpt   # noqa
 from env.hardware_env import JOINT_HIGH, JOINT_LOW               # noqa: E402
 
 # Gravity-stable fold for torque-off rest (≈ where the arm settles when limp; pan/roll/
-# gripper keep their current values). Verify once on the arm before unattended runs.
+# gripper keep their current values). Bench-verified gravity-stable 2026-06-06 (0.0 mrad
+# drift after torque-off).
 PARK_SHOULDER, PARK_ELBOW, PARK_WRIST = -1.70, -1.60, -1.00
+DEAD_BUS_POLLS = 60          # rest polls (30 s apart) of all-failed temp reads before giving up
 
 
 def log(out_dir, msg, **kv):
@@ -247,6 +249,21 @@ def main(args):
                            safety_delta=args.safety_delta, seed=args.seed)
     uploader = Uploader(repo, args.name, out_dir, args.max_backlog, not args.no_hf)
     uploader.start()
+    # Re-queue chunks a previous run dumped but never uploaded — the upload queue is
+    # in-memory, so they'd otherwise be orphaned on disk forever. Validate first: a
+    # SIGKILL mid-savez leaves a torn npz, which must never reach the hub (the learner
+    # would crash-loop on it). Torn files are quarantined, not deleted.
+    for orphan in sorted(out_dir.glob("chunk_*.npz")):
+        try:
+            with np.load(orphan) as z:
+                if "env_lengths" not in z.files:
+                    raise ValueError("missing env_lengths")
+        except Exception as ex:
+            orphan.rename(orphan.with_name(orphan.name + ".corrupt"))
+            log(out_dir, "quarantined torn orphan chunk", file=orphan.name, err=str(ex)[:80])
+            continue
+        uploader.submit(orphan)
+        log(out_dir, "re-queued orphan chunk from a previous run", file=orphan.name)
     chunk = ChunkWriter(out_dir)
 
     stop = {"flag": False}
@@ -282,7 +299,12 @@ def main(args):
     t0 = time.time()
 
     def park_and_rest(temps):
-        """Temp gate: fold to a gravity-stable pose, drop torque, wait until cool."""
+        """Temp gate: fold to a gravity-stable pose, drop torque, wait until cool.
+        SIGINT during the rest BREAKS (not returns) so torque is re-enabled and the
+        'exits with the arm holding' convention stays true. If every temp read fails
+        (-1 x6 = dead bus) for DEAD_BUS_POLLS consecutive polls, raise — a loud dead
+        process beats silently impersonating a long cool-down for days (the arm is
+        already parked + limp, the safe state for a dead bus)."""
         log(out_dir, "TEMP GATE — parking + resting", temps=[float(x) for x in temps])
         q_now = env.bus.read()[0]
         park = q_now.copy()
@@ -291,16 +313,27 @@ def main(args):
             env.bus.write_goal(q_now + (park - q_now) * k / 20.0)
             time.sleep(0.1)
         env.bus.disable_torque()
+        dead_polls = 0
         while True:
             time.sleep(30.0)
+            if stop["flag"]:
+                break                                       # fall through to enable_torque
             t = env.bus.read_temps()
             log(out_dir, "resting", temps=[float(x) for x in t])
-            if 0 <= max(t) <= args.temp_resume:
+            if max(t) < 0:                                  # ALL reads failed -> bus likely dead
+                dead_polls += 1
+                if dead_polls >= DEAD_BUS_POLLS:
+                    log(out_dir, "BUS DEAD during temp rest — exiting loudly (arm parked+limp)")
+                    raise RuntimeError(
+                        f"all servo temp reads failed for {DEAD_BUS_POLLS} consecutive polls "
+                        "(~30 min) during temp rest; bus presumed dead. Arm left parked+limp.")
+                continue
+            dead_polls = 0
+            if max(t) <= args.temp_resume:
                 break
-            if stop["flag"]:
-                return
         env.bus.enable_torque()                             # holds the parked pose
-        log(out_dir, "temps recovered — resuming")
+        log(out_dir, "temps recovered — resuming" if not stop["flag"]
+            else "SIGINT during rest — re-energized at park, exiting holding")
 
     def retreat():
         """Press watchdog: a few decisions toward joint midpoints, then history break."""
