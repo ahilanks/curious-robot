@@ -198,32 +198,43 @@ def main(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     log(out_dir, "collector boot", device=str(device), name=args.name)
 
-    # --- policy: resume own lineage if it exists, else the warmstart run -----------
+    # --- policy boot order: newest NON-REJECTED own-lineage ckpt on the hub ->
+    #     local champion.pt ratchet -> the warmstart run. The rejected-set loads FIRST
+    #     so a crash-restart while a bad ckpt sits as hub-latest cannot adopt it
+    #     unprobed (it was rejected for a reason). ---------------------------------
     champ_file = out_dir / "champion.pt"
+    state_file = out_dir / "champion.json"
+    rejects = 0
+    rejected: set[int] = set()
+    prev_state = {}
+    if state_file.exists():                                 # rejections survive restarts
+        try:
+            prev_state = json.loads(state_file.read_text())
+            rejected = set(prev_state.get("rejected", []))
+        except Exception:
+            pass
     boot_step, boot_file = (None, None)
     if not args.no_hf:
         try:
-            boot_step, boot_file = hub_latest(repo, args.name, token)
+            boot_step, boot_file = pick_candidate(hub_ckpts(repo, args.name, token),
+                                                  -10**12, rejected)
         except Exception as ex:
-            log(out_dir, "hub poll failed at boot; using warmstart", err=str(ex)[:120])
+            log(out_dir, "hub poll failed at boot; falling back", err=str(ex)[:120])
     if boot_file is not None:
         from huggingface_hub import hf_hub_download
         path = hf_hub_download(repo_id=repo, filename=boot_file, token=token)
+    elif champ_file.exists():
+        path = str(champ_file)
+        boot_step = int(prev_state.get("step", -1))
+        log(out_dir, "boot from local champion ratchet", step=boot_step)
     else:
         path = resolve_ckpt(args.init_ckpt, args.warmstart_name, args.warmstart_step, repo)
         boot_step = -1     # warmstart lives in ANOTHER run's numbering; any own-lineage
                            # ckpt (learner counts from 0) must register as newer
     champion = Policy(path, boot_step, device)
     import shutil
-    shutil.copyfile(path, champ_file)                       # the ratchet survives hub/cache loss
-    rejects = 0
-    rejected: set[int] = set()
-    state_file = out_dir / "champion.json"
-    if state_file.exists():                                 # rejected ckpts stay rejected across restarts
-        try:
-            rejected = set(json.loads(state_file.read_text()).get("rejected", []))
-        except Exception:
-            pass
+    if os.path.abspath(path) != os.path.abspath(champ_file):
+        shutil.copyfile(path, champ_file)                   # the ratchet survives hub/cache loss
     def save_state():
         state_file.write_text(json.dumps({"step": champion.step_id, "src": champion.path,
                                           "rejects": rejects, "rejected": sorted(rejected)}))
