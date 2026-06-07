@@ -33,10 +33,16 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
 import torch
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -200,6 +206,25 @@ def main(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     log(out_dir, "collector boot", device=str(device), name=args.name)
 
+    # W&B is the dashboard layer ON TOP of daemon.jsonl (which stays the crash-safe local
+    # log). Stable id + resume="allow": daemon restarts continue ONE W&B run instead of
+    # spawning a new run per restart. Auto-step (no step=): collector decision counts
+    # reset on restart and W&B rejects non-monotonic steps — `decisions` is a field.
+    run = None
+    if not args.no_wandb and wandb is not None and os.environ.get("WANDB_API_KEY"):
+        run = wandb.init(project=args.wandb_project or os.environ.get("WANDB_PROJECT", "curious-robot"),
+                         entity=os.environ.get("WANDB_ENTITY"),
+                         name=f"{args.name}-collector", id=f"{args.name}-collector",
+                         resume="allow", group=args.name, dir=str(out_dir), config=vars(args))
+        print(f"[wandb] {run.url}", flush=True)
+
+    def wlog(d):
+        if run is not None:
+            try:
+                run.log(d)
+            except Exception:
+                pass                                        # dashboard must never kill the arm loop
+
     # --- policy boot order: newest NON-REJECTED own-lineage ckpt on the hub ->
     #     local champion.pt ratchet -> the warmstart run. The rejected-set loads FIRST
     #     so a crash-restart while a bad ckpt sits as hub-latest cannot adopt it
@@ -293,9 +318,13 @@ def main(args):
     ep_len = 0
     press_run = 0
     hot_polls = 0
+    presses = 0
     decisions = chunks_done = 0
     last_poll = last_beat = time.time()
     sat_window, rsafe_window = [], []
+    recent_r = deque(maxlen=200)
+    recent_rcur = deque(maxlen=200)
+    last_temps = None
     t0 = time.time()
 
     def park_and_rest(temps):
@@ -370,6 +399,8 @@ def main(args):
         z_next = encode_obs(acting.wm, obs_next["image"], obs_next["proprio"], device)
         r_cur = float(curiosity_reward(acting.wm, hist_z, hist_a, z_next)[0])
         reward = args.lambda_safe * r_safe + args.lambda_cur * float(np.log1p(r_cur))
+        recent_r.append(reward)
+        recent_rcur.append(r_cur)
 
         ep_len += 1
         done = float(ep_len >= args.episode_steps)
@@ -395,6 +426,8 @@ def main(args):
         if press_run >= args.press_decisions:
             retreat()
             press_run = 0
+            presses += 1
+            wlog({"watchdog/presses": presses, "watchdog/press_decision": decisions})
             if probation is not None:                       # candidate caused a press: reject
                 log(out_dir, "PROBATION REJECT: press", step=acting.step_id)
                 rejected.add(acting.step_id); rejects += 1
@@ -412,6 +445,8 @@ def main(args):
                 if sat > args.probation_sat or rs < args.probation_rsafe:
                     log(out_dir, "PROBATION REJECT", step=acting.step_id, sat=sat, r_safe=rs)
                     rejected.add(acting.step_id); rejects += 1
+                    wlog({"probation/rejects": rejects, "probation/last_reject_step": acting.step_id,
+                          "probation/sat": sat, "probation/r_safe": rs})
                     acting = champion
                     obs = reset_history("reject")
                 else:
@@ -419,6 +454,8 @@ def main(args):
                     shutil.copyfile(acting.path, champ_file)
                     log(out_dir, "PROBATION PASS — new champion", step=champion.step_id,
                         sat=sat, r_safe=rs)
+                    wlog({"probation/champion_step": champion.step_id,
+                          "probation/sat": sat, "probation/r_safe": rs})
                 probation = None
                 save_state()
 
@@ -427,9 +464,11 @@ def main(args):
         #     Require 2 consecutive hot polls (~16 s apart) before parking.) -------------
         if decisions % args.temp_every == 0:
             temps = env.bus.read_temps()
+            last_temps = temps
             hot_polls = hot_polls + 1 if max(temps) > args.temp_gate else 0
             if hot_polls >= 2:
                 hot_polls = 0
+                wlog({"watchdog/temp_trips": 1, "temps/max_at_trip": float(max(temps))})
                 if len(chunk) >= args.min_chunk:
                     uploader.submit(chunk.dump()); chunks_done += 1
                 park_and_rest(temps)
@@ -460,11 +499,25 @@ def main(args):
             uploader.submit(chunk.dump()); chunks_done += 1
         if time.time() - last_beat > 60:
             last_beat = time.time()
+            sps = round(decisions / max(time.time() - t0, 1e-9), 2)
             log(out_dir, "heartbeat", decisions=decisions, chunks=chunks_done,
                 champion=champion.step_id, probation=bool(probation), rejects=rejects,
                 queue=uploader.q.qsize(), uploaded=uploader.uploaded,
-                dropped=uploader.dropped,
-                sps=round(decisions / max(time.time() - t0, 1e-9), 2))
+                dropped=uploader.dropped, sps=sps)
+            beat = {"collector/decisions": decisions, "collector/sps": sps,
+                    "collector/chunks_uploaded": uploader.uploaded,
+                    "collector/upload_queue": uploader.q.qsize(),
+                    "collector/chunks_dropped": uploader.dropped,
+                    "probation/champion_step": champion.step_id,
+                    "probation/rejects": rejects, "watchdog/presses": presses,
+                    "reward/total": float(np.mean(recent_r)) if recent_r else 0.0,
+                    "reward/r_cur": float(np.mean(recent_rcur)) if recent_rcur else 0.0,
+                    "reward/r_safe": float(np.mean(rsafe_window[-200:])) if rsafe_window else 0.0,
+                    "action/sat": float(np.mean(sat_window[-200:])) if sat_window else 0.0}
+            if last_temps is not None:
+                beat["temps/max"] = float(max(last_temps))
+                beat.update({f"temps/servo{j+1}": float(t) for j, t in enumerate(last_temps)})
+            wlog(beat)
         obs = obs_next
 
     # ----------------------------------------------------------------- shutdown
@@ -474,6 +527,8 @@ def main(args):
     while uploader.q.qsize() and time.time() < deadline:
         time.sleep(1)
     env.close()
+    if run is not None:
+        run.finish()
     log(out_dir, "collector exit", decisions=decisions, chunks=chunks_done)
 
 
@@ -513,6 +568,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-hf", action="store_true", help="dry-run: no uploads, no ckpt polls")
     p.add_argument("--hf-repo", default=None)
+    p.add_argument("--no-wandb", action="store_true")
+    p.add_argument("--wandb-project", default=None)
     return p.parse_args()
 
 

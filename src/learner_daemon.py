@@ -28,6 +28,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -125,6 +130,24 @@ def main(args):
     pool_dir.mkdir(parents=True, exist_ok=True)
     log(out_dir, "learner boot", device=str(device), name=args.name)
 
+    # W&B dashboard layer on top of daemon.jsonl. Stable id + resume="allow" -> daemon
+    # restarts continue one W&B run. global_step is monotonic across restarts (resumes
+    # from the latest ckpt), so it is safe as the x-axis step.
+    run = None
+    if not args.no_wandb and wandb is not None and os.environ.get("WANDB_API_KEY"):
+        run = wandb.init(project=args.wandb_project or os.environ.get("WANDB_PROJECT", "curious-robot"),
+                         entity=os.environ.get("WANDB_ENTITY"),
+                         name=f"{args.name}-learner", id=f"{args.name}-learner",
+                         resume="allow", group=args.name, dir=str(out_dir), config=vars(args))
+        print(f"[wandb] {run.url}", flush=True)
+
+    def wlog(d, step=None):
+        if run is not None:
+            try:
+                run.log(d, step=step)
+            except Exception:
+                pass                                       # dashboard must never kill training
+
     # --- warm-resume own lineage from the hub, else the warmstart run --------------
     from huggingface_hub import HfApi, hf_hub_download
     own = [f for f in HfApi(token=token).list_repo_files(repo)
@@ -195,6 +218,9 @@ def main(args):
             buf = load_buffer([str(f) for f in paths], H, args.h_fwd_max, device)
             log(out_dir, "pool rebuilt", chunks=len(paths), transitions=buf.total,
                 seen_session=seen_transitions, new_chunks=new)
+            wlog({"learner/pool_transitions": buf.total,
+                  "learner/seen_session": seen_transitions,
+                  "learner/pool_chunks": len(paths)}, step=global_step)
 
         # --- replay-ratio governor ---------------------------------------------------
         budget = args.replay_ratio * seen_transitions - steps_done_for_budget
@@ -234,10 +260,19 @@ def main(args):
                 d["sps"] = round(global_step / max(time.time() - t0, 1e-9), 1)
                 log(out_dir, "ckpt", **{k: (round(v, 4) if isinstance(v, float) else v)
                                         for k, v in d.items()})
+                wlog({"wm/pred_loss": d.get("pred_loss"), "wm/sigreg": d.get("sigreg"),
+                      "sac/critic_loss": d.get("critic_loss"), "sac/actor_loss": d.get("actor_loss"),
+                      "encoder/z_std": d.get("z_std"), "encoder/eff_rank": d.get("eff_rank"),
+                      "encoder/feat_corr": d.get("feat_corr"),
+                      "learner/pool_transitions": buf.total,
+                      "learner/seen_session": seen_transitions,
+                      "learner/steps_per_sec": d["sps"]}, step=global_step)
         if args.max_steps and global_step >= args.max_steps:   # bounded test runs
             save_and_upload(ckpt_state(global_step), out_dir, global_step, repo,
                             args.name, not args.no_hf, args.keep_local_ckpts)
             log(out_dir, "max-steps reached — exiting", step=global_step)
+            if run is not None:
+                run.finish()
             return
 
 
@@ -280,6 +315,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-hf", action="store_true", help="never upload (local tests)")
     p.add_argument("--hf-repo", default=None)
+    p.add_argument("--no-wandb", action="store_true")
+    p.add_argument("--wandb-project", default=None)
     return p.parse_args()
 
 
