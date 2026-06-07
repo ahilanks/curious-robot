@@ -316,6 +316,7 @@ def main(args):
     hist_a = torch.zeros(acting.H, 1, acting.a_dim, device=device)
     is_start = True
     ep_len = 0
+    ep_ret = 0.0
     press_run = 0
     hot_polls = 0
     presses = 0
@@ -403,11 +404,14 @@ def main(args):
         recent_rcur.append(r_cur)
 
         ep_len += 1
+        ep_ret += reward
         done = float(ep_len >= args.episode_steps)
         chunk.add(cur_px[0], cur_prop[0], a_env.reshape(-1), reward, done, is_start)
         is_start = done > 0
         if done:
+            wlog({"episode/return": ep_ret, "episode/len": ep_len})
             ep_len = 0
+            ep_ret = 0.0
         decisions += 1
         z = z_next
         hist_z = torch.cat([hist_z[1:], z_next.unsqueeze(0)], 0)
@@ -504,7 +508,12 @@ def main(args):
                 champion=champion.step_id, probation=bool(probation), rejects=rejects,
                 queue=uploader.q.qsize(), uploaded=uploader.uploaded,
                 dropped=uploader.dropped, sps=sps)
-            beat = {"collector/decisions": decisions, "collector/sps": sps,
+            # key names mirror train.py's schema (safe15 et al.) so daemon runs land on
+            # the same W&B panels; cur_contrib/safe_cur_ratio use train.py's definitions.
+            safe_m = float(np.mean(rsafe_window[-200:])) if rsafe_window else 0.0
+            cur_m = (float(args.lambda_cur * np.mean(np.log1p(np.asarray(recent_rcur))))
+                     if recent_rcur else 0.0)
+            beat = {"buffer/transitions": decisions, "perf/steps_per_sec": sps,
                     "collector/chunks_uploaded": uploader.uploaded,
                     "collector/upload_queue": uploader.q.qsize(),
                     "collector/chunks_dropped": uploader.dropped,
@@ -512,7 +521,9 @@ def main(args):
                     "probation/rejects": rejects, "watchdog/presses": presses,
                     "reward/total": float(np.mean(recent_r)) if recent_r else 0.0,
                     "reward/r_cur": float(np.mean(recent_rcur)) if recent_rcur else 0.0,
-                    "reward/r_safe": float(np.mean(rsafe_window[-200:])) if rsafe_window else 0.0,
+                    "reward/r_safe": safe_m,
+                    "reward/cur_contrib": cur_m,
+                    "reward/safe_cur_ratio": abs(safe_m) / max(abs(cur_m), 1e-6),
                     "action/sat": float(np.mean(sat_window[-200:])) if sat_window else 0.0}
             if last_temps is not None:
                 beat["temps/max"] = float(max(last_temps))
