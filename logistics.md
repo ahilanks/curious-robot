@@ -60,6 +60,18 @@ arm-contact set empty → all interaction metrics were silently 0; now verified 
       probation `rejects` ≈ 0.
 - [ ] **Explore-toward-objects is still THE open learning problem** (unchanged from sim — curiosity
       gradient doesn't point at blocks; now it gets real-world data to disprove itself on).
+- [ ] **Deferred review findings (2026-06-06 ultra review; zero runtime impact today, fix when next
+      touching the code).** Efficiency: bus `read()` is 4 txn/servo (block-read regs 56–61 + reg 69
+      would halve it and recover ~2.5→4+ sps; same idea for `write_goal` via GroupSyncWrite);
+      learner rebuilds the whole pool per new chunk (~10 s/cycle — use `ReplayBuffer.add` append);
+      ChunkWriter np.stack churn (~450 MB/dump — preallocate). Dedup/altitude: the collector's
+      acting loop is hand-copied from train.py (factor it like `sac_update` was — **reward-formula
+      drift trap**: editing train.py's reward silently diverges from what chunks bake in); campaign
+      constants duplicated as argparse defaults in 3 entry points; `press_tau` (N·m) is silently
+      coupled to `kt` (move next to kt in the calib json); warm-start/model-init duplicated
+      (learner vs offline_train); `log()` ×2, hub ckpt-listing ×3, chunk-count parse ×3, npz schema
+      keys ×3 — each wants one shared helper/constant; `cur_lowpass`≠`vel_lowpass` is a documented
+      sign-flip footgun (default-safe); sat/rsafe windows unbounded (deque(maxlen)); `pool_n` dead.
 - [x] Pin the swept `?` values into `README.md` — **done 2026-05-31 (maintainer-approved):**
       δ=15, λ_safe=0.1, τ_max=3.35, h_fwd_max=1, r_cur→per-dim-mean. (λ_cur still `?` — at 20, unswept.)
 
