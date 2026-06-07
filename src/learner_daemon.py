@@ -218,7 +218,7 @@ def main(args):
             buf = load_buffer([str(f) for f in paths], H, args.h_fwd_max, device)
             log(out_dir, "pool rebuilt", chunks=len(paths), transitions=buf.total,
                 seen_session=seen_transitions, new_chunks=new)
-            wlog({"learner/pool_transitions": buf.total,
+            wlog({"buffer/transitions": buf.total,
                   "learner/seen_session": seen_transitions,
                   "learner/pool_chunks": len(paths)}, step=global_step)
 
@@ -260,13 +260,17 @@ def main(args):
                 d["sps"] = round(global_step / max(time.time() - t0, 1e-9), 1)
                 log(out_dir, "ckpt", **{k: (round(v, 4) if isinstance(v, float) else v)
                                         for k, v in d.items()})
+                # key names mirror train.py's schema (safe15 et al.) -> shared W&B panels
                 wlog({"wm/pred_loss": d.get("pred_loss"), "wm/sigreg": d.get("sigreg"),
+                      "wm/identity_baseline": last_wm[2] if last_wm is not None else None,
+                      "wm/h_fwd": h_fwd,
                       "sac/critic_loss": d.get("critic_loss"), "sac/actor_loss": d.get("actor_loss"),
+                      "sac/alpha": float(log_alpha.exp().item()),
                       "encoder/z_std": d.get("z_std"), "encoder/eff_rank": d.get("eff_rank"),
                       "encoder/feat_corr": d.get("feat_corr"),
-                      "learner/pool_transitions": buf.total,
-                      "learner/seen_session": seen_transitions,
-                      "learner/steps_per_sec": d["sps"]}, step=global_step)
+                      "buffer/transitions": buf.total,
+                      "perf/steps_per_sec": d["sps"],
+                      "learner/seen_session": seen_transitions}, step=global_step)
         if args.max_steps and global_step >= args.max_steps:   # bounded test runs
             save_and_upload(ckpt_state(global_step), out_dir, global_step, repo,
                             args.name, not args.no_hf, args.keep_local_ckpts)
