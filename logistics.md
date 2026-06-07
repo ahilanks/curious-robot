@@ -46,9 +46,20 @@ arm-contact set empty → all interaction metrics were silently 0; now verified 
       δ (0.05). Watch `reward/safe_cur_ratio`, `interact/contacts_per_step`, pred/persist.
       (β is pinned at 0.3, no longer swept.)
 - [ ] **TD-priority ablation** — `--per-priority td` vs `curiosity` (see Ablations).
-- [ ] **Hardware: adapt WM/policy on real data** — safe15 is OOD-jerky on the real arm (see 2026-06-01/02
-      log); offline adaptation on collected `buffer_*.npz` (frozen-collect → train → sync weights) is the
-      smoothness fix, not config/gain tuning. Calibration + bus are done (`so101_calib.json`, `FeetechBus`).
+- [x] **Hardware: adapt WM/policy on real data** — ~~smoothness fix~~ **premise overturned 2026-06-06:
+      the "jerk" was ~entirely a measurement artifact** (recompute-τ billed servo arrivals as max-torque
+      fights; measured-τ r_safe = 0.0 on the same motion — see the 06-06 log). Adaptation infrastructure
+      is BUILT anyway (offline_train + the 24/7 daemons) and now targets the real gap: obs-OOD
+      (value-gap 80 vs 136) + interaction, with r_safe as a truthful guardrail.
+- [ ] **START the 24/7 loop** — arm: clamp base, route cables out of sweep, objects in workspace,
+      screw pass; Mac: `caffeinate -i` + tmux + port check; pod: 1×A100, branch
+      `safety/deadband-and-lambda-safe`, `.env`, `bash setup.sh`, tmux, network volume (or
+      `--keep-hub-chunks`). First cycle attended. Commands: §Hardware campaign reference below.
+- [ ] **Watch across rounds/days** — value-gap `V/(r̄/(1−γ))` → 1 (was 80/136 = 0.59 on real data),
+      `reward/r_cur` + interaction stats up, q̇-reversal% → sim's ~34%, r_safe stays ≈ 0,
+      probation `rejects` ≈ 0.
+- [ ] **Explore-toward-objects is still THE open learning problem** (unchanged from sim — curiosity
+      gradient doesn't point at blocks; now it gets real-world data to disprove itself on).
 - [x] Pin the swept `?` values into `README.md` — **done 2026-05-31 (maintainer-approved):**
       δ=15, λ_safe=0.1, τ_max=3.35, h_fwd_max=1, r_cur→per-dim-mean. (λ_cur still `?` — at 20, unswept.)
 
@@ -211,3 +222,135 @@ _(add a dated entry per run)_
     transitions. Gentler-collection levers if needed: soft gains (now default), lower action_max,
     low-pass the action stream. This is the **same class of problem** as the sim explore-toward-objects
     gap — the policy is OOD on real inputs. All on branch `safety/deadband-and-lambda-safe`.
+    *(2026-06-06 postscript: the −100/−190 numbers and the "OOD-jerky" framing were ~entirely a
+    measurement artifact — see that entry. The bring-up itself stands.)*
+- 2026-06-03 — **offline fine-tuning pipeline + the jerk gap decomposed** (`cdda294`).
+  - **`src/offline_train.py`** (+ `sac_update` factored out of train.py, behavior-preserving): the
+    round loop collect (Mac, frozen) → HF npz → fine-tune (RunPod, env-free WM+SAC on reloaded
+    buffers) → redeploy. `load_buffer` = exact inverse of `save_buffer` (each `env_lengths` entry =
+    own env row; real+sim mix in one buffer). Verified: bit-equal round-trip; WM+SAC fire on real
+    fixtures; ckpt keeps train.py's exact 8 keys so redeploy loads; warm-start carries
+    history_size/h_fwd from the ckpt. Gotchas pinned: SAC silently skips when stream pairs <
+    batch-size (collect ≥ a few hundred/round); offline prios cold-start uniform → use
+    `--per-priority td`; redeploy passes lineage `--action-block 5 --history-size 3` (train.py
+    rebuilds from CLI, not ckpt args).
+  - **Jerk-gap decomposition** (frozen-safe15 MuJoCo buffers vs real buffers, same stats): sim
+    reproduces −35 @ action_max 0.3 and −63 @ 0.05 (the policy is **action-scale-OOD even in sim**;
+    the W&B −51.5→−32 plateau is config-specific). At matched 0.3: real r_safe −190 vs sim −35
+    (×5.4) **yet the real arm is LESS dynamic at every 150 ms-resolvable scale** (|q̇| 0.83 vs 1.50,
+    τ-saturation 90% vs 87%) → the excess penalty lives in the 30 ms window: (a) sim α-ramps targets
+    over 6×5 ms substeps, hardware sent one step-goal/30 ms → race-and-stop sawtooth; (b) **metric
+    semantics flip**: sim scores `actuator_force` (the torque CAUSING q̈ — its own braking scores
+    compliant); hardware *recomputed* τ=kp(goal−q)−kv·q̇ with kp=998, which saturates at **0.19°**
+    of tracking error → a P=16 servo pegs |τ|=τ_max whenever moving and every arrival/stall scores
+    a max-weight "fight"; (c) quantized Present_Speed inflates q̈ during fast motion.
+- 2026-06-05 — **P0 plant+metric fix shipped + campaign prep** (`4878e8e`, `8ad0bff`).
+  - **Goal_Speed pacing**: `write_goal` writes per-servo speed = |Δticks|/0.030 s (clamp [1, cap];
+    0 = MAX on Feetech) → firmware executes each move as a constant-velocity ramp spanning the
+    window — sim's target ramp by construction. `SOARM_NO_PACE=1` = legacy A/B.
+  - **Obs/reward torque SPLIT**: r_safe scores **measured** τ (Present_Current-based, EMA matched
+    to vel_lowpass, clipped ±τ_max); **proprio/`applied_torque` KEEP the kp-law recompute** (the
+    obs distribution the sim-trained encoder expects — sim saturates 87%, recompute 90%). Both
+    r_safe variants logged per control step (`SOARM_DEBUG=N`) for attribution.
+  - **Campaign prep**: action_max probe (sim r_safe −52.3@0.1 / −39.1@0.15 / −29.7@0.2; reversals
+    flat ~34–39% at all scales) → **0.1 pinned**: the largest scale where the FULL action range
+    paces in-window (2173 ≤ cap 2400 ticks/s); 0.15+ exceeds the servo ceiling on its biggest
+    moves = permanent plant-sim mismatch, vs 0.1's one-time warm-start OOD cost that rounds absorb.
+    λ 0.1/20 + δ 15 verified from the safe15 ckpt args. `sim_mix_v1` collected at campaign config →
+    HF `buffers/sim_mix_v1/{buffer,buffer_small}.npz` (3000/600 tr; the ONLY mix-safe sim buffers —
+    the older `_sim_safe15_*` stats buffers are λ_cur=1, never mix). HF buffer transport round-trip
+    sha256-verified.
+- 2026-06-06 — **bench session: THE JERK MYSTERY IS CLOSED; campaign frozen** (`8cf390e`→`4145f7a`).
+  - **This firmware's Present_Current is MAGNITUDE-ONLY** (pan test: identical +9 mA both drive
+    directions, 0/138 negative). **Sign lives in Present_Load reg 60 bit 10** (PWM direction;
+    flips 100%/0.8% with direction vs the known-good speed sign) → τ_meas = kt·|I|·sign(load₁₀)·signs,
+    verified flipping (+0.010/−0.013) through the production read path.
+  - **kt = 10.0 N·m/A** — moving-raise estimate vs exact MuJoCo `qfrc_bias` at recorded poses
+    (9.9 raise / 12.4 hold). **Gravity-HOLD calibration is stiction-poisoned** (the elbow holds
+    0.22 N·m on 2 mA) — never calibrate torque from hold current. τ_meas clip at 3.35 ≈ the
+    servo's physical ~3 N·m ceiling (~0.33 A) — self-consistent.
+  - **THE 2×2 VERDICT** (frozen safe15 @ 0.1, P=16, paced AND unpaced): **measured r_safe = 0.0 at
+    every control step while the recompute scored the same motions −47/−57 mean (spikes −144)**.
+    Peak real effort 0.44 N·m. ⇒ the old −50…−190 was ~entirely the recompute artifact; the arm was
+    never fighting its motors at this config. **Pacing is inert at P=16 + action_max 0.1** (weak P
+    self-smooths both 6-tick and 65-tick deltas; lag p95 41 mrad benign) — kept as wear insurance.
+  - **δ=15 fully verified** — rest + slow sweeps = exactly 0 (exact-EMA replay of bench recordings);
+    the stall case fired ORGANICALLY in a 200-decision run (arm pinned itself at joint stops:
+    τ_meas pegged 3.35 @ |q̇| 0.09 → measured r_safe −0.003 fired **while the recompute scored that
+    exact event −0.0** — the old metric misses real fights AND invents fake ones; anti-correlated).
+  - **Reframed success criteria**: r_safe is a truthful guardrail sitting at ≈0 (fires only on real
+    stalls/collisions); adaptation success = `reward/r_cur` + interaction stats growing, q̇-reversal%
+    → sim's ~34%, and the **value-gap metric** `V_measured/(r̄/(1−γ))` → 1 (safe15's critic reads
+    ~80 on real states whose rewards justify ~136 — the critic's to-close gap; re-graph per round).
+  - **Behavioral baseline** (100-decision frozen runs): real reversals **15.8%** vs sim 34.9% — the
+    P=16+paced plant low-passes the policy's dither; and **|q̇| 0.136 vs sim 1.11 rad/s** — the arm
+    moves ~8× slower than sim for the same policy. *The real plant gap is attenuation, not jerk.*
+- 2026-06-06 (later) — **24/7 autonomous loop built, integration-tested, drilled on the arm**
+  (`0e96e53`→`2cbf0e0`). `src/collect_daemon.py` (Mac) + `src/learner_daemon.py` (always-on 1×A100
+  pod) over the HF Hub as mailbox — **no direct connection between machines** (both only make
+  outbound HTTPS; chunks Mac→`buffers/auto1/`, ckpts pod→`auto1/`; either side can die/restart
+  independently, the hub holds all durable state).
+  - **Safety for unattended** (the human's jobs, replaced): **acceptance probation** — every new
+    ckpt drives ~30 watched decisions before adoption; press / mean|a|>0.9 / r_safe<−5 / NaN ⇒
+    reject + revert to the local `champion.pt` ratchet; rejections persist (a high-numbered bad
+    ckpt can't block the lineage or get re-tried). **Temp gate** (reg 63, 2-poll debounce — the
+    sensor is FET-adjacent and spikes ~15 °C transiently, 46→33 in 32 s): >50 °C ⇒ park in the
+    gravity-stable fold (verified 0.0 mrad drift), torque off, resume <42 °C. **Press watchdog**
+    (PER-JOINT pegged-τ + ~0 q̇, 5 consecutive decisions, threshold 2.5 N·m): retreat to joint
+    midpoints — static presses score r_safe=0 *by spec*, the reward never fixes them. Disk-bounded
+    uploads; replay-ratio governor on the learner (A100 outruns the 2.6 tps arm ~100:1 — keep
+    `--replay-ratio` LOW early or it overfits the pool).
+  - **Integration-tested on the real hub** (mock arm): chunks→pool→ckpt→probation→**PROMOTE**
+    (champion 80, sat 0.66); poisoned ckpt (saturated actor) → **REJECT** at sat 0.998, ratchet
+    held. Bugs the test caught: hf-cache `os.replace` dangles relative symlinks (copy via realpath);
+    warmstart must boot step −1; rejected-set must persist; boot order = newest non-rejected →
+    champion.pt → warmstart.
+  - **On-arm drill**: reg-63 confirmed real temperature (pan 33→46 °C under 60 s of drive); temp
+    gate tripped/parked/rested/resumed live ×2; gravity-assisted scripted press correctly does NOT
+    fire (~0.1 N·m — no fight; real pegs need external loading, per the organic event). Cleared for
+    production; cadence ~2.5 sps with the 4-reads/servo loop (block-read regs 56–61 is the shelf
+    optimization).
+
+## Hardware campaign reference (frozen 2026-06-06 — change nothing mid-campaign)
+
+**Pinned constants** — `--action-max 0.1`, `--lambda-safe 0.1 --lambda-cur 20 --safety-delta 15`
+(always pass λ_cur — the default 1.0 silently shrinks curiosity 20×), `--action-block 5
+--history-size 3` (train.py rebuilds from CLI), offline LRs wm 1e-5 / actor·critic 1e-4 (optimizers
+restart cold), `--per-priority td` offline. `so101_calib.json`: P16/D32, goal_speed 2400 (pacing
+cap), pace_dt 0.030, acceleration 0, **kt 10.0**. Judge progress **real-to-real** — never against
+sim's −35 (different τ source).
+
+**The 24/7 loop** (preferred):
+```bash
+# Mac (tmux; caffeinate stops macOS sleep killing the USB bus)
+export SOARM_PORT=/dev/cu.usbmodem5AA90245791 SOARM_CALIB=so101_calib.json
+caffeinate -i python src/collect_daemon.py --name auto1 --warmstart-name safe15 --warmstart-step 100000
+# RunPod 1×A100 (clone private repo via GH_TOKEN, git checkout safety/deadband-and-lambda-safe,
+# .env with HF_TOKEN/HF_UPLOAD_REPO_ID/WANDB_API_KEY/GH_TOKEN, bash setup.sh, then in tmux:)
+python src/learner_daemon.py --name auto1 --warmstart-name safe15 --warmstart-step 100000
+```
+Pre-start: clamp the base; route cables out of the sweep volume (entanglement is the one failure no
+watchdog catches); objects in the workspace (light/rigid — curiosity needs material); screw pass.
+Pod pool survives pod death via a network volume for `runs/auto1_learner/` or `--keep-hub-chunks`.
+First cycle attended: watch `runs/auto1/daemon.jsonl` for heartbeats (healthy: `rejects`=0,
+`dropped`=0), the first chunk upload, one `candidate on probation` → `PROBATION PASS`. Sync
+cadences: chunk ~6–7 min; ckpt ~5–10 min; ckpt→arm ≤5 min poll + ~12 s probation (~20 min
+end-to-end staleness — irrelevant for off-policy SAC). Failure modes: Mac dies → arm HOLDS (or is
+parked+limp mid-rest), restart resumes lineage; pod dies → Mac keeps collecting, new pod
+warm-resumes; HF unreachable → uploads queue (≤20 chunks) then drop-oldest, polls fail silently.
+
+**Manual round fallback** (the daemons supersede this, but it works):
+```bash
+python src/train.py --env-backend hardware --frozen-policy --resume-name <prev> \
+  --name hw_round_N --total-steps 600 --max-episode-steps 10000 --action-max 0.1 \
+  --lambda-cur 20 --lambda-safe 0.1 --safety-delta 15 --save-buffer --no-wandb --no-hf
+huggingface-cli upload a5ilank/curious-robot runs/hw_round_N/buffer_*.npz buffers/hw_round_N/buffer.npz
+python src/offline_train.py --resume-name <prev> --buffer buffers/hw_round_N/buffer.npz \
+  --name round_N --steps 4000 --save-every 1000 --per-priority td   # RunPod
+```
+
+**Never mix into fine-tunes**: `runs/dryrun_collect/` (mock-sim, positive rewards),
+`hw_validate`/`hw_dval`/`hw_safe15_match` (pre-P0 recompute-metric rewards), `_sim_safe15_*`/probe
+buffers (λ_cur=1). Mix-safe sim: `buffers/sim_mix_v1/buffer_small.npz` (1:1) from round 2+ only if
+the fine-tune destabilizes. Campaign-valid real buffers collected 06-06: `hw_p0_run100{,b,c}`,
+`hw_p0_run200{,b,c}`, `hw_p0_{paced,nopace}` (~720 tr).
