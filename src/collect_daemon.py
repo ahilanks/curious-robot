@@ -283,11 +283,15 @@ def main(args):
     # reset on restart and W&B rejects non-monotonic steps — `decisions` is a field.
     run = None
     if not args.no_wandb and wandb is not None and os.environ.get("WANDB_API_KEY"):
-        run = wandb.init(project=args.wandb_project or os.environ.get("WANDB_PROJECT", "curious-robot"),
-                         entity=os.environ.get("WANDB_ENTITY"),
-                         name=f"{args.name}-collector", id=f"{args.name}-collector",
-                         resume="allow", group=args.name, dir=str(out_dir), config=vars(args))
-        print(f"[wandb] {run.url}", flush=True)
+        try:                                                # transient W&B outage at boot must not kill the daemon
+            run = wandb.init(project=args.wandb_project or os.environ.get("WANDB_PROJECT", "curious-robot"),
+                             entity=os.environ.get("WANDB_ENTITY"),
+                             name=f"{args.name}-collector", id=f"{args.name}-collector",
+                             resume="allow", group=args.name, dir=str(out_dir), config=vars(args))
+            print(f"[wandb] {run.url}", flush=True)
+        except Exception as e:
+            run = None
+            log(out_dir, "wandb init failed (non-fatal, dashboard off)", err=str(e))
 
     def wlog(d):
         if run is not None:
