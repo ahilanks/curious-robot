@@ -346,8 +346,13 @@ watchdog catches); objects in the workspace (light/rigid — curiosity needs mat
 Pod pool survives pod death via a network volume for `runs/auto1_learner/` or `--keep-hub-chunks`.
 First cycle attended: watch `runs/auto1/daemon.jsonl` for heartbeats (healthy: `rejects`=0,
 `dropped`=0), the first chunk upload, one `candidate on probation` → `PROBATION PASS`. Sync
-cadences: chunk ~6–7 min; ckpt ~5–10 min; ckpt→arm ≤5 min poll + ~12 s probation (~20 min
-end-to-end staleness — irrelevant for off-policy SAC). Failure modes: Mac dies → arm HOLDS (or is
+cadences (near-live ckpt transport, 2026-06-10): chunk Mac→pod ~6–7 min; ckpt pod→hub every
+`--save-secs` (45 s) wall clock; hub→arm ≤20 s background poll + download + ~12 s probation —
+**~1–2 min weight staleness** (data direction still bounded by chunk cadence). The hub holds
+ONLY the latest ckpt (each upload is one atomic add+delete-older commit; every `--squash-every`
+=100 uploads the learner squashes repo history and purges stale LFS blobs — without that,
+deleted ckpts would keep their storage and grow ~80 GB/day). `champion.pt` on the Mac remains
+the rollback ratchet; `--keep-hub-ckpts` restores the old keep-everything behavior. Failure modes: Mac dies → arm HOLDS (or is
 parked+limp mid-rest), restart resumes lineage; pod dies → Mac keeps collecting, new pod
 warm-resumes; HF unreachable → uploads queue (≤20 chunks) then drop-oldest, polls fail silently.
 

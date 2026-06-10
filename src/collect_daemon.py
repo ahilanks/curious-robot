@@ -4,11 +4,13 @@ Runs the frozen acting loop on the physical SO-ARM101 indefinitely:
   - dumps transitions in CHUNKS (save_buffer npz format) and uploads them to the HF Hub
     on a background thread (disk-bounded: local files deleted on confirmed upload,
     oldest dropped if the upload backlog grows — never fill the disk)
-  - polls the Hub for new checkpoints from learner_daemon.py and HOT-SWAPS the policy
-    between decisions — but only after an on-arm ACCEPTANCE PROBATION: the candidate
-    drives ~30 watched decisions first; any watchdog trip (press, saturated actions,
-    real fights, NaNs) rejects it and reverts to the last-known-good CHAMPION
-    (runs/<name>/champion.pt — the ratchet that makes a bad upload recoverable)
+  - a background fetcher thread polls the Hub (~every --poll-every s) for new
+    checkpoints from learner_daemon.py and downloads them off the acting loop; the
+    main loop HOT-SWAPS to a ready candidate between decisions — but only after an
+    on-arm ACCEPTANCE PROBATION: the candidate drives ~30 watched decisions first; any
+    watchdog trip (press, saturated actions, real fights, NaNs) rejects it and reverts
+    to the last-known-good CHAMPION (runs/<name>/champion.pt — the ratchet that makes
+    a bad upload recoverable)
   - temp gate: polls servo temperatures (reg 63) every few decisions; above --temp-gate
     it parks the arm in a gravity-stable fold, drops torque, and waits until
     --temp-resume before continuing (hobby servos are the 24/7 physical ceiling)
@@ -43,6 +45,11 @@ try:
     import wandb
 except ImportError:
     wandb = None
+
+try:
+    import imageio
+except ImportError:
+    imageio = None
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -108,6 +115,70 @@ def hub_latest(repo, name, token):
     """(step, filename) of the newest <name>/ckpt_*.pt on the hub, or (None, None)."""
     ck = hub_ckpts(repo, name, token)
     return ck[-1] if ck else (None, None)
+
+
+class CkptFetcher(threading.Thread):
+    """Background hub poll + candidate download. At near-live cadence (learner uploads
+    every ~45 s, we poll every ~20 s) a synchronous 59 MB download would stall the
+    acting loop for many seconds every minute — so both the list call and the download
+    live here, and the main loop only ever adopts a READY LOCAL FILE between decisions.
+    Holds one candidate; a fresher hub ckpt replaces an unconsumed one (the arm should
+    always probation the newest). Main-loop feedback arrives via note()."""
+
+    def __init__(self, repo, name, token, out_dir, poll_every, champion_step, rejected):
+        super().__init__(daemon=True)
+        self.repo, self.name, self.token = repo, name, token
+        self.out_dir, self.poll_every = out_dir, poll_every
+        self.dl_dir = out_dir / "candidates"
+        self.dl_dir.mkdir(exist_ok=True)
+        for f in self.dl_dir.glob(f"{name}/ckpt_*.pt"):     # leftovers from a crash
+            f.unlink(missing_ok=True)
+        self.lock = threading.Lock()
+        self.champion_step = champion_step
+        self.rejected = set(rejected)
+        self.slot = None                                    # (step, Path) ready to adopt
+
+    def note(self, champion_step=None, rejected_step=None):
+        """Main-loop outcomes, so stale/rejected ckpts are never re-downloaded."""
+        with self.lock:
+            if champion_step is not None:
+                self.champion_step = champion_step
+            if rejected_step is not None:
+                self.rejected.add(rejected_step)
+
+    def take(self):
+        """Pop the ready candidate, or None (called between decisions, never blocks).
+        The handed-out step raises the poll floor immediately — otherwise the next poll
+        would re-download the very ckpt that is out on probation."""
+        with self.lock:
+            cand, self.slot = self.slot, None
+            if cand is not None:
+                self.champion_step = max(self.champion_step, cand[0])
+        return cand
+
+    def run(self):
+        from huggingface_hub import hf_hub_download
+        while True:
+            try:
+                with self.lock:
+                    champ, rej = self.champion_step, set(self.rejected)
+                    held = self.slot[0] if self.slot else None
+                floor = champ if held is None else max(champ, held)
+                step, fname = pick_candidate(hub_ckpts(self.repo, self.name, self.token),
+                                             floor, rej)
+                if step is not None:
+                    # local_dir (not the hf cache): one real file we can unlink after
+                    # probation — cache entries would accrete 59 MB per ckpt forever
+                    p = Path(hf_hub_download(repo_id=self.repo, filename=fname,
+                                             token=self.token, local_dir=self.dl_dir))
+                    with self.lock:
+                        stale, self.slot = self.slot, (step, p)
+                    if stale is not None:
+                        stale[1].unlink(missing_ok=True)
+                    log(self.out_dir, "candidate downloaded", step=step)
+            except Exception as ex:
+                log(self.out_dir, "ckpt fetch failed (non-fatal)", err=str(ex)[:120])
+            time.sleep(self.poll_every)
 
 
 # ------------------------------------------------------------------- chunk writer
@@ -274,6 +345,17 @@ def main(args):
                            safety_delta=args.safety_delta, seed=args.seed)
     uploader = Uploader(repo, args.name, out_dir, args.max_backlog, not args.no_hf)
     uploader.start()
+    fetcher = None
+    if not args.no_hf:
+        fetcher = CkptFetcher(repo, args.name, token, out_dir, args.poll_every,
+                              champion.step_id, rejected)
+        fetcher.start()
+
+    def discard_candidate(pol):
+        """Drop a consumed candidate download (champion.pt holds any promoted copy)."""
+        p = Path(pol.path)
+        if fetcher is not None and p.is_relative_to(fetcher.dl_dir):
+            p.unlink(missing_ok=True)
     # Re-queue chunks a previous run dumped but never uploaded — the upload queue is
     # in-memory, so they'd otherwise be orphaned on disk forever. Validate first: a
     # SIGKILL mid-savez leaves a torn npz, which must never reach the hub (the learner
@@ -321,12 +403,27 @@ def main(args):
     hot_polls = 0
     presses = 0
     decisions = chunks_done = 0
-    last_poll = last_beat = time.time()
+    last_beat = time.time()
     sat_window, rsafe_window = [], []
     recent_r = deque(maxlen=200)
     recent_rcur = deque(maxlen=200)
     last_temps = None
     t0 = time.time()
+
+    # --- train videos: mirror train.py's train/wrist + train/overhead panels (same
+    # cadence/keys as the pinned runs). Wrist is free (the obs the policy sees);
+    # overhead is a second USB camera (--overhead-cam / SOARM_OVERHEAD_CAM, e.g. the
+    # Mac's built-in cam pointed at the arm), grabbed only inside the buffer window.
+    video_on = imageio is not None and args.video_every > 0
+    wrist_buf = deque(maxlen=args.video_steps)
+    over_buf = deque(maxlen=args.video_steps)
+    over_cam = None
+    if video_on and args.overhead_cam >= 0:
+        try:
+            from env.hardware_env import UsbCamera
+            over_cam = UsbCamera(index=args.overhead_cam, hw=224)
+        except Exception as ex:
+            log(out_dir, "overhead cam unavailable (non-fatal)", err=str(ex)[:80])
 
     def park_and_rest(temps):
         """Temp gate: fold to a gravity-stable pose, drop torque, wait until cool.
@@ -386,6 +483,9 @@ def main(args):
             log(out_dir, "NON-FINITE ACTION — reverting to champion")
             if probation is not None:
                 rejected.add(acting.step_id); rejects += 1; probation = None
+                if fetcher is not None:
+                    fetcher.note(rejected_step=acting.step_id)
+                discard_candidate(acting)
                 save_state()
             acting = champion
             obs = reset_history("nan")
@@ -416,6 +516,34 @@ def main(args):
         z = z_next
         hist_z = torch.cat([hist_z[1:], z_next.unsqueeze(0)], 0)
 
+        # --- train videos: buffer frames in the window before each save, then save the
+        #     wrist + overhead clips every video_every (predicate mirrors train.py) ---
+        if video_on and 0 < decisions % args.video_every \
+                and decisions % args.video_every >= args.video_every - args.video_steps:
+            wrist_buf.append(cur_px[0])
+            if over_cam is not None:
+                try:
+                    over_buf.append(over_cam.read())
+                except Exception as ex:
+                    log(out_dir, "overhead grab failed — disabling (non-fatal)",
+                        err=str(ex)[:80])
+                    over_cam = None
+        if video_on and decisions > 0 and decisions % args.video_every == 0:
+            roll_dir = out_dir / "rollouts"
+            roll_dir.mkdir(exist_ok=True)
+            for tag, buf_ in (("wrist", wrist_buf), ("overhead", over_buf)):
+                if not buf_:
+                    continue
+                vp = roll_dir / f"train_{tag}_{decisions:07d}.mp4"
+                try:
+                    imageio.mimsave(vp, list(buf_), fps=args.video_fps)
+                    if run is not None:
+                        wlog({f"train/{tag}": wandb.Video(str(vp), format="mp4")})
+                        vp.unlink(missing_ok=True)   # in W&B now; keep local disk clean
+                    buf_.clear()
+                except Exception as ex:
+                    log(out_dir, f"video {tag} failed (non-fatal)", err=str(ex)[:80])
+
         # --- watchdog signals (tau_meas is hardware-only; mock provides it too) ----
         taus = np.stack([i["tau_meas"][0] for i in sub_infos])          # (block, 6)
         qvels = np.stack([i["qvel"][0] for i in sub_infos])
@@ -435,6 +563,9 @@ def main(args):
             if probation is not None:                       # candidate caused a press: reject
                 log(out_dir, "PROBATION REJECT: press", step=acting.step_id)
                 rejected.add(acting.step_id); rejects += 1
+                if fetcher is not None:
+                    fetcher.note(rejected_step=acting.step_id)
+                discard_candidate(acting)
                 acting = champion; probation = None
                 save_state()
             obs = reset_history("press")
@@ -449,6 +580,9 @@ def main(args):
                 if sat > args.probation_sat or rs < args.probation_rsafe:
                     log(out_dir, "PROBATION REJECT", step=acting.step_id, sat=sat, r_safe=rs)
                     rejected.add(acting.step_id); rejects += 1
+                    if fetcher is not None:
+                        fetcher.note(rejected_step=acting.step_id)
+                    discard_candidate(acting)
                     wlog({"probation/rejects": rejects, "probation/last_reject_step": acting.step_id,
                           "probation/sat": sat, "probation/r_safe": rs})
                     acting = champion
@@ -456,6 +590,9 @@ def main(args):
                 else:
                     champion = acting
                     shutil.copyfile(acting.path, champ_file)
+                    if fetcher is not None:
+                        fetcher.note(champion_step=champion.step_id)
+                    discard_candidate(champion)
                     log(out_dir, "PROBATION PASS — new champion", step=champion.step_id,
                         sat=sat, r_safe=rs)
                     wlog({"probation/champion_step": champion.step_id,
@@ -479,24 +616,20 @@ def main(args):
                 obs = reset_history("temp_rest")
                 continue
 
-        # --- checkpoint poll (skip while a candidate is on probation) -----------------
-        if (not args.no_hf and probation is None
-                and time.time() - last_poll > args.poll_every):
-            last_poll = time.time()
-            try:
-                step, fname = pick_candidate(hub_ckpts(repo, args.name, token),
-                                             champion.step_id, rejected)
-                if step is not None:
-                    from huggingface_hub import hf_hub_download
-                    p = hf_hub_download(repo_id=repo, filename=fname, token=token)
-                    acting = Policy(p, step, device)
+        # --- checkpoint adoption (fetcher polls + downloads in the background; the
+        #     re-check matters: the slot was filled against possibly-stale state) ------
+        if fetcher is not None and probation is None:
+            cand = fetcher.take()
+            if cand is not None:
+                step, cpath = cand
+                if step > champion.step_id and step not in rejected:
+                    acting = Policy(cpath, step, device)
                     probation = {"left": args.probation_steps}
                     log(out_dir, "candidate on probation", step=step,
                         probation_steps=args.probation_steps)
                     obs = reset_history("swap")
                     continue
-            except Exception as ex:
-                log(out_dir, "ckpt poll failed (non-fatal)", err=str(ex)[:120])
+                cpath.unlink(missing_ok=True)           # stale by the time it surfaced
 
         # --- chunk + heartbeat ----------------------------------------------------------
         if len(chunk) >= args.chunk_steps:
@@ -560,7 +693,9 @@ def parse_args():
     p.add_argument("--chunk-steps", type=int, default=1000)
     p.add_argument("--min-chunk", type=int, default=50, help="don't ship slivers on temp rests")
     p.add_argument("--max-backlog", type=int, default=20, help="unuploaded chunks kept on disk")
-    p.add_argument("--poll-every", type=float, default=300, help="ckpt poll period [s]")
+    p.add_argument("--poll-every", type=float, default=20,
+                   help="ckpt poll period [s] (background thread; near-live tracking "
+                        "of the learner's --save-secs uploads)")
     # acceptance gate
     p.add_argument("--probation-steps", type=int, default=30)
     p.add_argument("--probation-sat", type=float, default=0.90, help="mean |a| reject threshold")
@@ -581,6 +716,15 @@ def parse_args():
     p.add_argument("--hf-repo", default=None)
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--wandb-project", default=None)
+    # train videos (defaults mirror train.py's pinned-run settings)
+    p.add_argument("--video-every", type=int, default=1000,
+                   help="train-video period (decision steps): save a wrist + overhead clip every N; 0 disables")
+    p.add_argument("--video-steps", type=int, default=60,
+                   help="frames per train-video clip (window of decision steps before each save)")
+    p.add_argument("--video-fps", type=int, default=20)
+    p.add_argument("--overhead-cam", type=int,
+                   default=int(os.environ.get("SOARM_OVERHEAD_CAM", "1")),
+                   help="cv2 index of the overhead/Mac camera; -1 disables overhead clips")
     return p.parse_args()
 
 

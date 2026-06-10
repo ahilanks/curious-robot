@@ -4,8 +4,11 @@ Forever: poll the HF Hub for new collector chunks (buffers/<name>/chunk_*.npz) -
 download + archive locally (hub copies deleted by default to bound storage) -> keep a
 pool of the newest --pool-cap transitions -> run offline WM+SAC fine-tune steps on it
 (exact offline_train.py update path: wm_update before sac_update, fine-tune LRs) ->
-upload <name>/ckpt_<global_step>.pt every --save-every steps. collect_daemon.py polls
-those, probations them on the arm, and promotes or rejects.
+upload <name>/ckpt_<global_step>.pt every --save-secs seconds of wall clock (near-live;
+each upload is one atomic commit that also deletes the older hub ckpts — the hub holds
+only the latest, and every --squash-every uploads the repo history is squashed + stale
+LFS blobs purged so deletes actually free storage). collect_daemon.py polls those,
+probations them on the arm, and promotes or rejects.
 
 REPLAY-RATIO GOVERNOR: an A100 outruns a ~2.6 transitions/s collector by orders of
 magnitude; uncapped it would re-grind the same pool into an overfit policy between
@@ -40,7 +43,7 @@ from lewm.module import SIGReg                                    # noqa: E402
 from model.state_encoder import WorldModel                        # noqa: E402
 from src.offline_train import load_buffer                         # noqa: E402
 from src.train import (Actor, TwinQ, collapse_metrics, resolve_ckpt,   # noqa: E402
-                       sac_update, save_and_upload, wm_update)
+                       sac_update, wm_update)
 
 
 def log(out_dir, msg, **kv):
@@ -96,6 +99,54 @@ def prune_archive(pool_dir, archive_cap, out_dir):
             f.unlink(missing_ok=True)
     if total > archive_cap:
         log(out_dir, "archive pruned", kept_cap=archive_cap)
+
+
+def upload_latest(state, out_dir, step, repo, name, token, enable_hf, keep_local, prune):
+    """Save ckpt_<step>.pt and push it in ONE atomic commit that also deletes every
+    older <name>/ckpt_*.pt — the hub holds exactly the latest checkpoint, and the
+    collector can never observe an empty window (a commit is atomic on the hub).
+    On upload failure the local file is kept as a fallback (mirrors save_and_upload)."""
+    path = out_dir / f"ckpt_{step:07d}.pt"
+    torch.save(state, path)
+    uploaded = False
+    if enable_hf and repo and token:
+        try:
+            from huggingface_hub import CommitOperationAdd, CommitOperationDelete, HfApi
+            api = HfApi(token=token)
+            remote = f"{name}/ckpt_{step:07d}.pt"
+            ops = [CommitOperationAdd(path_in_repo=remote, path_or_fileobj=str(path))]
+            if prune:
+                ops += [CommitOperationDelete(path_in_repo=f)
+                        for f in api.list_repo_files(repo)
+                        if f.startswith(f"{name}/ckpt_") and f.endswith(".pt")
+                        and f != remote]
+            api.create_commit(repo_id=repo, operations=ops,
+                              commit_message=f"{name} ckpt {step}")
+            uploaded = True
+        except Exception as ex:
+            log(out_dir, "ckpt upload failed (non-fatal, keeping local)", err=str(ex)[:120])
+    if uploaded and not keep_local:
+        path.unlink(missing_ok=True)
+        return None
+    return path
+
+
+def reclaim_hub_storage(repo, name, token, out_dir):
+    """Deleting a file from the hub tip does NOT free its LFS blob — history keeps it,
+    and at a ~1/min ckpt cadence that grows ~80 GB/day of invisible storage. Squash the
+    repo history to a single commit, then permanently delete the now-unreferenced LFS
+    blobs under this run's prefixes (ckpts + already-consumed collector chunks). Other
+    runs' files (safe15 et al.) survive the squash — only their history goes."""
+    from huggingface_hub import HfApi
+    api = HfApi(token=token)
+    api.super_squash_history(repo_id=repo)
+    tip = set(api.list_repo_files(repo))
+    prefixes = (f"{name}/ckpt_", f"buffers/{name}/chunk_")
+    stale = [f for f in api.list_lfs_files(repo)
+             if f.filename.startswith(prefixes) and f.filename not in tip]
+    if stale:
+        api.permanently_delete_lfs_files(repo_id=repo, lfs_files=stale)
+    log(out_dir, "hub storage reclaimed", purged_blobs=len(stale))
 
 
 def pool_paths(pool_dir, cap):
@@ -193,10 +244,53 @@ def main(args):
                 "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
                 "log_alpha": log_alpha.detach().cpu(), "h_fwd": h_fwd, "args": saved_args}
 
+    def save_now():
+        """Upload the current weights (hub keeps only this latest ckpt), log the train
+        metrics that used to ride the step-based save, and periodically reclaim hub
+        storage (squash + LFS purge — tip deletes alone don't free anything)."""
+        nonlocal last_save_t, last_saved_step, uploads
+        last_save_t = time.time()
+        last_saved_step = global_step
+        upload_latest(ckpt_state(global_step), out_dir, global_step, repo, args.name,
+                      token, not args.no_hf, args.keep_local_ckpts,
+                      prune=not args.keep_hub_ckpts)
+        uploads += 1
+        if (not args.no_hf and not args.keep_hub_ckpts and args.squash_every
+                and uploads % args.squash_every == 0):
+            try:
+                reclaim_hub_storage(repo, args.name, token, out_dir)
+            except Exception as ex:
+                log(out_dir, "hub reclaim failed (non-fatal)", err=str(ex)[:120])
+        d = {"step": global_step, "pool": buf.total, "seen": seen_transitions}
+        if last_wm is not None:
+            d.update(pred_loss=last_wm[0], sigreg=last_wm[1])
+        if last_sac is not None:
+            d.update(critic_loss=last_sac[0], actor_loss=last_sac[1])
+        if last_zb is not None:
+            zs, er, fc = collapse_metrics(last_zb)
+            d.update(z_std=zs, eff_rank=er, feat_corr=fc)
+        d["sps"] = round(global_step / max(time.time() - t0, 1e-9), 1)
+        log(out_dir, "ckpt", **{k: (round(v, 4) if isinstance(v, float) else v)
+                                for k, v in d.items()})
+        # key names mirror train.py's schema (safe15 et al.) -> shared W&B panels
+        wlog({"wm/pred_loss": d.get("pred_loss"), "wm/sigreg": d.get("sigreg"),
+              "wm/identity_baseline": last_wm[2] if last_wm is not None else None,
+              "wm/h_fwd": h_fwd,
+              "sac/critic_loss": d.get("critic_loss"), "sac/actor_loss": d.get("actor_loss"),
+              "sac/alpha": float(log_alpha.exp().item()),
+              "encoder/z_std": d.get("z_std"), "encoder/eff_rank": d.get("eff_rank"),
+              "encoder/feat_corr": d.get("feat_corr"),
+              "buffer/transitions": buf.total,
+              "perf/steps_per_sec": d["sps"],
+              "learner/seen_session": seen_transitions}, step=global_step)
+
     # =============================================================== forever loop
     buf, pool_n, seen_transitions = None, 0, 0      # governor counters are session-local:
     steps_done_for_budget = 0                       # restart -> budget refills with next chunk
     last_wm = last_sac = last_zb = None
+    last_save_t = time.time()
+    last_saved_step = global_step
+    uploads = 0
     t0 = time.time()
     while True:
         # --- sync + (re)build the pool when new data lands -------------------------
@@ -225,6 +319,10 @@ def main(args):
         # --- replay-ratio governor ---------------------------------------------------
         budget = args.replay_ratio * seen_transitions - steps_done_for_budget
         if budget <= 0:
+            # ship unsaved progress before idling — budget can stay spent for minutes
+            # (until the next chunk lands) and the arm should act on the freshest weights
+            if global_step > last_saved_step and time.time() - last_save_t >= args.save_secs:
+                save_now()
             log(out_dir, "governor: budget spent — idling", seen=seen_transitions,
                 steps=steps_done_for_budget)
             time.sleep(args.idle_sleep)
@@ -246,34 +344,10 @@ def main(args):
                 last_sac = (res["critic_loss"], res["actor_loss"]); last_zb = res["zb"]
             global_step += 1
             steps_done_for_budget += 1
-            if global_step % args.save_every == 0:
-                save_and_upload(ckpt_state(global_step), out_dir, global_step, repo,
-                                args.name, not args.no_hf, args.keep_local_ckpts)
-                d = {"step": global_step, "pool": buf.total, "seen": seen_transitions}
-                if last_wm is not None:
-                    d.update(pred_loss=last_wm[0], sigreg=last_wm[1])
-                if last_sac is not None:
-                    d.update(critic_loss=last_sac[0], actor_loss=last_sac[1])
-                if last_zb is not None:
-                    zs, er, fc = collapse_metrics(last_zb)
-                    d.update(z_std=zs, eff_rank=er, feat_corr=fc)
-                d["sps"] = round(global_step / max(time.time() - t0, 1e-9), 1)
-                log(out_dir, "ckpt", **{k: (round(v, 4) if isinstance(v, float) else v)
-                                        for k, v in d.items()})
-                # key names mirror train.py's schema (safe15 et al.) -> shared W&B panels
-                wlog({"wm/pred_loss": d.get("pred_loss"), "wm/sigreg": d.get("sigreg"),
-                      "wm/identity_baseline": last_wm[2] if last_wm is not None else None,
-                      "wm/h_fwd": h_fwd,
-                      "sac/critic_loss": d.get("critic_loss"), "sac/actor_loss": d.get("actor_loss"),
-                      "sac/alpha": float(log_alpha.exp().item()),
-                      "encoder/z_std": d.get("z_std"), "encoder/eff_rank": d.get("eff_rank"),
-                      "encoder/feat_corr": d.get("feat_corr"),
-                      "buffer/transitions": buf.total,
-                      "perf/steps_per_sec": d["sps"],
-                      "learner/seen_session": seen_transitions}, step=global_step)
+            if time.time() - last_save_t >= args.save_secs:
+                save_now()
         if args.max_steps and global_step >= args.max_steps:   # bounded test runs
-            save_and_upload(ckpt_state(global_step), out_dir, global_step, repo,
-                            args.name, not args.no_hf, args.keep_local_ckpts)
+            save_now()
             log(out_dir, "max-steps reached — exiting", step=global_step)
             if run is not None:
                 run.finish()
@@ -314,7 +388,15 @@ def parse_args():
     p.add_argument("--per-priority", choices=["curiosity", "td"], default="td",
                    help="td: priorities self-adapt (chunks carry none)")
     p.add_argument("--h-fwd-max", type=int, default=1, help="pool slack sizing")
-    p.add_argument("--save-every", type=int, default=2000)
+    p.add_argument("--save-secs", type=float, default=45.0,
+                   help="seconds between ckpt uploads (wall-clock, not steps — the arm "
+                        "can only absorb ~1 ckpt/min: download + 30-decision probation)")
+    p.add_argument("--keep-hub-ckpts", action="store_true",
+                   help="don't delete older hub ckpts on upload (default: hub keeps "
+                        "only the latest; the collector's champion.pt is the ratchet)")
+    p.add_argument("--squash-every", type=int, default=100,
+                   help="uploads between hub history squashes + LFS purges (deleted "
+                        "files otherwise keep their storage forever); 0 disables")
     p.add_argument("--keep-local-ckpts", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-hf", action="store_true", help="never upload (local tests)")

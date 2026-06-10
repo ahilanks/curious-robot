@@ -521,7 +521,13 @@ class UsbCamera:
             raise RuntimeError(f"UsbCamera: could not open video index {index}")
 
     def read(self) -> np.ndarray:
-        ok, frame = self.cap.read()
+        # USB cams drop the odd frame; retry briefly before treating it as fatal
+        # (a single miss killed a 24/7 collector run on 2026-06-06).
+        for _ in range(3):
+            ok, frame = self.cap.read()
+            if ok:
+                break
+            time.sleep(0.1)
         if not ok:
             raise RuntimeError("UsbCamera: frame grab failed")
         frame = self._cv2.resize(frame, (self.hw, self.hw))
