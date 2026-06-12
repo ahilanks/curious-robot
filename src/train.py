@@ -320,8 +320,15 @@ def sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
         if args.per_priority == "td":   # ablation: replace curiosity priority with |TD error|
             td = (0.5 * (q1 + q2) - y).sum(-1).abs().detach().cpu().numpy()
             buf.update_priorities(b["e"], b["i"], td)
-        q1p, q2p = critic(zb, actor(zb))
+        ap = actor(zb)
+        q1p, q2p = critic(zb, ap)
         actor_loss = (-torch.min(q1p.sum(-1), q2p.sum(-1))).mean()   # sum heads, then twin-min (== old path at K=1)
+        if getattr(args, "actor_rate_reg", 0) > 0:
+            # action-rate as an actor-loss regularizer instead of a reward term: penalize
+            # the policy's own within-block sub-action jerk directly — smoothness pressure
+            # that never enters r or propagates through Q (the curiosity balance untouched).
+            sub = ap.view(ap.shape[0], args.action_block, -1)
+            actor_loss = actor_loss + args.actor_rate_reg * sub.diff(dim=1).pow(2).mean()
         actor_opt.zero_grad(); actor_loss.backward(); actor_opt.step()
         with torch.no_grad():
             for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
@@ -676,9 +683,14 @@ def main(args):
         cur_px, cur_prop = obs["image"], obs["proprio"]          # o_t (before acting)
 
         # --- act (deterministic policy; exploration = curiosity reward, not action noise.
-        #     start_steps no longer randomizes acting — it only delays gradient updates) ---
+        #     start_steps no longer randomizes acting — it only delays gradient updates,
+        #     unless --warmup-random opts the uniform-action warmup back in: data-side
+        #     diversity for from-scratch sim runs, still no policy stochasticity) ---
         with torch.no_grad():
-            a = actor(z)
+            if args.warmup_random and step < args.start_steps:
+                a = torch.rand(args.n_envs, a_dim, device=device) * 2 - 1
+            else:
+                a = actor(z)
         hist_a = torch.cat([hist_a[1:], a.unsqueeze(0)], 0)
         a_env = a.detach().cpu().numpy().reshape(args.n_envs, args.action_block, n_dof)
 
@@ -1015,6 +1027,15 @@ def parse_args():
                    help="critic outputs one Q head per reward component (cur/safe/rate/energy), each trained "
                         "on its own TD target; the actor maximizes the sum (same optimum as the scalar critic). "
                         "Logs sac/q_<comp> for interpretability.")
+    p.add_argument("--actor-rate-reg", type=float, default=0.0,
+                   help="action-rate as an ACTOR-LOSS regularizer (vs --w-action-rate's reward term): "
+                        "+W * mean (pi(z) sub-action diffs)^2 added to actor_loss. Keeps smoothness "
+                        "pressure out of r and Q — the A/B for whether the reward-term variant "
+                        "pollutes the curiosity balance.")
+    p.add_argument("--warmup-random", action="store_true",
+                   help="act with uniform random actions during start_steps (restores the pre-2026-06-12 "
+                        "warmup as an opt-in): buffer diversity for from-scratch sim runs; acting is "
+                        "deterministic after warmup either way.")
     # actor-critic (README; deterministic — entropy/alpha removed 2026-06-12)
     p.add_argument("--gamma", type=float, default=0.9)
     p.add_argument("--tau", type=float, default=0.005, help="Polyak rate (SAC-style target critic)")
