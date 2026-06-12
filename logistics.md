@@ -559,3 +559,93 @@ jerk_safe15_500_det.npz) vs 4.3 at P8 — delta=9 was marginal at P16. With gain
 P8/D16 the 06-12 calibration (benign<=7.4, bad>=10.7, delta=9, lambda_safe=2.2) is VALID
 as-is; P8 calib sessions live in runs/deadband_calib/p8d16/, calib_deadband POLICY_CEIL
 back to 4.3. No relabel session needed.
+## 2026-06-12 — SIM SMOOTHNESS/TRANSFER CAMPAIGN: 10 runs, 6k steps each (branch `sim/transfer-experiments`)
+
+Goal: validate, fully in sim on the new kp=499.11/P8 plant + deterministic actor, the
+transferability ideas (action-rate reward, energy reward, torque-free obs, multi-head Q,
+deadband verification) and pick the simplest config with smooth, hardware-shaped motion.
+All runs: 8 envs, action_max 0.1 (hw campaign scale), λ_cur 15, sim-calibrated safety
+(δ=15, λ_safe=0.1 — see below), start_steps 1000, ~75 min/run at 3-way A100 sharing
+(4-way OOMs: ~20 GiB/learner). New flags in train.py: `--w-action-rate`,
+`--w-action-rate2`, `--w-energy`, `--no-torque-obs`, `--multihead-q`, `--actor-rate-reg`,
+`--warmup-random`, `--explore-noise`. New tools: `src/measure_sim_scales.py`,
+`src/compare_runs.py`. New metrics in every run: `smooth/{action_rate,action_rate2,
+energy,qd_mean,tau_sat_frac,qd_reversal_frac}`, `sac/q_{cur,safe,rate,energy}`.
+
+**Deadband / weights — sim≠real is now MEASURED** (`runs/sim_scales/kp499.json`): sim τ is
+the saturated PD actuator force (rails at 3.35; sat 9–100% by regime), so hinge args run
+20–50× the real kt-torque args. The real-arm pair (δ=9, λ_safe=2.2) fires on 33% of
+joint-samples during SMOOTH sim motion → contrib −71 vs cur +10 → freeze-grade; sim keeps
+(δ=15, λ_safe=0.1), which reproduces safe15's measured −30 / ~0.3:1 balance. In sim, δ is
+second-order (penalty mass sits at args ≫15; λ_safe is the lever); on the real arm δ is
+THE lever (benign ≤7.4 vs bad ≥10.7). Deadband verified firing correctly in both regimes —
+they're just different regimes. Hardware keeps (9, 2.2).
+
+**Headline negative result — the 2026-06-12 deterministic actor, from scratch in sim, has
+two sticky attractors and r_safe is gameable:**
+- No warmup (sbase/srate/senergy/snotorq): post-warmup BANG-BANG (rate 2.1–2.4, τ-sat
+  0.9+) — curiosity *rewards* thrash (unpredictable). `sbase` then converged to a
+  periodic-windmill loophole: r_safe −1.3 (looks great) at 93% saturation, rate 2.13,
+  0 contacts — violent motion scored as "safe" because τ stays aligned with q̈.
+  `senergy` found the same class of loophole and ended with WORSE energy (4.08) than
+  srate (2.86) — the energy reward failed its own objective. DROP the energy term.
+- Warmup alone (`swbase`): the opposite attractor — frozen lull (rate 1.07, sat 0.56,
+  contacts 0, curiosity collapsed). Exploration needs a persistent mechanism, not a
+  1000-step kick.
+- Encoders stayed low-rank everywhere (eff_rank_probe 1.3–3.8 at 6k; rate-family +
+  noise runs best) — 6k sprints rank configs relatively; a winner needs a long confirm run.
+
+**What works (final-1k means; rate↓ sat↓ E↓ cont↑):**
+| run | config | rate | sat | E | cont/s | cur | effR |
+|---|---|---|---|---|---|---|---|
+| sbase | control | 2.13 | .93 | 4.62 | .00 | 5.6* | 1.4 |
+| senergy | w_energy 1 | 2.11 | .89 | 4.08 | .00 | 3.1 | 2.4 |
+| snotorq | no-torque-obs | 1.60 | .74 | 3.80 | .02 | 1.3 | 1.3 |
+| srate | w_rate 3 | 1.51 | .75 | 2.86 | **.44** | 2.9 | 3.4 |
+| swrate | warmup+w_rate 3 | 1.57 | .73 | 3.38 | .01 | 5.5 | 3.8 |
+| smhq | +multihead-q | 1.58 | .79 | 3.85 | .02 | 3.5 | 3.3 |
+| swbase | warmup only | 1.07 | .56 | 2.88 | .00 | 2.1 | 1.4 |
+| snoise | warmup+w_rate 3+noise .1 | **0.76** | **.48** | **1.12** | .11↗ | 4.0 | 3.4 |
+| sareg | warmup+actor-rate-reg 5 | **0.22** | **.13** | 0.90 | .00 | 3.2 | 2.3 |
+| scand | warmup+actor-reg 1+noise .1 | 0.50 | .33 | 1.42 | .01 | 2.8 | 1.4 |
+(*sbase's cur is thrash-fed, not a win.)
+
+- **Action-rate reward (the user-specced legged_gym term, W=3)** is the only *reward*
+  term that bends the policy back from bang-bang AND restores object interaction —
+  `srate` had contact BURSTS (rolling mean to 0.76 @ ~5.2k) vs the historic permanent
+  ~0.001 collapse (newarch/lcur20/safe15); `snoise` adds steady rising late-run contact.
+  Cost (the flagged Q-pollution, now QUANTIFIED via multihead): q_rate ends at −24.7 vs
+  q_cur +21.9, q_safe −11.4 — the rate term is the single largest value component.
+- **Actor-loss rate regularizer** (`--actor-rate-reg`, the "one line in actor_loss")
+  has enormous, Q-clean leverage: W=5 → rate 0.22 / sat 0.13 / reversals at the real
+  arm's calm scale — but over-damped (0 contacts). W=1+noise (`scand`) stays smooth
+  (rate 0.50/sat 0.33) yet still inert with a weak encoder (effR 1.4) — Q-clean, less alive.
+- **Collection noise** (`--explore-noise 0.1`, TD3-style, sim-only; policy stays
+  deterministic) breaks both attractors cheaply: snoise = smoothest interactive run.
+- **Torque-free obs** (`--no-torque-obs`): no cost detected (snotorq ≈ controls in the
+  no-warmup regime); removes the ~96%-saturated sign-bit obs channel = the main sim→real
+  proprio mismatch. Adopt; re-verify once under the final recipe before a long pretrain.
+- **Multi-head Q** (`--multihead-q`): per-component heads train fine (sum == scalar
+  optimum), behavior unchanged (smhq ≈ swrate), and the decomposition is the new
+  standard diagnostic for reward-balance questions. Keep as an opt-in.
+
+**kp=998 question — answered + already fixed:** kp came from the RBE501 STS3215 model at
+firmware P=16; hardware is pinned P8/D16 since 2026-06-12, sim already recalculated to
+499.11 (linear in P; kv=2.731 is back-EMF, P-independent). At action scale the plant still
+saturates similarly (measured); the obs-recompute moot point stands if torque-free obs lands.
+
+**RECOMMENDATION — the simplest transferable smooth config (sim pretrain):**
+`--warmup-random --w-action-rate 3 --explore-noise 0.1 --no-torque-obs` on the sim-
+calibrated safety (δ=15, λ_safe=0.1), λ_cur 15, action_max 0.1 (= the `snoise` recipe
++ torque-free obs). Rationale: snoise is the only run that is simultaneously smooth
+(rate 0.76 / sat 0.48 / E 1.12 — 2.6× calmer than srate), interactive (contacts 0.11
+and rising — vs the historic post-warmup collapse), curious (4.0), and encoder-healthiest
+(effR 3.4). The Q-clean actor-reg variants (sareg W=5, scand W=1+noise) are smoother
+still but inert (contacts ≈0) with weaker encoders — keep `--actor-rate-reg 0.5-1` as a
+deploy-time smoothness topper, not the primary shaper. Noise/warmup are SIM-ONLY data
+levers; the deployed policy stays deterministic.
+
+Caveats: 1 seed per config, 6k sprints; encoder ranks everywhere ≪ safe15's 33@100k;
+srate's interaction is bursty, snoise's is small-but-trending. Before trusting the
+winner: one 50–100k confirmation run of the recommended config (+ the no-torque-obs
+re-verify rides along free). Hardware unchanged: (δ=9, λ_safe=2.2), P8/D16, kp=499.11.
