@@ -691,6 +691,8 @@ def main(args):
                 a = torch.rand(args.n_envs, a_dim, device=device) * 2 - 1
             else:
                 a = actor(z)
+                if args.explore_noise > 0:   # TD3-style collection noise; policy itself stays deterministic
+                    a = (a + args.explore_noise * torch.randn_like(a)).clamp(-1.0, 1.0)
         hist_a = torch.cat([hist_a[1:], a.unsqueeze(0)], 0)
         a_env = a.detach().cpu().numpy().reshape(args.n_envs, args.action_block, n_dof)
 
@@ -1036,6 +1038,11 @@ def parse_args():
                    help="act with uniform random actions during start_steps (restores the pre-2026-06-12 "
                         "warmup as an opt-in): buffer diversity for from-scratch sim runs; acting is "
                         "deterministic after warmup either way.")
+    p.add_argument("--explore-noise", type=float, default=0.0,
+                   help="TD3-style Gaussian noise std added to actions during COLLECTION only (clamped to "
+                        "[-1,1]); the policy/eval remain deterministic. Sim-pretrain remedy for the "
+                        "two-attractor pathology (bang-bang thrash vs frozen lull) seen in from-scratch "
+                        "deterministic runs 2026-06-12; not for hardware.")
     # actor-critic (README; deterministic — entropy/alpha removed 2026-06-12)
     p.add_argument("--gamma", type=float, default=0.9)
     p.add_argument("--tau", type=float, default=0.005, help="Polyak rate (SAC-style target critic)")
