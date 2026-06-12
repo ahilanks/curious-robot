@@ -42,7 +42,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from lewm.module import SIGReg                                    # noqa: E402
 from model.state_encoder import WorldModel                        # noqa: E402
 from src.offline_train import load_buffer                         # noqa: E402
-from src.train import (Actor, TwinQ, collapse_metrics, resolve_ckpt,   # noqa: E402
+from src.train import (Actor, TwinQ, collapse_metrics, load_actor_state, resolve_ckpt,   # noqa: E402
                        sac_update, wm_update)
 
 
@@ -226,12 +226,11 @@ def main(args):
                     dropout=float(src_args.get("wm_dropout", 0.1))).to(device)
     wm.load_state_dict(ck["wm"]); wm.eval()
     sigreg = SIGReg(knots=17, num_proj=1024).to(device)
-    actor = Actor(wm.z_dim, a_dim).to(device); actor.load_state_dict(ck["actor"])
+    actor = Actor(wm.z_dim, a_dim).to(device); load_actor_state(actor, ck["actor"])
     critic = TwinQ(wm.z_dim, a_dim).to(device); critic.load_state_dict(ck["critic"])
     critic_tgt = TwinQ(wm.z_dim, a_dim).to(device); critic_tgt.load_state_dict(ck["critic_tgt"])
     for p_ in critic_tgt.parameters():
         p_.requires_grad_(False)
-    log_alpha = ck["log_alpha"].to(device)
     actor_opt = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
     critic_opt = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
     wm_opt = torch.optim.AdamW([p_ for p_ in wm.parameters() if p_.requires_grad],
@@ -246,7 +245,7 @@ def main(args):
     def ckpt_state(step):
         return {"step": step, "wm": wm.state_dict(), "actor": actor.state_dict(),
                 "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
-                "log_alpha": log_alpha.detach().cpu(), "h_fwd": h_fwd, "args": saved_args}
+                "h_fwd": h_fwd, "args": saved_args}
 
     def save_now():
         """Upload the current weights (hub keeps only this latest ckpt), log the train
@@ -281,7 +280,6 @@ def main(args):
               "wm/identity_baseline": last_wm[2] if last_wm is not None else None,
               "wm/h_fwd": h_fwd,
               "sac/critic_loss": d.get("critic_loss"), "sac/actor_loss": d.get("actor_loss"),
-              "sac/alpha": float(log_alpha.exp().item()),
               "encoder/z_std": d.get("z_std"), "encoder/eff_rank": d.get("eff_rank"),
               "encoder/feat_corr": d.get("feat_corr"),
               "buffer/transitions": buf.total,
@@ -343,7 +341,7 @@ def main(args):
                                         args.gamma_wm, args.sigreg_weight, device)
                     wm.eval()
             res = sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
-                             log_alpha, args, global_step, device)
+                             args, global_step, device)
             if res is not None:
                 last_sac = (res["critic_loss"], res["actor_loss"]); last_zb = res["zb"]
             global_step += 1

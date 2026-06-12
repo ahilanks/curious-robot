@@ -323,6 +323,109 @@ _(add a dated entry per run)_
     production; cadence ~2.5 sps with the 4-reads/servo loop (block-read regs 56–61 is the shelf
     optimization).
 
+- 2026-06-10 — **servo gain-sweep benches on the real arm** (`src/bench_dgain_wide.py`,
+  `src/bench_pgain_path.py`): one continuous joint-space path THROUGH 6 waypoints (Catmull-Rom,
+  C1 through each point, global min-jerk time warp; pan in the cable-safe +0.05…+0.70, downward
+  joints capped for the table). Each gain runs the identical path; restore P16/D32 after.
+  **Stiffness (P, reg 21) is a real knob** — brisk path (`--path-time 4`):
+
+  | P-gain | track err (mean/max) | jerk RMS | peak \|τ\| |
+  |---|---|---|---|
+  | 8 | 7.8° / 41.9° | 3.9 k°/s³ | 4.7 |
+  | 16 (default) | 6.1° / 37.3° | 5.8 k°/s³ | 8.3 |
+  | 32 | 4.5° / 34.2° | 6.8 k°/s³ | 13.1 |
+  | 48 | 3.7° / 20.7° | 6.7 k°/s³ | 13.9 |
+
+  Soft = floaty corner-cutting; stiff = 2× tighter tracking at 3× the peak effort; 32→48 is
+  diminishing returns (P=32 the sweet spot for scripted motion; **campaign stays P16** — sim's
+  kp=998.22 was derived at P16). **Damping (D, reg 22) is a dead knob** — same path, 6 s
+  (spread ≲ run-to-run noise; P16 repeats scored 4.0°/4.0° mean):
+
+  | D-gain | track err (mean/max) | jerk RMS | peak \|τ\| |
+  |---|---|---|---|
+  | 8 | 4.1° / 23.9° | 3.0 k°/s³ | 4.4 |
+  | 32 (default) | 3.9° / 21.4° | 2.9 k°/s³ | 4.0 |
+  | 128 | 3.6° / 20.4° | 3.3 k°/s³ | 4.6 |
+
+  Gear friction owns the damping (confirms the 2026-06-09 down-sweep from the high side).
+  **D=254 destabilizes**: velocity-noise chatter (~3 A spikes, 9.75° lag) tripped the STS3215
+  firmware overload protection, which **silently cut torque on all 6 servos** (reg 40 read 0,
+  no bus error) — after any high-current event, verify Torque_Enable before trusting "arm
+  holding". `bench_pgain_path.py --reg d` refuses D>128. Gain-write gotcha: a readback
+  immediately after an EEPROM write burst drops (reads 0) — wait ~100 ms + comm-check.
+
+- 2026-06-11 — **safe15 jerk attributed** (`src/bench_safe15_jerk.py`, 100 instrumented control
+  substeps at campaign config; data `runs/jerk_bench/jerk_safe15_100.npz`). Wall-clock probes on
+  every bus/camera call + MPS-synced inference stages. **The "30 ms" substep is really 74 ms
+  intra-block / 103 ms at block boundaries** (12.5 substeps/s vs 33.3 design): write 4.2 +
+  dt_safe-sleep 30 + bus read 8.3 + **camera read 33.4** (blocks on the next 30 fps frame —
+  the single biggest unbudgeted cost) + at boundaries ViT encode 14.2 / curiosity 7.1 /
+  actor.sample 3.5. **Jerk is NOT the block-boundary ViT stall**: |accel|/|jerk| are uniform
+  across substep positions k=0..4 (k=0 is mildly *smoother*). It's two compounding effects:
+  (1) **13 Hz stop-start staccato** — pacing lands every move in exactly 30 ms (planned-arrival
+  p50 30.0 ms ✓) but the substep lasts 74–103 ms, so the arm dead-stops ~45–73 ms after every
+  move; (2) **policy dither** — safe15 reverses commanded direction on ~70% of substeps per
+  joint (mean |Δq| 0.056 rad/substep at action_max 0.1); sim physics + alpha-interp filter
+  this, the position staircase executes it literally (= the sim→real gap called on 2026-06-02).
+  Fixes by size: free-running camera grab thread (latest-frame buffer; −33 ms → ~42 ms substep),
+  then act on tanh(mean) instead of sampling (kills dither, changes exploration), then overlap
+  inference (hard: serial by design). **Bonus findings**: true read-to-read dt is 79.5 ms but
+  r_safe's qddot divides by 0.030 → accel overestimated ×2.65 on hardware; and **measured
+  r_safe was 0.00 for the entire run** (|tau_meas| mean 0.2 N·m — the δ=15 deadband never
+  trips; the live safety term is inert in this regime) while r_safe_recompute read −45.9
+  (saturated-KP artifact, consistent with the old "real ≈ −45" numbers).
+
+- 2026-06-11 (later) — **jerk fixes #1–#3 landed + verified on-arm** (bench re-runs, mean vs
+  sample, `runs/jerk_bench/`): (1) `UsbCamera` free-running grab thread (camera read 33.4 →
+  0.3 ms; `SOARM_SYNC_CAM=1` restores blocking grab); (2) `collect_daemon --act-mode mean`
+  (default) acts on tanh(mean) — `sample` for A/B; (3) daemon loop defers curiosity/reward/
+  chunk.add into the next block's motion window (`flush_pending()` guards every reset/gate/
+  shutdown path — verified 108/108 transitions on a mock SIGINT run). **Substep 79.5 → 43.7 ms**
+  (intra 41, boundary 55); remaining overage = bus read 8.3 ms (shelf: block-read regs 56–69).
+  NOT done by request: pace_dt stretch (mid-move reads) and action pipelining (stale actions).
+  **P8/D16 trial** (servos left there; any standard-calib connect restores P16/D32): at equal
+  timing, accel 16.7 → 9–10 rad/s², jerk 578 → ~300 rad/s³, peak |tau_meas| 0.65–0.78 N·m —
+  smoothest config measured; trade-offs: P8 tracking sag + kp=998.22 obs-recompute was derived
+  at P16. **GOTCHA — max_step_ticks clamps vs the last READ**: `write_goal` limits every goal
+  to ±300 ticks (0.46 rad) of `_last_pos`, which only `read()` refreshes — any multi-step
+  scripted move without interleaved reads silently stops ~0.46 rad short (masqueraded as "P8
+  too weak"). Fixed in bench `go_home()` and in `park_and_rest`'s fold (which could have
+  dropped torque from a non-park pose). Behavior note: safe15-mean actively pins wrist flex
+  against its +1.66 downward clamp — manual raises get undone by the policy.
+
+- 2026-06-11 (evening) — **investigations + λ_cur 20→15**. (1) **Clamp occupancy** (2000-substep
+  mean-policy run): 92% of time ≥1 joint within 0.15 rad of a clamp, interior only 8%; pan
+  high-clamp 51%, grip open-clamp 92%, lift/elbow folded low 35/37%. Workspace-box tightening
+  (DOWN_CAP-style collection limits) is the concrete exploration lever — clamp-riding at a
+  table-facing pose beats folded-against-backstops. (2) **P8/D16 obs caveat is DEAD**: the
+  kp=998.22 obs recompute is saturated at ±3.35 on **96-97% of joint-samples at BOTH gain
+  configs** (the obs torque channel is a near-constant sign bit); effective-stiffness fit from
+  logged current-vs-error gives P8/P16 ≈ 0.81 (KP-eq ≈ 813) — irrelevant under saturation.
+  Tracking at policy scale is NO worse at P8 (|err| mean 0.036-0.046 vs 0.051-0.057 rad).
+  P8/D16 adoption now blocked only by a decision + calib json edit. (3) **Lineage**: auto2
+  learner is at ckpt 15909 (hub holds only the latest), all auto2 chunks consumed; today's
+  config delta (mean acting, 44 ms loop, λ_cur 15, gains TBD) is a regime boundary → **next
+  launch should be auto3**, warm-started from auto2's champion, never appending to auto2.
+  (4) **λ_cur switched 20→15** (the long-deferred sweep candidate): collect_daemon default,
+  train.py default (was the 1.0 foot-gun), README table — all aligned at 15. (5) **CPU vs MPS**
+  on-arm A/B: full-CPU is worse (boundary 57.6 vs 55.1 ms; encode 15.8 vs 11.5) — MPS stays;
+  only the actor MLP is faster on CPU (0.2 vs 3.1 ms, kernel-launch overhead), optional ~3 ms
+  hybrid. Remaining timing shelf items: bus block-read regs 56-69 (~5-6 ms), fp16 ViT (~5 ms).
+
+- 2026-06-11 (night) — **EMA REMOVED from the hardware env** (user decision; sim has no
+  filtering, so raw restores obs parity in phase/lag — the encoder now sees instantaneous
+  qd like sim, with Present_Speed quantization noise as the cost). `_read()` returns raw
+  qd and clipped raw tau; `vel_lowpass`/`cur_lowpass` params and filter state deleted.
+  Verified on-arm: env outputs bit-identical to raw bus reads; loop 43.9 ms unchanged;
+  the historical "raw qd blows up r_safe" did NOT recur in the smooth regime (max hinge
+  arg 1.4 vs δ=15; raw qddot p99 13.6 rad/s²) — that fear dated from the P64/sampled era.
+  **Deadband re-pin numbers therefore use the RAW sweep**: δ≈1.0 (p99), λ_safe≈25-30 for
+  the ~0.5:1 jerky-motion balance (jerky −0.18..−0.27 vs smooth −0.006..−0.019 per substep,
+  15-30x separation), probation-rsafe −5.0 → ≈−0.1 (currently dead code — no measured run
+  in history could trip −5). δ=15 + λ_safe=0.1 stays calibrated-for-sim only; judge
+  real-to-real. Bench npz key renamed sub_qd_filt → sub_qd_env. Temps after the day's
+  bench series: shoulder/elbow 42/40 °C (gate 50).
+
 ## Hardware campaign reference (frozen 2026-06-06 — change nothing mid-campaign)
 
 **Pinned constants** — `--action-max 0.1`, `--lambda-safe 0.1 --lambda-cur 20 --safety-delta 15`
@@ -371,3 +474,88 @@ python src/offline_train.py --resume-name <prev> --buffer buffers/hw_round_N/buf
 buffers (λ_cur=1). Mix-safe sim: `buffers/sim_mix_v1/buffer_small.npz` (1:1) from round 2+ only if
 the fine-tune destabilizes. Campaign-valid real buffers collected 06-06: `hw_p0_run100{,b,c}`,
 `hw_p0_run200{,b,c}`, `hw_p0_{paced,nopace}` (~720 tr).
+
+## 2026-06-12 — deterministic policy (stochasticity removed) + dq_max retired + README constants pass
+
+**Policy is now fully deterministic** (user decision): `Actor` = `tanh(MLP(z))` — Gaussian
+head (`log_std`), `actor.sample`, entropy bonus, and `log_alpha`/`--alpha` all deleted.
+`sac_update` (name kept for caller/W&B-key continuity) is now TD3-style: target
+`y = r + γ(1−d)·min Q̄(z', π(z'))`, actor loss `−min Q(z, π(z))`; twin critics + Polyak target
+(ρ=0.005) KEPT — with entropy gone the target net is the only TD stabilizer left, do not remove.
+Random-action warmup acting removed too (`--start-steps` now only delays gradient updates).
+What still has randomness (data-side, NOT the policy): sim reset/object spawn, PER + minibatch
+sampling, WM dropout 0.1, seeds. Exploration now rides entirely on the curiosity reward.
+- ckpt schema: new ckpts drop `log_alpha`; actors save without `log_std`. OLD ckpts
+  (safe15, auto2, …) load everywhere via `load_actor_state` (filters `log_std.*`); the loaded
+  deterministic actor is bit-identical to the old `a_det = tanh(mean)` path, so deployed
+  behavior matches the daemon's previous `--act-mode mean` default exactly. `--act-mode`
+  removed from collect_daemon + bench (bench npz now `*_det.npz`, `act_mode="det"`).
+- touched: train.py (Actor/load_actor_state/sac_update/main/args), collect_daemon,
+  learner_daemon, offline_train (arg `--alpha` gone), bench_safe15_jerk, eval_predictor,
+  play_policy, README (actor eq, "Actor-critic objective (deterministic)" section, α row out).
+- verified: unit smoke (determinism, old-ckpt filter, TD3 step), SOARM_MOCK hardware self-test
+  OK, mock bench on real safe15 ckpt OK, 12-step inproc sim train run end-to-end OK, new ckpt
+  schema clean. NOTE: a fresh/continued lineage trains the actor toward argmax Q from step 1
+  (no entropy regularizer) — watch for premature exploitation; the planned action-rate
+  regularizer slots into the new actor_loss in one line.
+
+**dq_max removed everywhere** (env/soarm_adapter, mujoco_env, parallel_env, hardware_env (+self-test),
+train.py, play_policy, eval_predictor, bench). It was a 100-rad never-binding duplicate clamp;
+README's Δq^max symbol now maps 1:1 to code `action_max` (the actuation equation
+Δq=a⊙Δq^max is literally what the code does). Old ckpt `args["dq_max"]` simply ignored.
+
+**README constants table**: every Meaning cell rewritten as a short functional phrase;
+Δq^max/action_max rows merged (0.3 sim, 0.1 hardware campaign); ρ row kept + disambiguated
+(SAC/TD3 critic-target Polyak, NOT a JEPA EMA teacher — user asked to remove it; kept because
+train.py:299 uses it and it's load-bearing, now more than ever). play_policy.py pre-existing
+breakage noted: imports `record_rollout` from src.train which no longer exists there.
+
+## 2026-06-12 — safety deadband CALIBRATED ON THE REAL ARM; re-pin package LANDED
+
+Built `src/calib_deadband.py` (hold / reversal / analyze modes) and ran a labeled session at
+P8/D16, true-dt hinge args, kt=10. User rated events 0-3. Data (`runs/deadband_calib/*.npz`):
+- benign (sev 0: baseline, light touch, ALL scripted reversals up to ±0.25 rad — 2.5x the
+  policy's max possible substep — rated "totally fine"): max 3.3; policy-run ceiling 4.3
+- sev 1 (firm push): 7.4        — acceptable, must stay penalty-free
+- sev 2-3 (grabs, joint blocks, jerky manhandling): 10.7 / 13.0 / 13.9 / 24.4
+Clean gap [7.4, 10.7] → **delta = 9** (geometric midpoint). KEY INSIGHT: at these gains the
+arm's own motion cannot reach "bad" — delta's job is external events (blocks, snags, collisions).
+
+LANDED (defaults; meant for the NEXT lineage — do not hot-resume auto2 onto these rewards):
+- `_control_step` qddot divisor: hardcoded 0.030 → measured read-to-read dt, clamped
+  [0.5x, 4x] dt_safe (real loop ~42-44 ms; old divisor inflated args ~1.5x)
+- delta 15 → 9 (train.py, collect_daemon, hardware_env, mujoco_env; parallel_env stale 0.05
+  defaults synced too); README δ row + §Rewards updated
+- lambda_safe 0.1 → 2.2 (one median bad substep ≈ one decision's curiosity ~10; benign
+  r_safe is now IDENTICALLY 0, so lambda_safe scales only genuine events)
+- probation_rsafe −5.0 (dead code) → −0.05 raw mean over the 30-decision window
+  (trips on ~2+ bad decisions; a single external snag passes)
+Verified live: 30 gentle substeps at delta=9/true-dt → r_safe 0/30 nonzero, loop 41.7 ms,
+mock self-test + py_compile green, arm homed after.
+
+CAVEATS: (1) valid at P8/D16 — recalibrate (5-min reversal ladder) if the lineage deploys at
+P16/D32; (2) sim-side arg distribution at delta=9 UNVERIFIED — old sim notes claimed gentle
+contact reaches ~15, so measure sim benign args before a long sim pretrain at these defaults;
+(3) kt=10 baked into both calibration and runtime — rescaling kt rescales delta with it.
+
+## 2026-06-12 — gains PINNED at P8/D16; sim kp recalculated 499.11 via the RBE501 motor model
+
+User decision after a brief P16/D32 detour ("this is jerky"): P8/D16 is now the campaign
+config. `so101_calib.json` p_gain/d_gain -> 8/16 (any standard connect now writes 8/16, the
+old gotcha is inverted), servos confirmed 8/16 by read-back.
+
+**kp recalculated for P=8** per the RBE501 DC-motor derivation the XML cites
+(kp = Km*Gp*(180/pi)/R — LINEAR in firmware P; kv = Km*Kb/R — back-EMF only, NO firmware
+P/D dependence, which matches our "friction owns damping / D cosmetic" bench finding):
+kp 998.22@P16 -> **499.11@P8**, kv 2.731 unchanged. Applied to scene.xml +
+so101_new_calib.xml (sts3215 class default), hardware_env KP, soarm_adapter docstring,
+README K_p row. Saturation band of the obs recompute doubles to 6.7 mrad (~4.4 ticks) —
+still mostly saturated during motion; moot if the [q,qd]-only proprio lands.
+NOTE: sim plant is softer now — sim-pretrained ckpts from the kp=998 era saw different
+dynamics; fine for the auto3 era, do not mix expectations.
+
+**Deadband status**: the P16 detour measured benign policy ceiling 8.0 (500 substeps,
+jerk_safe15_500_det.npz) vs 4.3 at P8 — delta=9 was marginal at P16. With gains back at
+P8/D16 the 06-12 calibration (benign<=7.4, bad>=10.7, delta=9, lambda_safe=2.2) is VALID
+as-is; P8 calib sessions live in runs/deadband_calib/p8d16/, calib_deadband POLICY_CEIL
+back to 4.3. No relabel session needed.

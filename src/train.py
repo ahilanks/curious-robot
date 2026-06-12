@@ -3,7 +3,7 @@ an intrinsic curiosity reward, on the MuJoCo SO-ARM101 (README is the spec).
 
 Per decision step (action_block env steps), for every parallel env:
   1. encode z_t from (wrist image, proprio) with the current world model
-  2. sample a_t ~ pi(.|z_t); apply it (delta-target PD) over action_block env steps
+  2. act a_t = pi(z_t) (deterministic tanh policy); apply it (delta-target PD) over action_block env steps
   3. curiosity   r_cur = ||f(z_{t-H+1:t}, a_t) - z_{t+1}||^2     (1-step pred error)
      reward      r_t   = sum_k r_safe_k + lambda_cur * symlog(r_cur)
   4. store (o_t, q_t, qdot_t, a_t, r_t, o_{t+1}) with PER priority = r_cur
@@ -59,27 +59,27 @@ def to_norm_pixel(px_uint8, device):
     return (t - IMAGENET_MEAN.to(device).view(shp)) / IMAGENET_STD.to(device).view(shp)
 
 
-# --------------------------------------------------------------------------- SAC
+# ----------------------------------------------------- actor-critic (deterministic)
 class Actor(nn.Module):
-    def __init__(self, z_dim, a_dim, hidden=256, log_std_range=(-5, 2)):
+    """Deterministic policy a = tanh(MLP(z)). The Gaussian head, sampling and entropy
+    machinery were removed 2026-06-12 (user decision: deterministic policy only);
+    exploration comes from the curiosity reward, not action noise. `mean` keeps its
+    name so pre-removal checkpoints load via load_actor_state."""
+
+    def __init__(self, z_dim, a_dim, hidden=256):
         super().__init__()
         self.trunk = nn.Sequential(nn.Linear(z_dim, hidden), nn.ReLU(),
                                    nn.Linear(hidden, hidden), nn.ReLU())
         self.mean = nn.Linear(hidden, a_dim)
-        self.log_std = nn.Linear(hidden, a_dim)
-        self.lo, self.hi = log_std_range
 
     def forward(self, z):
-        h = self.trunk(z)
-        return self.mean(h), self.log_std(h).clamp(self.lo, self.hi)
+        return torch.tanh(self.mean(self.trunk(z)))
 
-    def sample(self, z):
-        mean, log_std = self(z)
-        normal = torch.distributions.Normal(mean, log_std.exp())
-        u = normal.rsample()
-        a = torch.tanh(u)
-        logp = (normal.log_prob(u) - torch.log(1 - a.pow(2) + 1e-6)).sum(-1, keepdim=True)
-        return a, logp, torch.tanh(mean)
+
+def load_actor_state(actor, sd):
+    """Load an actor state_dict, tolerating pre-2026-06-12 stochastic-SAC checkpoints:
+    their log_std.* head is dropped; everything else must match exactly."""
+    actor.load_state_dict({k: v for k, v in sd.items() if not k.startswith("log_std")})
 
 
 class TwinQ(nn.Module):
@@ -262,10 +262,13 @@ def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device):
     return float(pred_loss.item()), float(sig.item()), float(idl)
 
 
-def sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt, log_alpha,
+def sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
                args, step, device):
-    """Run args.updates_per_step SAC gradient steps on PER samples from buf (the
-    encoder is frozen w.r.t. SAC: z is encoded under no_grad from the CURRENT wm).
+    """Run args.updates_per_step deterministic actor-critic gradient steps on PER
+    samples from buf (TD3-style: twin critics + Polyak target net, but no entropy
+    term and no action sampling — stochasticity removed 2026-06-12; the name stays
+    for caller/W&B-key continuity). The encoder is frozen w.r.t. these updates: z is
+    encoded under no_grad from the CURRENT wm.
     Returns {"critic_loss", "actor_loss", "zb"} from the last completed update, or
     None if the gate is closed (warmup / buffer below batch) or sampling came up dry.
     Shared by the online loop here and offline fine-tuning (offline_train.py)."""
@@ -273,7 +276,6 @@ def sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt, log_al
         return None
     per_beta = min(1.0, args.per_beta_start
                    + (1 - args.per_beta_start) * step / max(args.total_steps, 1))
-    alpha = log_alpha.exp()
     out = None
     for _ in range(args.updates_per_step):
         b = buf.sample_sac(args.batch_size, args.per_alpha, per_beta)
@@ -282,18 +284,16 @@ def sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt, log_al
         zb = encode_obs(wm, b["px"], b["prop"], device)
         znb = encode_obs(wm, b["px_n"], b["prop_n"], device)
         with torch.no_grad():
-            an, logpn, _ = actor.sample(znb)
-            q1n, q2n = critic_tgt(znb, an)
-            y = b["r"] + (1 - b["d"]) * args.gamma * (torch.min(q1n, q2n) - alpha * logpn)
+            q1n, q2n = critic_tgt(znb, actor(znb))
+            y = b["r"] + (1 - b["d"]) * args.gamma * torch.min(q1n, q2n)
         q1, q2 = critic(zb, b["a"])
         critic_loss = (b["w"] * ((q1 - y).pow(2) + (q2 - y).pow(2))).mean()
         critic_opt.zero_grad(); critic_loss.backward(); critic_opt.step()
         if args.per_priority == "td":   # ablation: replace curiosity priority with |TD error|
             td = (0.5 * (q1 + q2) - y).abs().detach().squeeze(1).cpu().numpy()
             buf.update_priorities(b["e"], b["i"], td)
-        ap, logpp, _ = actor.sample(zb)
-        q1p, q2p = critic(zb, ap)
-        actor_loss = (alpha * logpp - torch.min(q1p, q2p)).mean()
+        q1p, q2p = critic(zb, actor(zb))
+        actor_loss = (-torch.min(q1p, q2p)).mean()
         actor_opt.zero_grad(); actor_loss.backward(); actor_opt.step()
         with torch.no_grad():
             for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
@@ -402,22 +402,21 @@ def resolve_ckpt(ckpt=None, name="baseline", step=None, hf_repo=None):
 
 
 def load_init_ckpt(args, wm, actor, critic, critic_tgt, device):
-    """Warm-start / resume: load WM + SAC weights so the online loop CONTINUES a prior run
-    instead of starting cold (train.py otherwise only ever SAVES checkpoints, never loads).
-    Resolves a local --init-ckpt or an HF --resume-name[/--resume-step]. Returns
-    (log_alpha on device, h_fwd) to overwrite the freshly-initialised values. NOTE: optimizer
-    state is not in the checkpoint, so Adam moments restart — lower LRs for bring-up if needed."""
+    """Warm-start / resume: load WM + actor-critic weights so the online loop CONTINUES a
+    prior run instead of starting cold (train.py otherwise only ever SAVES checkpoints,
+    never loads). Resolves a local --init-ckpt or an HF --resume-name[/--resume-step].
+    Returns h_fwd to overwrite the freshly-initialised value. NOTE: optimizer state is
+    not in the checkpoint, so Adam moments restart — lower LRs for bring-up if needed."""
     path = resolve_ckpt(args.init_ckpt, args.resume_name or args.name, args.resume_step, args.hf_repo)
     ck = torch.load(path, map_location=device, weights_only=False)
     wm.load_state_dict(ck["wm"])
-    actor.load_state_dict(ck["actor"])
+    load_actor_state(actor, ck["actor"])     # drops the log_std head of old stochastic ckpts
     critic.load_state_dict(ck["critic"])
     critic_tgt.load_state_dict(ck["critic_tgt"])
-    log_alpha = ck["log_alpha"].to(device)
     h_fwd = int(ck.get("h_fwd", args.h_fwd_start))
     print(f"[resume] loaded wm+actor+critic from {path} "
           f"(saved step {ck.get('step', '?')}, h_fwd={h_fwd})", flush=True)
-    return log_alpha, h_fwd
+    return h_fwd
 
 
 def tile_frames(imgs):
@@ -457,7 +456,7 @@ def main(args):
     if args.start_steps < 0:                      # default-aware: skip random warmup on a real arm
         args.start_steps = 0 if args.env_backend == "hardware" else 1000
     env = VecEnv(n_envs=args.n_envs, frame_skip=args.frame_skip,
-                 action_max=args.action_max, dq_max=args.dq_max,
+                 action_max=args.action_max,
                  safety_delta=args.safety_delta, seed=args.seed,
                  threads=args.env_threads)
     n_dof = env.n_dof
@@ -482,7 +481,6 @@ def main(args):
     critic_tgt.load_state_dict(critic.state_dict())
     for p in critic_tgt.parameters():
         p.requires_grad_(False)
-    log_alpha = torch.tensor(float(np.log(args.alpha)), device=device)   # fixed entropy temp
 
     actor_opt = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
     critic_opt = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
@@ -492,7 +490,7 @@ def main(args):
     # --- resume / warm-start: load wm+sac weights BEFORE the loop (else cold start) ---
     resume_h_fwd = None
     if args.init_ckpt or args.resume_name:
-        log_alpha, resume_h_fwd = load_init_ckpt(args, wm, actor, critic, critic_tgt, device)
+        resume_h_fwd = load_init_ckpt(args, wm, actor, critic, critic_tgt, device)
 
     # --- frozen-policy data collection: act + buffer, NO gradient updates ---
     policy_loaded = bool(args.init_ckpt or args.resume_name)
@@ -504,7 +502,7 @@ def main(args):
                              "Load a policy, e.g. --resume-name safe15 --resume-step 100000.")
         print(f"[frozen] WARNING: {msg}.", flush=True)
     if args.frozen_policy:
-        print("[frozen] data-collection mode: NO gradient updates (WM/SAC/alpha/curriculum "
+        print("[frozen] data-collection mode: NO gradient updates (WM/SAC/curriculum "
               "all skipped); acting + buffering only. Buffer -> out_dir/buffer_<N>.npz on exit.",
               flush=True)
 
@@ -529,8 +527,6 @@ def main(args):
         warns = []
         if args.action_max > 0.15:
             warns.append(f"action_max={args.action_max} is large for a real arm")
-        if args.start_steps > 0:
-            warns.append(f"{args.start_steps} random-warmup steps will move the arm randomly")
         if not loaded:
             warns.append("no policy loaded (random actor)")
         print(f"[hardware] SAFETY: n_envs=1, control_dt={env.dt_safe}s, "
@@ -613,7 +609,7 @@ def main(args):
                         print(f"[curriculum] step={step} H_fwd -> {h_fwd}", flush=True)
         # --- SAC updates (PER; encoder is frozen w.r.t. SAC, z encoded under no_grad) ---
         res = sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
-                         log_alpha, args, step, device)
+                         args, step, device)
         if res is not None:
             last_sac = (res["critic_loss"], res["actor_loss"])
             last_zb = res["zb"]
@@ -637,12 +633,10 @@ def main(args):
             break
         cur_px, cur_prop = obs["image"], obs["proprio"]          # o_t (before acting)
 
-        # --- act ---
+        # --- act (deterministic policy; exploration = curiosity reward, not action noise.
+        #     start_steps no longer randomizes acting — it only delays gradient updates) ---
         with torch.no_grad():
-            if step < args.start_steps:
-                a = torch.rand(args.n_envs, a_dim, device=device) * 2 - 1   # warmup
-            else:
-                a, _, _ = actor.sample(z)
+            a = actor(z)
         hist_a = torch.cat([hist_a[1:], a.unsqueeze(0)], 0)
         a_env = a.detach().cpu().numpy().reshape(args.n_envs, args.action_block, n_dof)
 
@@ -763,8 +757,7 @@ def main(args):
                 d.update({"wm/pred_loss": last_wm[0], "wm/sigreg": last_wm[1],
                           "wm/identity_baseline": last_wm[2]})
             if last_sac is not None:
-                d.update({"sac/critic_loss": last_sac[0], "sac/actor_loss": last_sac[1],
-                          "sac/alpha": float(log_alpha.exp().item())})
+                d.update({"sac/critic_loss": last_sac[0], "sac/actor_loss": last_sac[1]})
             wlog(d, step)
             with open(out_dir / "metrics.jsonl", "a") as f:    # local metrics record (esp. when --no-wandb)
                 f.write(json.dumps({"step": step, **{k: float(v) for k, v in d.items()}}) + "\n")
@@ -779,7 +772,7 @@ def main(args):
         if args.save_every > 0 and step > 0 and step % args.save_every == 0:
             state = {"step": step, "wm": wm.state_dict(), "actor": actor.state_dict(),
                      "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
-                     "log_alpha": log_alpha.detach().cpu(), "h_fwd": h_fwd, "args": vars(args)}
+                     "h_fwd": h_fwd, "args": vars(args)}
             save_and_upload(state, out_dir, step,
                             args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
                             run_name, not args.no_hf, args.keep_local_ckpts)
@@ -806,7 +799,7 @@ def main(args):
     if not args.frozen_policy:                    # frozen: weights are unchanged, skip the re-upload
         state = {"step": args.total_steps, "wm": wm.state_dict(), "actor": actor.state_dict(),
                  "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
-                 "log_alpha": log_alpha.detach().cpu(), "h_fwd": h_fwd, "args": vars(args)}
+                 "h_fwd": h_fwd, "args": vars(args)}
         save_and_upload(state, out_dir, args.total_steps,
                         args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
                         run_name, not args.no_hf, args.keep_local_ckpts)
@@ -821,7 +814,9 @@ def parse_args():
     # schedule / infra
     p.add_argument("--total-steps", type=int, default=200_000)
     p.add_argument("--start-steps", type=int, default=-1,
-                   help="random-action warmup (decision steps); default-aware: 0 on hardware, 1000 in sim")
+                   help="update warmup (decision steps): no WM/SAC gradient steps before this; acting is "
+                        "ALWAYS the deterministic policy (the random-action warmup was removed with the "
+                        "rest of the policy stochasticity). Default-aware: 0 on hardware, 1000 in sim")
     p.add_argument("--n-envs", type=int, default=8)
     p.add_argument("--env-threads", type=int, default=0,
                    help=">0 steps envs on a thread pool (inproc backend only)")
@@ -835,7 +830,7 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     # resume / warm-start (train.py otherwise never loads a checkpoint)
     p.add_argument("--init-ckpt", default=None,
-                   help="local .pt to warm-start wm+actor+critic+critic_tgt+log_alpha+h_fwd before the loop")
+                   help="local .pt to warm-start wm+actor+critic+critic_tgt+h_fwd before the loop")
     p.add_argument("--resume-name", default=None,
                    help="resume from an HF run name (e.g. safe15) instead of a local --init-ckpt")
     p.add_argument("--resume-step", type=int, default=None,
@@ -863,8 +858,8 @@ def parse_args():
                         "falls back to a warmup-rollout probe if unavailable")
     # action / actuation (README)
     p.add_argument("--action-block", type=int, default=5)
-    p.add_argument("--action-max", type=float, default=0.3)
-    p.add_argument("--dq-max", type=float, default=100.0, help="README dq^max (~inf; clip rarely binds)")
+    p.add_argument("--action-max", type=float, default=0.3,
+                   help="README dq^max: rad of joint delta per unit tanh action")
     # world model (README; the '?' values below are sweepable, not pinned in README)
     p.add_argument("--history-size", type=int, default=3, help="H_bwd")
     p.add_argument("--h-fwd-start", type=int, default=1)
@@ -884,23 +879,25 @@ def parse_args():
     p.add_argument("--flatline-window", type=int, default=200)
     p.add_argument("--flatline-tol", type=float, default=0.03)
     # reward ('?' values; sweepable)
-    p.add_argument("--lambda-safe", type=float, default=0.1,
+    p.add_argument("--lambda-safe", type=float, default=2.2,
                    help="weight on the safety penalty r_safe: r = lambda_safe*r_safe + lambda_cur*symlog(r_cur). "
-                        "Default 0.1 keeps safety:curiosity ~0.5:1 at steady state under the per-dim-mean r_cur "
-                        "(the literal README weight 1.0 over-weights safety ~5:1 now and freezes the policy); "
-                        "0 ablates safety.")
-    p.add_argument("--lambda-cur", type=float, default=1.0,
+                        "Default 2.2 (2026-06-12, real-arm calibration): under delta=9 benign motion scores "
+                        "exactly 0, so lambda_safe scales only genuine events — 2.2 makes one median "
+                        "user-labeled-bad substep cancel ~one decision's curiosity term. 0 ablates safety.")
+    p.add_argument("--lambda-cur", type=float, default=15.0,
                    help="curiosity weight on symlog(r_cur). r_cur is the per-dim MEAN squared pred error "
-                        "(~O(0.1-1)), so lambda_cur~1 keeps cur_term O(1) in symlog's sensitive region. README '?'")
-    p.add_argument("--safety-delta", type=float, default=15.0,
-                   help="delta: safety-reward deadband on the per-joint -tau*qddot (N*m*rad/s^2). Default 15 "
-                        "leaves gentle reaching / light contact / pickup (-tau*qddot<~15) penalty-free while "
-                        "penalizing hard impacts and violent high-torque reversals (~40-560). The old 0.05 "
-                        "penalized essentially all motion -> safety dominates -> policy freezes.")
-    # SAC (README)
+                        "(~O(0.1-1)); 15-20 keeps curiosity audible against raw |r_safe|~50 at lambda_safe 0.1. "
+                        "Default 15 (2026-06-11; safe15/campaign history ran 20 — old default 1.0 silently "
+                        "shrank curiosity 20x and caused one mis-deploy).")
+    p.add_argument("--safety-delta", type=float, default=9.0,
+                   help="delta: safety-reward deadband on the per-joint -tau*qddot (N*m*rad/s^2). Default 9 "
+                        "re-pinned 2026-06-12 from real-arm calibration at P8/D16 (true-dt args: all benign "
+                        "motion incl. max-violence reversals <=7.4; user-labeled-bad grabs/blocks/jerks "
+                        ">=10.7). Sim-side distribution unverified at 9 — recheck before long sim pretrains. "
+                        "The pre-2026-06 0.05 penalized all motion -> policy froze; the old 15 never fired.")
+    # actor-critic (README; deterministic — entropy/alpha removed 2026-06-12)
     p.add_argument("--gamma", type=float, default=0.9)
-    p.add_argument("--alpha", type=float, default=0.2, help="fixed entropy temperature")
-    p.add_argument("--tau", type=float, default=0.005, help="Polyak rate")
+    p.add_argument("--tau", type=float, default=0.005, help="Polyak rate (SAC-style target critic)")
     p.add_argument("--actor-lr", type=float, default=3e-4)
     p.add_argument("--critic-lr", type=float, default=3e-4)
     p.add_argument("--batch-size", type=int, default=128)

@@ -25,7 +25,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from model.state_encoder import WorldModel       # noqa: E402
 from env.mujoco_env import MujocoSO101Env         # noqa: E402
-from src.train import Actor, record_rollout, resolve_ckpt   # noqa: E402
+from src.train import Actor, load_actor_state, record_rollout, resolve_ckpt   # noqa: E402
 
 
 def main():
@@ -57,9 +57,9 @@ def main():
                     history_size=ca["history_size"]).to(device)
     wm.load_state_dict(ckpt["wm"]); wm.eval()
     actor = Actor(wm.z_dim, n_dof * ca["action_block"]).to(device)
-    actor.load_state_dict(ckpt["actor"]); actor.eval()
+    load_actor_state(actor, ckpt["actor"]); actor.eval()
 
-    env = MujocoSO101Env(action_max=ca["action_max"], dq_max=ca["dq_max"],
+    env = MujocoSO101Env(action_max=ca["action_max"],
                          safety_delta=ca["safety_delta"], seed=args.seed)
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     tag = args.name if args.step is None else f"{args.name}_{args.step:07d}"

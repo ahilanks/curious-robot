@@ -55,7 +55,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from model.state_encoder import WorldModel                       # noqa: E402
-from src.train import Actor, curiosity_reward, encode_obs, resolve_ckpt   # noqa: E402
+from src.train import Actor, curiosity_reward, encode_obs, load_actor_state, resolve_ckpt   # noqa: E402
 from env.hardware_env import JOINT_HIGH, JOINT_LOW               # noqa: E402
 
 # Gravity-stable fold for torque-off rest (≈ where the arm settles when limp; pan/roll/
@@ -86,7 +86,7 @@ class Policy:
                              history_size=self.H).to(device)
         self.wm.load_state_dict(ck["wm"]); self.wm.eval()
         self.actor = Actor(self.wm.z_dim, self.a_dim).to(device)
-        self.actor.load_state_dict(ck["actor"]); self.actor.eval()
+        load_actor_state(self.actor, ck["actor"]); self.actor.eval()
         self.step_id = step_id
         self.path = str(ckpt_path)
 
@@ -443,6 +443,9 @@ def main(args):
         for k in range(1, 21):                              # ~2 s interpolated fold (paced)
             env.bus.write_goal(q_now + (park - q_now) * k / 20.0)
             time.sleep(0.1)
+            env.bus.read()   # refresh _last_pos: max_step_ticks clamps goals to +/-0.46 rad
+                             # of the last READ — without this the >1 rad fold stops short
+                             # and torque-off would drop the arm from a non-park pose
         env.bus.disable_torque()
         dead_polls = 0
         while True:
@@ -477,14 +480,46 @@ def main(args):
             env.step_block_wait()
         log(out_dir, "PRESS WATCHDOG — retreated toward midpoints")
 
+    # --- deferred per-decision bookkeeping (jerk fix #3, 2026-06-11) ---------------
+    # Curiosity + reward + chunk.add for decision d need nothing from block d+1, so
+    # they run while the arm is already executing it — the only serial work left
+    # between blocks is encode + sample (~18 ms vs ~25 ms). This is NOT action
+    # pipelining: every action is still sampled from the freshest observation.
+    pend = None          # (hist_z, hist_a, z_next, r_safe, px, prop, a_flat, wm)
+
+    def flush_pending():
+        """Run the deferred curiosity/reward/buffer write for the stashed decision.
+        MUST be called before any history reset, chunk dump on a gate, or shutdown,
+        so the transition lands in the chunk and is_start ordering stays exact. The
+        generating wm is stored in the stash, so policy swaps can't misattribute it."""
+        nonlocal pend, ep_len, ep_ret, is_start
+        if pend is None:
+            return
+        p_hz, p_ha, p_zn, p_rs, p_px, p_prop, p_a, p_wm = pend
+        pend = None
+        r_cur = float(curiosity_reward(p_wm, p_hz, p_ha, p_zn)[0])
+        reward = args.lambda_safe * p_rs + args.lambda_cur * float(np.log1p(r_cur))
+        recent_r.append(reward)
+        recent_rcur.append(r_cur)
+        ep_len += 1
+        ep_ret += reward
+        done = float(ep_len >= args.episode_steps)
+        chunk.add(p_px, p_prop, p_a, reward, done, is_start)
+        is_start = done > 0
+        if done:
+            wlog({"episode/return": ep_ret, "episode/len": ep_len})
+            ep_len = 0
+            ep_ret = 0.0
+
     # =========================================================== the forever loop
     while not stop["flag"]:
         cur_px, cur_prop = obs["image"], obs["proprio"]
 
         with torch.no_grad():
-            a, _, _ = acting.actor.sample(z)
+            a = acting.actor(z)        # deterministic policy (stochasticity removed 2026-06-12)
         if not torch.isfinite(a).all():                     # NaN policy: instant reject
             log(out_dir, "NON-FINITE ACTION — reverting to champion")
+            flush_pending()
             if probation is not None:
                 rejected.add(acting.step_id); rejects += 1; probation = None
                 if fetcher is not None:
@@ -498,24 +533,13 @@ def main(args):
         a_env = a.detach().cpu().numpy().reshape(1, args.action_block, 6)
 
         env.step_block_async(a_env)
+        flush_pending()                # decision d-1's bookkeeping overlaps block d's motion
         obs_next, sub_infos = env.step_block_wait()
 
         r_safe = float(np.mean([i["safety_reward"] for i in sub_infos]))
         z_next = encode_obs(acting.wm, obs_next["image"], obs_next["proprio"], device)
-        r_cur = float(curiosity_reward(acting.wm, hist_z, hist_a, z_next)[0])
-        reward = args.lambda_safe * r_safe + args.lambda_cur * float(np.log1p(r_cur))
-        recent_r.append(reward)
-        recent_rcur.append(r_cur)
-
-        ep_len += 1
-        ep_ret += reward
-        done = float(ep_len >= args.episode_steps)
-        chunk.add(cur_px[0], cur_prop[0], a_env.reshape(-1), reward, done, is_start)
-        is_start = done > 0
-        if done:
-            wlog({"episode/return": ep_ret, "episode/len": ep_len})
-            ep_len = 0
-            ep_ret = 0.0
+        pend = (hist_z, hist_a, z_next, r_safe, cur_px[0], cur_prop[0],
+                a_env.reshape(-1), acting.wm)
         decisions += 1
         z = z_next
         hist_z = torch.cat([hist_z[1:], z_next.unsqueeze(0)], 0)
@@ -560,6 +584,7 @@ def main(args):
         rsafe_window.append(r_safe)
 
         if press_run >= args.press_decisions:
+            flush_pending()
             retreat()
             press_run = 0
             presses += 1
@@ -589,6 +614,7 @@ def main(args):
                     discard_candidate(acting)
                     wlog({"probation/rejects": rejects, "probation/last_reject_step": acting.step_id,
                           "probation/sat": sat, "probation/r_safe": rs})
+                    flush_pending()
                     acting = champion
                     obs = reset_history("reject")
                 else:
@@ -614,6 +640,7 @@ def main(args):
             if hot_polls >= 2:
                 hot_polls = 0
                 wlog({"watchdog/temp_trips": 1, "temps/max_at_trip": float(max(temps))})
+                flush_pending()
                 if len(chunk) >= args.min_chunk:
                     uploader.submit(chunk.dump()); chunks_done += 1
                 park_and_rest(temps)
@@ -627,6 +654,7 @@ def main(args):
             if cand is not None:
                 step, cpath = cand
                 if step > champion.step_id and step not in rejected:
+                    flush_pending()
                     acting = Policy(cpath, step, device)
                     probation = {"left": args.probation_steps}
                     log(out_dir, "candidate on probation", step=step,
@@ -669,6 +697,7 @@ def main(args):
         obs = obs_next
 
     # ----------------------------------------------------------------- shutdown
+    flush_pending()
     if len(chunk):
         uploader.submit(chunk.dump())
     deadline = time.time() + 120                            # let pending uploads finish
@@ -689,9 +718,9 @@ def parse_args():
     # frozen campaign config (round_runbook.md) — change only between campaigns
     p.add_argument("--action-max", type=float, default=0.1)
     p.add_argument("--action-block", type=int, default=5)
-    p.add_argument("--lambda-safe", type=float, default=0.1)
-    p.add_argument("--lambda-cur", type=float, default=20.0)
-    p.add_argument("--safety-delta", type=float, default=15.0)
+    p.add_argument("--lambda-safe", type=float, default=2.2)   # 2026-06-12 real-arm calibration
+    p.add_argument("--lambda-cur", type=float, default=15.0)   # 2026-06-11: 20 -> 15 (sweep candidate)
+    p.add_argument("--safety-delta", type=float, default=9.0)  # benign<=7.4 / bad>=10.7 (true-dt, P8/D16)
     p.add_argument("--episode-steps", type=int, default=200, help="bookkeeping truncation")
     # chunking / transport
     p.add_argument("--chunk-steps", type=int, default=1000)
@@ -703,7 +732,11 @@ def parse_args():
     # acceptance gate
     p.add_argument("--probation-steps", type=int, default=30)
     p.add_argument("--probation-sat", type=float, default=0.90, help="mean |a| reject threshold")
-    p.add_argument("--probation-rsafe", type=float, default=-5.0, help="mean r_safe reject threshold")
+    p.add_argument("--probation-rsafe", type=float, default=-0.05,
+                   help="mean raw r_safe reject threshold over the probation window. Under delta=9 "
+                        "benign decisions score exactly 0, so any sustained negative mean is real: "
+                        "-0.05 trips on ~2+ bad decisions per 30 while one external snag passes "
+                        "(the old -5.0 was unreachable dead code)")
     # watchdogs
     p.add_argument("--temp-gate", type=float, default=50.0)
     p.add_argument("--temp-resume", type=float, default=42.0)

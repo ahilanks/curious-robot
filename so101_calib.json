@@ -1,11 +1,25 @@
 {
-  "offsets_ticks": [2013, 1981, 2246, 1941, 1991, 2010],
-  "signs": [1, 1, 1, 1, 1, 1],
+  "offsets_ticks": [
+    2013,
+    1981,
+    2246,
+    1941,
+    1991,
+    2010
+  ],
+  "signs": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+  ],
   "vel_scale": 0.00153,
-  "p_gain": 16,
-  "d_gain": 32,
+  "p_gain": 8,
+  "d_gain": 16,
   "goal_speed": 2400,
-  "pace_dt": 0.030,
+  "pace_dt": 0.03,
   "acceleration": 0,
   "kt": 10.0
 }

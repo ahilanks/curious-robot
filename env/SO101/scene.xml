@@ -27,7 +27,10 @@
     <default class="sts3215">
       <geom contype="0" conaffinity="0"/>
       <joint damping="0.60" frictionloss="0.052" armature="0.028"/>
-      <position kp="998.22" kv="2.731" forcerange="-2.94 2.94"/>
+      <!-- kp from the RBE501 DC-motor model at firmware P_gain=8 (2026-06-12, was
+           998.22 at P=16; kp scales linearly with P). kv = Km*Kb/R is back-EMF
+           damping only — independent of the firmware P/D registers. -->
+      <position kp="499.11" kv="2.731" forcerange="-2.94 2.94"/>
     </default>
     <default class="object">
       <!-- Softer contacts: solref="0.02 1" gives a 20 ms time constant (vs 5 ms),

@@ -15,7 +15,8 @@ Four things make it match the sim distribution the safe15 weights were trained o
      OBSERVATION distribution the sim-trained encoder saw (sim's `data.actuator_force`
      saturates ~87% of moving samples; the recompute ~90% — measured 2026-06-03).
    - r_safe uses tau_meas = kt * Present_Current (measured motor effort, joint-frame sign,
-     EMA-filtered like qdot). The recompute is a COUNTERFACTUAL on hardware: kp=998 saturates
+     RAW — the 0.5-EMA on qdot/tau was removed 2026-06-11, sim-parity: sim is unfiltered).
+     The recompute is a COUNTERFACTUAL on hardware: kp=998 saturates
      at 0.19 deg of tracking error, so a P=16 servo chasing 30 ms goals pegs |tau|=tau_max
      whenever moving, and every arrival/stall (qdot drops while error > 0.2 deg) scored as a
      max-weight "fight" — that artifact dominated the sim->real r_safe gap (-35 vs -190 at
@@ -56,6 +57,7 @@ in for the real arm; this module imports neither lerobot nor mujoco at top level
 from __future__ import annotations
 
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Protocol
@@ -71,8 +73,10 @@ _INFO_KEYS = ("applied_torque", "qvel", "qvel_prev", "qpos", "safety_reward",
               "object_contacts", "table_contacts", "object_motion", "tau_meas")
 
 # --- SO-101 actuation constants (env/SO101/so101_new_calib.xml) ------------------
-# <position kp="998.22" kv="2.731" ...> on every joint; per-joint forcerange +/-3.35.
-KP = 998.22
+# <position kp="499.11" kv="2.731" ...> on every joint; per-joint forcerange +/-3.35.
+# kp from the RBE501 DC-motor model at firmware P_gain=8 (2026-06-12; linear in P,
+# was 998.22 at P=16). kv is back-EMF damping, independent of firmware P/D.
+KP = 499.11
 KV = 2.731
 N_DOF = 6
 TAU_MAX = np.array([3.35] * N_DOF, dtype=np.float32)                 # actuator_forcerange[:,1]
@@ -95,16 +99,13 @@ class HardwareSO101Env:
         overhead_resolution: int = 256,
         frame_skip: int = 6,              # accepted for parity; control_dt is fixed to DT_SAFE
         action_max: float = 0.3,
-        dq_max: float = 100.0,
-        safety_delta: float = 15.0,
+        safety_delta: float = 9.0,        # re-pinned 2026-06-12 from real-arm calibration
         seed: int = 0,
         threads: int = 0,                 # accepted for parity; unused
         bus: "ServoBus | None" = None,
         camera: "Camera | None" = None,
         control_dt: float = DT_SAFE,
-        vel_lowpass: float = 0.5,         # EMA on qdot (raw servo velocity is noisy -> qddot blows up r_safe)
-        cur_lowpass: float | None = None,  # EMA on measured torque; None = vel_lowpass so tau_meas and the
-    ):                                     # qddot it multiplies share a time constant (mismatch can flip -tau*qddot)
+    ):
         if n_envs != 1:
             raise ValueError(f"HardwareSO101Env is a single physical arm; n_envs must be 1 (got {n_envs})")
         self.n_envs = 1
@@ -113,11 +114,8 @@ class HardwareSO101Env:
         self.wrist_resolution = wrist_resolution
         self.overhead_resolution = overhead_resolution
         self.action_max = float(action_max)
-        self.dq_max = float(dq_max)
         self.safety_delta = float(safety_delta)
         self.dt_safe = float(control_dt)
-        self.vel_lowpass = float(vel_lowpass)
-        self.cur_lowpass = float(cur_lowpass) if cur_lowpass is not None else float(vel_lowpass)
 
         self.bus = bus if bus is not None else _default_bus()
         self.camera = camera if camera is not None else _default_camera(wrist_resolution)
@@ -126,24 +124,24 @@ class HardwareSO101Env:
         self._pending = None
         self._q = np.zeros(N_DOF, np.float32)            # last commanded-from joint angles (pre-step q)
         self._qd_prev = np.zeros(N_DOF, np.float32)      # qdot at the previous control-step read
-        self._qd_filt = np.zeros(N_DOF, np.float32)      # EMA velocity state
-        self._tau_filt = np.zeros(N_DOF, np.float32)     # EMA measured-torque state (kt * Present_Current)
+        self._t_read_prev = None                         # wall time of that read (true-dt qddot)
         self._last_frame = None
         self._ctrl_steps = 0                             # control-step counter (for SOARM_DEBUG prints)
         self._debug_every = int(os.environ.get("SOARM_DEBUG", "0"))   # print both r_safe variants every N steps
 
     # --- observation assembly -------------------------------------------------
     def _read(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Read (q, qdot, tau_meas) in SI (rad, rad/s, N*m); low-pass qdot and tau_meas
-        with matched time constants. tau_meas is clipped to +/-tau_max so the r_safe
-        weight |tau|/tau_max stays <= 1 (strict sim form parity)."""
+        """Read (q, qdot, tau_meas) in SI (rad, rad/s, N*m), RAW — no filtering. (The
+        0.5-EMA on qdot/tau was removed 2026-06-11 by request: sim is unfiltered, so raw
+        keeps obs parity in phase/lag; the cost is Present_Speed quantization noise in
+        qddot — any deadband re-pin must be derived on RAW signals, whose -tau*qddot tail
+        sits ~3.5x higher than the old filtered one.) tau_meas is clipped to +/-tau_max
+        so the r_safe weight |tau|/tau_max stays <= 1 (strict sim form parity)."""
         q, qd_raw, tau_raw = self.bus.read()
         q = np.asarray(q, np.float32)
         qd_raw = np.asarray(qd_raw, np.float32)
         tau_raw = np.asarray(tau_raw, np.float32)
-        self._qd_filt = self.vel_lowpass * qd_raw + (1.0 - self.vel_lowpass) * self._qd_filt
-        self._tau_filt = self.cur_lowpass * tau_raw + (1.0 - self.cur_lowpass) * self._tau_filt
-        return q, self._qd_filt.copy(), np.clip(self._tau_filt, -TAU_MAX, TAU_MAX).astype(np.float32)
+        return q, qd_raw, np.clip(tau_raw, -TAU_MAX, TAU_MAX).astype(np.float32)
 
     @staticmethod
     def _obs(image: np.ndarray, q: np.ndarray, qd: np.ndarray, tau: np.ndarray) -> dict:
@@ -154,11 +152,10 @@ class HardwareSO101Env:
     # --- lifecycle: READ-ONLY reset (never commands the arm) -------------------
     def reset(self) -> dict[str, np.ndarray]:
         """Read current state; do NOT move the arm. Returns stacked (n_envs=1) obs."""
-        q, qd_raw, tau_raw = self.bus.read()             # seed the EMA filters from the live reading
-        self._qd_filt = np.asarray(qd_raw, np.float32).copy()
-        self._tau_filt = np.asarray(tau_raw, np.float32).copy()
+        q, qd_raw, _ = self.bus.read()
         self._q = np.asarray(q, np.float32)
-        self._qd_prev = self._qd_filt.copy()
+        self._qd_prev = np.asarray(qd_raw, np.float32).copy()
+        self._t_read_prev = None                          # next step's qddot falls back to dt_safe
         tau = np.clip(-KV * self._qd_prev, -TAU_MAX, TAU_MAX).astype(np.float32)  # goal==q => tau=-kv*qdot
         self._last_frame = self.camera.read()
         o = self._obs(self._last_frame, self._q, self._qd_prev, tau)
@@ -173,13 +170,21 @@ class HardwareSO101Env:
     # --- one paced control step ----------------------------------------------
     def _control_step(self, action: np.ndarray) -> tuple[dict, dict]:
         a = np.clip(np.asarray(action, np.float32), -1.0, 1.0)
-        dq = np.clip(a * self.action_max, -self.dq_max, self.dq_max)
-        goal = np.clip(self._q + dq, JOINT_LOW, JOINT_HIGH).astype(np.float32)   # delta-target, == SOArmAdapter
+        goal = np.clip(self._q + a * self.action_max, JOINT_LOW, JOINT_HIGH).astype(np.float32)   # delta-target, == SOArmAdapter
 
         t_start = time.perf_counter()
         self.bus.write_goal(goal)                         # servo's internal PD realizes the target
-        _sleep_until(t_start + self.dt_safe)              # hold dt_safe so qddot finite-diff matches sim
-        q_new, qd_new, tau_meas = self._read()            # read AFTER the wait -> read-to-read == dt_safe
+        _sleep_until(t_start + self.dt_safe)              # pace the command cadence to dt_safe
+        q_new, qd_new, tau_meas = self._read()            # read AFTER the wait
+
+        # TRUE-dt qddot (2026-06-12): the real read-to-read window is ~44 ms (camera/
+        # inference ride between reads), not the 30 ms design dt. The hardcoded divisor
+        # inflated qddot ~1.5x; delta=9 was calibrated on TRUE-dt args, so measure the
+        # window. Clamped [0.5x, 4x] dt_safe against reconnect/stall outliers.
+        t_read = time.perf_counter()
+        dt_meas = (t_read - self._t_read_prev) if self._t_read_prev is not None else self.dt_safe
+        dt_meas = float(np.clip(dt_meas, 0.5 * self.dt_safe, 4.0 * self.dt_safe))
+        self._t_read_prev = t_read
 
         # OBS torque: the sim PD-law recompute (distribution-match for the sim-trained
         # encoder; see module docstring #1). NOT used for the reward.
@@ -187,9 +192,9 @@ class HardwareSO101Env:
         # REWARD torque: measured motor effort (kt * Present_Current). Its sign tracks the
         # real drive direction, so servo arrivals/stalls are not billed as max-torque fights.
         r_safe = float(safety_reward_np(tau_meas, qd_new, self._qd_prev, TAU_MAX,
-                                        dt_safe=self.dt_safe, delta=self.safety_delta))
+                                        dt_safe=dt_meas, delta=self.safety_delta))
         r_safe_rec = float(safety_reward_np(tau, qd_new, self._qd_prev, TAU_MAX,
-                                            dt_safe=self.dt_safe, delta=self.safety_delta))
+                                            dt_safe=dt_meas, delta=self.safety_delta))
         self._last_frame = self.camera.read()
         self._ctrl_steps += 1
         if self._debug_every and self._ctrl_steps % self._debug_every == 0:
@@ -458,7 +463,7 @@ class FeetechBus:
                 cmag = c & 0x7FFF
                 cur.append(cmag if (ld & self._LOAD_SIGN_BIT) else -cmag)
             else:
-                cur.append(0)                                # dropped read -> 0 torque (benign; EMA smooths)
+                cur.append(0)                                # dropped read -> 0 torque for one step (benign)
         pos = np.asarray(pos, np.float64); spd = np.asarray(spd, np.float64)
         cur = np.asarray(cur, np.float64)
         self._last_pos = pos.copy()                          # refresh last-good
@@ -510,7 +515,22 @@ class FeetechBus:
 
 
 class UsbCamera:
-    """Wrist USB camera via OpenCV; returns (hw, hw, 3) uint8 RGB."""
+    """Wrist USB camera via OpenCV; returns (hw, hw, 3) uint8 RGB.
+
+    FREE-RUNNING GRAB THREAD (jerk fix #1, 2026-06-11): cv2's cap.read() blocks on the
+    next sensor frame (~33 ms at 30 fps), and the old synchronous grab sat INSIDE every
+    control substep — the single biggest reason the 30 ms design period ran at ~74 ms
+    (bench `jerk_safe15_100.npz`, logistics 2026-06-11). A daemon thread now grabs
+    frames continuously into a latest-frame slot; read() returns the newest frame in
+    ~0 ms. Frame age stays bounded by one sensor interval (<=33 ms) — no staler than
+    the old post-wait grab, the control loop just stops paying for it.
+    SOARM_SYNC_CAM=1 restores the legacy blocking grab (A/B escape hatch).
+
+    Failure semantics match the old loud-fail: transient misses are retried silently
+    (a single miss killed a 24/7 collector run on 2026-06-06), but ~3 s of consecutive
+    misses marks the camera dead and the next read() raises."""
+
+    _DEAD_AFTER_MISSES = 30           # ~3 s at the 0.1 s retry cadence -> loud failure
 
     def __init__(self, index: int = 0, hw: int = 224):
         import cv2
@@ -519,21 +539,66 @@ class UsbCamera:
         self.cap = cv2.VideoCapture(index)
         if not self.cap.isOpened():
             raise RuntimeError(f"UsbCamera: could not open video index {index}")
+        self._sync = bool(os.environ.get("SOARM_SYNC_CAM"))
+        self._lock = threading.Lock()
+        self._latest = None                 # newest raw BGR frame (grab thread only writes)
+        self._dead = None                   # error string once the grab thread gives up
+        self._stop = False
+        if not self._sync:
+            self._thread = threading.Thread(target=self._grab_loop, daemon=True,
+                                            name="UsbCamera-grab")
+            self._thread.start()
+            deadline = time.time() + 5.0    # block construction until the first frame
+            while time.time() < deadline:
+                with self._lock:
+                    if self._latest is not None or self._dead:
+                        break
+                time.sleep(0.01)
+            with self._lock:
+                if self._latest is None:
+                    self._stop = True
+                    raise RuntimeError(self._dead or "UsbCamera: no frame within 5 s of open")
 
-    def read(self) -> np.ndarray:
-        # USB cams drop the odd frame; retry briefly before treating it as fatal
-        # (a single miss killed a 24/7 collector run on 2026-06-06).
-        for _ in range(3):
-            ok, frame = self.cap.read()
-            if ok:
-                break
-            time.sleep(0.1)
-        if not ok:
-            raise RuntimeError("UsbCamera: frame grab failed")
+    def _grab_loop(self) -> None:
+        misses = 0
+        while not self._stop:
+            ok, frame = self.cap.read()     # cap.read() allocates a fresh array per frame
+            if not ok:
+                misses += 1
+                if misses >= self._DEAD_AFTER_MISSES:
+                    with self._lock:
+                        self._dead = "UsbCamera: frame grab failed (grab thread gave up)"
+                    return
+                time.sleep(0.1)
+                continue
+            misses = 0
+            with self._lock:
+                self._latest = frame
+
+    def _convert(self, frame: np.ndarray) -> np.ndarray:
         frame = self._cv2.resize(frame, (self.hw, self.hw))
         return self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
 
+    def read(self) -> np.ndarray:
+        if self._sync:                      # legacy blocking grab (SOARM_SYNC_CAM=1)
+            for _ in range(3):
+                ok, frame = self.cap.read()
+                if ok:
+                    break
+                time.sleep(0.1)
+            if not ok:
+                raise RuntimeError("UsbCamera: frame grab failed")
+            return self._convert(frame)
+        with self._lock:
+            frame, dead = self._latest, self._dead
+        if dead:
+            raise RuntimeError(dead)
+        return self._convert(frame)         # resize/convert outside the lock (new arrays)
+
     def close(self) -> None:
+        self._stop = True
+        if getattr(self, "_thread", None) is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
         if hasattr(self, "cap"):
             self.cap.release()
 
@@ -643,8 +708,7 @@ def _self_test() -> None:
     a_one = np.full(N_DOF, 0.5, np.float32)
     o_one, info = env._control_step(a_one)
     assert "tau_meas" in info and "r_safe_recompute" in info
-    goal_exp = np.clip(q_before + np.clip(np.clip(a_one, -1, 1) * env.action_max,
-                                          -env.dq_max, env.dq_max), JOINT_LOW, JOINT_HIGH)
+    goal_exp = np.clip(q_before + np.clip(a_one, -1, 1) * env.action_max, JOINT_LOW, JOINT_HIGH)
     tau_exp = np.clip(KP * (goal_exp - info["qpos"]) - KV * info["qvel"], -TAU_MAX, TAU_MAX)
     assert np.allclose(info["applied_torque"], tau_exp, atol=1e-5), \
         "proprio torque must stay the sim PD-law recompute"

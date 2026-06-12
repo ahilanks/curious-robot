@@ -22,7 +22,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from model.state_encoder import WorldModel       # noqa: E402
 from env.mujoco_env import MujocoSO101Env         # noqa: E402
-from src.train import Actor, encode_obs, resolve_ckpt   # noqa: E402
+from src.train import Actor, encode_obs, load_actor_state, resolve_ckpt   # noqa: E402
 
 
 @torch.no_grad()
@@ -31,7 +31,7 @@ def collect(env, wm, actor, n_dof, action_block, n_steps, device):
     z = encode_obs(wm, obs["image"][None], obs["proprio"][None], device)[0]
     zs, acts = [z], []
     for _ in range(n_steps):
-        a, _, _ = actor.sample(z[None])
+        a = actor(z[None])
         acts.append(a[0])
         a_env = a[0].cpu().numpy().reshape(action_block, n_dof)
         for k in range(action_block):
@@ -92,8 +92,8 @@ def main():
                     history_size=ca["history_size"]).to(device)
     wm.load_state_dict(ckpt["wm"]); wm.eval()
     actor = Actor(wm.z_dim, n_dof * ca["action_block"]).to(device)
-    actor.load_state_dict(ckpt["actor"]); actor.eval()
-    env = MujocoSO101Env(action_max=ca["action_max"], dq_max=ca["dq_max"],
+    load_actor_state(actor, ckpt["actor"]); actor.eval()
+    env = MujocoSO101Env(action_max=ca["action_max"],
                          safety_delta=ca["safety_delta"], seed=args.seed)
 
     Z, A = collect(env, wm, actor, n_dof, ca["action_block"], args.steps, device)
