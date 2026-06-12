@@ -38,7 +38,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from lewm.module import SIGReg                            # noqa: E402
 from model.state_encoder import WorldModel                # noqa: E402
 from src.train import (Actor, ReplayBuffer, TwinQ, collapse_metrics,   # noqa: E402
-                       resolve_ckpt, sac_update, save_and_upload, wm_update)
+                       load_actor_state, resolve_ckpt, sac_update, save_and_upload, wm_update)
 
 try:
     import wandb
@@ -154,14 +154,12 @@ def main(args):
     critic_tgt.load_state_dict(critic.state_dict())
     for p in critic_tgt.parameters():
         p.requires_grad_(False)
-    log_alpha = torch.tensor(float(np.log(args.alpha)), device=device)
     if ck is not None:
         wm.load_state_dict(ck["wm"])
-        actor.load_state_dict(ck["actor"])
+        load_actor_state(actor, ck["actor"])
         critic.load_state_dict(ck["critic"])
         critic_tgt.load_state_dict(ck["critic_tgt"])
-        log_alpha = ck["log_alpha"].to(device)
-        print(f"[resume] loaded wm+actor+critic+critic_tgt+log_alpha (h_fwd={h_fwd})", flush=True)
+        print(f"[resume] loaded wm+actor+critic+critic_tgt (h_fwd={h_fwd})", flush=True)
     actor_opt = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
     critic_opt = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
     wm_opt = torch.optim.AdamW([p for p in wm.parameters() if p.requires_grad],
@@ -192,7 +190,7 @@ def main(args):
     def ckpt_state(step):   # the EXACT 8 keys train.py saves -> redeploy loads cleanly
         return {"step": step, "wm": wm.state_dict(), "actor": actor.state_dict(),
                 "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
-                "log_alpha": log_alpha.detach().cpu(), "h_fwd": h_fwd, "args": saved_args}
+                "h_fwd": h_fwd, "args": saved_args}
 
     # --- env-free learner loop: WM before SAC each step (SAC re-encodes under the
     #     fresh encoder); h_fwd stays pinned (no flatline curriculum offline) ---
@@ -209,7 +207,7 @@ def main(args):
                 wm.eval()
                 n_wm += 1
         res = sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
-                         log_alpha, args, step, device)
+                         args, step, device)
         if res is not None:
             last_sac = (res["critic_loss"], res["actor_loss"])
             last_zb = res["zb"]
@@ -217,8 +215,7 @@ def main(args):
 
         if step % args.log_every == 0:
             d = {"buffer/transitions": buf.total, "wm/h_fwd": h_fwd,
-                 "perf/steps_per_sec": (step + 1) / (time.time() - t0),
-                 "sac/alpha": float(log_alpha.exp().item())}
+                 "perf/steps_per_sec": (step + 1) / (time.time() - t0)}
             if last_wm is not None:
                 d.update({"wm/pred_loss": last_wm[0], "wm/sigreg": last_wm[1],
                           "wm/identity_baseline": last_wm[2]})
@@ -290,7 +287,6 @@ def parse_args():
     p.add_argument("--wm-dropout", type=float, default=None)
     # SAC (defaults = train.py's except the fine-tune LRs)
     p.add_argument("--gamma", type=float, default=0.9)
-    p.add_argument("--alpha", type=float, default=0.2, help="fixed entropy temperature (cold starts)")
     p.add_argument("--tau", type=float, default=0.005)
     p.add_argument("--actor-lr", type=float, default=1e-4,
                    help="fine-tune default (train.py uses 3e-4)")
