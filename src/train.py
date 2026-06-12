@@ -83,11 +83,17 @@ def load_actor_state(actor, sd):
 
 
 class TwinQ(nn.Module):
-    def __init__(self, z_dim, a_dim, hidden=256):
+    """Twin Q critics. n_out=1 is the scalar critic; n_out=K (--multihead-q) gives one
+    head per weighted reward component, each trained on its own per-component TD target
+    with the SHARED next action — the actor still maximizes the sum over heads, so the
+    optimum matches the scalar critic; the heads exist to make the value decomposition
+    inspectable (which reward component is steering the policy)."""
+
+    def __init__(self, z_dim, a_dim, hidden=256, n_out=1):
         super().__init__()
         mk = lambda: nn.Sequential(nn.Linear(z_dim + a_dim, hidden), nn.ReLU(),
                                    nn.Linear(hidden, hidden), nn.ReLU(),
-                                   nn.Linear(hidden, 1))
+                                   nn.Linear(hidden, n_out))
         self.q1, self.q2 = mk(), mk()
 
     def forward(self, z, a):
@@ -102,26 +108,29 @@ class ReplayBuffer:
     current WM at sample time, so the co-trained encoder can drift without staleness.
     PER priority = curiosity surprise (raw 1-step prediction error)."""
 
-    def __init__(self, n_envs, cap_per_env, img_hw, a_dim, prop_dim, device):
+    def __init__(self, n_envs, cap_per_env, img_hw, a_dim, prop_dim, device, n_comp=0):
         self.n_envs, self.C, self.device = n_envs, cap_per_env, device
         s = (n_envs, cap_per_env)
         self.pixels = np.zeros((*s, img_hw, img_hw, 3), np.uint8)
         self.proprio = np.zeros((*s, prop_dim), np.float32)
         self.action = np.zeros((*s, a_dim), np.float32)
         self.r = np.zeros(s, np.float32)
+        self.rc = np.zeros((*s, n_comp), np.float32) if n_comp else None   # per-component rewards (--multihead-q)
         self.d = np.zeros(s, np.float32)
         self.is_start = np.zeros(s, bool)
         self.prio = np.zeros(s, np.float64)
         self.head = np.zeros(n_envs, np.int64)
         self.count = np.zeros(n_envs, np.int64)
 
-    def add(self, pixels, proprio, action, r, d, is_start, prio):
+    def add(self, pixels, proprio, action, r, d, is_start, prio, rc=None):
         for e in range(self.n_envs):
             i = self.head[e]
             self.pixels[e, i] = pixels[e]
             self.proprio[e, i] = proprio[e]
             self.action[e, i] = action[e]
             self.r[e, i] = r[e]
+            if self.rc is not None:
+                self.rc[e, i] = rc[e]
             self.d[e, i] = d[e]
             self.is_start[e, i] = is_start[e]
             self.prio[e, i] = prio[e]
@@ -162,13 +171,16 @@ class ReplayBuffer:
         w = (len(e_all) * probs[sel]) ** (-per_beta)
         w = (w / w.max()).astype(np.float32)
         t = lambda x: torch.as_tensor(x, device=self.device)
-        return {
+        out = {
             "px": self.pixels[e, i], "prop": self.proprio[e, i],
             "px_n": self.pixels[e, ni], "prop_n": self.proprio[e, ni],
             "a": t(self.action[e, i]), "r": t(self.r[e, i])[:, None],
             "d": t(self.d[e, i])[:, None], "w": t(w)[:, None],
             "e": e, "i": i,                          # for optional TD-error priority writeback
         }
+        if self.rc is not None:
+            out["rc"] = t(self.rc[e, i])             # (B, K) per-component rewards
+        return out
 
     def update_priorities(self, e, i, prio):
         """Overwrite priorities of sampled transitions (used by --per-priority td)."""
@@ -204,6 +216,19 @@ class ReplayBuffer:
         ee = e[:, None].repeat(T, 1)
         return (self.pixels[ee, idx], self.proprio[ee, idx],
                 torch.as_tensor(self.action[ee, idx], device=self.device))
+
+
+REWARD_COMPONENTS = ("cur", "safe", "rate", "energy")   # --multihead-q head order
+
+
+def scrub_torque_obs(obs, n_dof):
+    """--no-torque-obs: zero the u^app slice of proprio in place (obs -> [q, qd, 0]).
+    Keeps the proprio/encoder shapes (old ckpts still load) while removing the channel
+    that is a near-constant saturated sign bit on hardware (2026-06-11: 96-97% of
+    joint-samples pegged at +/-3.35 under the kp-law recompute) and mostly saturated
+    in sim too — the main sim->real obs-distribution mismatch."""
+    obs["proprio"][..., 2 * n_dof:3 * n_dof] = 0.0
+    return obs
 
 
 # ------------------------------------------------------------------- WM helpers
@@ -285,21 +310,26 @@ def sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
         znb = encode_obs(wm, b["px_n"], b["prop_n"], device)
         with torch.no_grad():
             q1n, q2n = critic_tgt(znb, actor(znb))
-            y = b["r"] + (1 - b["d"]) * args.gamma * torch.min(q1n, q2n)
+            # scalar critic: (B,1) target as before. multihead: per-head TD targets from
+            # the per-component rewards, min-over-twins applied per head (pessimism per
+            # component); the shared next action keeps the heads' sum == the scalar value.
+            y = b.get("rc", b["r"]) + (1 - b["d"]) * args.gamma * torch.min(q1n, q2n)
         q1, q2 = critic(zb, b["a"])
-        critic_loss = (b["w"] * ((q1 - y).pow(2) + (q2 - y).pow(2))).mean()
+        critic_loss = (b["w"] * ((q1 - y).pow(2) + (q2 - y).pow(2)).mean(-1, keepdim=True)).mean()
         critic_opt.zero_grad(); critic_loss.backward(); critic_opt.step()
         if args.per_priority == "td":   # ablation: replace curiosity priority with |TD error|
-            td = (0.5 * (q1 + q2) - y).abs().detach().squeeze(1).cpu().numpy()
+            td = (0.5 * (q1 + q2) - y).sum(-1).abs().detach().cpu().numpy()
             buf.update_priorities(b["e"], b["i"], td)
         q1p, q2p = critic(zb, actor(zb))
-        actor_loss = (-torch.min(q1p, q2p)).mean()
+        actor_loss = (-torch.min(q1p.sum(-1), q2p.sum(-1))).mean()   # sum heads, then twin-min (== old path at K=1)
         actor_opt.zero_grad(); actor_loss.backward(); actor_opt.step()
         with torch.no_grad():
             for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
                 pt.mul_(1 - args.tau).add_(args.tau * p)
         out = {"critic_loss": float(critic_loss.item()),
                "actor_loss": float(actor_loss.item()), "zb": zb.detach()}
+        if q1p.shape[-1] > 1:            # per-head mean Q: which component steers the policy
+            out["q_heads"] = (0.5 * (q1p + q2p)).mean(0).detach().cpu().numpy()
     return out
 
 
@@ -476,8 +506,9 @@ def main(args):
     z_dim = wm.z_dim
 
     actor = Actor(z_dim, a_dim).to(device)
-    critic = TwinQ(z_dim, a_dim).to(device)
-    critic_tgt = TwinQ(z_dim, a_dim).to(device)
+    n_q_out = len(REWARD_COMPONENTS) if args.multihead_q else 1
+    critic = TwinQ(z_dim, a_dim, n_out=n_q_out).to(device)
+    critic_tgt = TwinQ(z_dim, a_dim, n_out=n_q_out).to(device)
     critic_tgt.load_state_dict(critic.state_dict())
     for p in critic_tgt.parameters():
         p.requires_grad_(False)
@@ -514,7 +545,8 @@ def main(args):
             print(f"[frozen] WARNING: requested {args.total_steps} steps but the buffer holds {keep}/env; "
                   f"oldest will be overwritten. Split into shorter runs to keep all transitions.", flush=True)
         cap_per_env = max(cap_per_env, keep)
-    buf = ReplayBuffer(args.n_envs, cap_per_env, env.wrist_resolution, a_dim, prop_dim, device)
+    buf = ReplayBuffer(args.n_envs, cap_per_env, env.wrist_resolution, a_dim, prop_dim, device,
+                       n_comp=len(REWARD_COMPONENTS) if args.multihead_q else 0)
     print(f"[buffer] {args.n_envs} x {cap_per_env} = {args.n_envs * cap_per_env} transitions", flush=True)
 
     run_name = args.name
@@ -551,6 +583,8 @@ def main(args):
 
     # --- live per-env state (history is (H, n_envs, .) so resets touch one row) ---
     obs = env.reset()
+    if args.no_torque_obs:
+        scrub_torque_obs(obs, n_dof)
     z = encode_obs(wm, obs["image"], obs["proprio"], device)        # (n_envs, z_dim)
     hist_z = z.unsqueeze(0).repeat(H, 1, 1)
     hist_a = torch.zeros(H, args.n_envs, a_dim, device=device)
@@ -561,13 +595,17 @@ def main(args):
     h_fwd = resume_h_fwd if resume_h_fwd is not None else args.h_fwd_start   # curriculum horizon (resumed if warm-started)
     pred_hist = deque(maxlen=args.flatline_window)    # for the flatline bump trigger
     updates_at_stage = 0
+    prev_sub_a = np.zeros((args.n_envs, n_dof), np.float64)   # last sub-action of the previous block (action-rate boundary)
+    tau_max_arr = np.asarray(env.tau_max, np.float32)
     recent = {k: deque(maxlen=400) for k in
               ("r_cur", "r_safe", "cur_contrib", "contacts", "table_contacts",
-               "motion", "ret", "frac_block", "frac_table")}
+               "motion", "ret", "frac_block", "frac_table",
+               "rate", "rate2", "energy", "qd_mean", "tau_sat", "qd_rev",
+               "r_rate", "r_energy")}
     recent_mse = {k: deque(maxlen=2000) for k in ("mse_block", "mse_table", "mse_none")}
     t0 = time.time()
     last_wm = last_sac = None
-    last_zb = None
+    last_zb = last_qh = None
     video_on = imageio is not None and args.video_every > 0
     wrist_buf = deque(maxlen=args.video_steps)      # train-video clips (per-env frames, tiled)
     over_buf = deque(maxlen=args.video_steps)
@@ -578,6 +616,9 @@ def main(args):
                   if not args.no_hf else None)
         if loaded is not None:
             probe_px, probe_prop = loaded[0][:args.probe_size], loaded[1][:args.probe_size]
+            if args.no_torque_obs:               # probe obs must match the scrubbed training obs
+                probe_prop = probe_prop.copy()
+                probe_prop[..., 2 * n_dof:3 * n_dof] = 0.0
             print(f"[probe] loaded {len(probe_px)} uniform-pose obs from HF ({args.probe_id})", flush=True)
         else:
             print(f"[probe] HF probe '{args.probe_id}' unavailable; falling back to warmup-rollout probe",
@@ -589,7 +630,7 @@ def main(args):
         these GPU updates overlap the env workers rendering the next decision. Update
         count and schedule are identical to the serial loop; they just see the buffer
         minus the single in-flight transition (added after wait) -- negligible off-policy."""
-        nonlocal last_wm, last_sac, last_zb, updates_at_stage
+        nonlocal last_wm, last_sac, last_zb, last_qh, updates_at_stage
         # --- world-model co-training: autoregressive MSE rollout + beta*SIGReg ---
         if step >= args.start_steps and step % args.wm_update_every == 0:
             batch = buf.sample_wm(args.wm_batch_size, H + h_fwd)
@@ -613,6 +654,7 @@ def main(args):
         if res is not None:
             last_sac = (res["critic_loss"], res["actor_loss"])
             last_zb = res["zb"]
+            last_qh = res.get("q_heads")
         return h_fwd
 
     # graceful stop for data-collection runs: 1st Ctrl-C finishes the in-flight decision and
@@ -646,18 +688,53 @@ def main(args):
         if not args.frozen_policy:                # frozen: skip ALL gradient work (data collection only)
             h_fwd = learner_updates(step, h_fwd)
         obs, sub_infos = env.step_block_wait()
+        if args.no_torque_obs:
+            scrub_torque_obs(obs, n_dof)
 
-        # --- accumulate safety reward + interaction stats over the action_block ---
+        # --- accumulate safety reward + interaction + smoothness stats over the action_block ---
         r_safe = np.zeros(args.n_envs, np.float32)
         contacts = np.zeros(args.n_envs, np.float32)
         table_contacts = np.zeros(args.n_envs, np.float32)
         motion = np.zeros(args.n_envs, np.float32)
+        energy = np.zeros(args.n_envs, np.float32)      # mean_i |tau_i * qd_i| (mechanical power)
+        qd_mean = np.zeros(args.n_envs, np.float32)
+        tau_sat = np.zeros(args.n_envs, np.float32)
+        qd_rev = np.zeros(args.n_envs, np.float32)      # sign-flip fraction of qd between substeps
+        prev_qd = None
         for info in sub_infos:
             r_safe += info["safety_reward"]
             contacts += info["object_contacts"].astype(np.float32)
             table_contacts += info["table_contacts"].astype(np.float32)
             motion += info["object_motion"]
+            tau, qd = info["applied_torque"], info["qvel"]
+            energy += np.abs(tau * qd).mean(-1)
+            qd_mean += np.abs(qd).mean(-1)
+            tau_sat += (np.abs(tau) > 0.95 * tau_max_arr).mean(-1).astype(np.float32)
+            if prev_qd is not None:
+                qd_rev += ((qd * prev_qd) < 0).mean(-1).astype(np.float32)
+            prev_qd = qd
         r_safe /= args.action_block      # one r_safe per decision (README: Env(a_t) -> r_safe_t)
+        energy /= args.action_block
+        qd_mean /= args.action_block
+        tau_sat /= args.action_block
+        qd_rev /= max(args.action_block - 1, 1)
+
+        # --- action-rate (legged_gym-style smoothness): mean per-dim squared delta over
+        #     consecutive sub-actions, including the boundary pair with the previous
+        #     block's last sub-action. On an episode's first decision the boundary (and
+        #     the 2nd-order term spanning it) is masked out — never penalize the
+        #     cross-reset jump. Computed for every run (logged); enters the reward only
+        #     when --w-action-rate/--w-action-rate2 > 0. ---
+        seq = np.concatenate([prev_sub_a[:, None, :], a_env.astype(np.float64)], axis=1)  # (n_envs, 1+B, n_dof)
+        d1 = np.diff(seq, axis=1)                          # (n_envs, B, n_dof)
+        d2 = np.diff(seq, n=2, axis=1)                     # (n_envs, B-1, n_dof)
+        sq1, sq2 = (d1 ** 2).mean(-1), (d2 ** 2).mean(-1)  # per-pair, per-dim mean
+        m1, m2 = np.ones_like(sq1), np.ones_like(sq2)
+        m1[is_start, 0] = 0.0
+        m2[is_start, 0] = 0.0
+        rate = ((sq1 * m1).sum(1) / m1.sum(1)).astype(np.float32)
+        rate2 = ((sq2 * m2).sum(1) / np.maximum(m2.sum(1), 1.0)).astype(np.float32)
+        prev_sub_a = a_env[:, -1].astype(np.float64).copy()
 
         # freeze a FIXED diverse probe set (early warmup obs) so encoder/eff_rank_probe
         # measures encoder health independent of how narrow the policy's behavior gets.
@@ -672,7 +749,11 @@ def main(args):
         z_next = encode_obs(wm, obs["image"], obs["proprio"], device)
         r_cur = curiosity_reward(wm, hist_z, hist_a, z_next).cpu().numpy()        # (n_envs,) >= 0
         cur_term = args.lambda_cur * np.log1p(r_cur)         # lambda_cur * symlog(r_cur)  (r_cur>=0)
-        reward = args.lambda_safe * r_safe + cur_term        # r = lambda_safe*r_safe + lambda_cur*symlog(r_cur)
+        r_rate = -(args.w_action_rate * rate + args.w_action_rate2 * rate2)       # smoothness penalties (0 unless flagged)
+        r_energy = -args.w_energy * energy
+        safe_term = args.lambda_safe * r_safe
+        reward = safe_term + cur_term + r_rate + r_energy
+        comps = np.stack([cur_term, safe_term, r_rate, r_energy], -1).astype(np.float32)  # REWARD_COMPONENTS order
 
         # contact-conditioned curiosity MSE (r_cur = ||zhat-z||^2): is the model more
         # surprised poking a block than scraping the table or moving in free space?
@@ -689,11 +770,15 @@ def main(args):
         ep_ret += reward
         done = (ep_len >= args.max_episode_steps).astype(np.float32)
         buf.add(pixels=cur_px, proprio=cur_prop, action=a.detach().cpu().numpy(),
-                r=reward, d=done, is_start=is_start.copy(), prio=r_cur)
+                r=reward, d=done, is_start=is_start.copy(), prio=r_cur,
+                rc=comps if args.multihead_q else None)
         for key, val in (("r_cur", r_cur), ("r_safe", r_safe), ("cur_contrib", cur_term),
                          ("contacts", contacts), ("table_contacts", table_contacts),
                          ("motion", motion), ("ret", reward),
-                         ("frac_block", touch_block), ("frac_table", touch_table)):
+                         ("frac_block", touch_block), ("frac_table", touch_table),
+                         ("rate", rate), ("rate2", rate2), ("energy", energy),
+                         ("qd_mean", qd_mean), ("tau_sat", tau_sat), ("qd_rev", qd_rev),
+                         ("r_rate", r_rate), ("r_energy", r_energy)):
             recent[key].append(float(np.mean(val)))
 
         # --- advance latent + history; reset timed-out envs ---
@@ -704,6 +789,8 @@ def main(args):
         if len(done_envs):
             for e in done_envs:
                 o_e = env.reset_one(int(e))
+                if args.no_torque_obs:
+                    scrub_torque_obs(o_e, n_dof)
                 obs["image"][e] = o_e["image"]
                 obs["proprio"][e] = o_e["proprio"]
             z_reset = encode_obs(wm, obs["image"][done_envs], obs["proprio"][done_envs], device)
@@ -740,6 +827,14 @@ def main(args):
                  "interact/object_motion": np.mean(recent["motion"]),
                  "interact/frac_touch_block": np.mean(recent["frac_block"]),
                  "interact/frac_touch_table": np.mean(recent["frac_table"]),
+                 "smooth/action_rate": np.mean(recent["rate"]),
+                 "smooth/action_rate2": np.mean(recent["rate2"]),
+                 "smooth/energy": np.mean(recent["energy"]),
+                 "smooth/qd_mean": np.mean(recent["qd_mean"]),
+                 "smooth/tau_sat_frac": np.mean(recent["tau_sat"]),
+                 "smooth/qd_reversal_frac": np.mean(recent["qd_rev"]),
+                 "reward/r_rate": np.mean(recent["r_rate"]),
+                 "reward/r_energy": np.mean(recent["r_energy"]),
                  "buffer/transitions": buf.total, "perf/steps_per_sec": sps,
                  "wm/h_fwd": h_fwd}
             for key in ("mse_block", "mse_table", "mse_none"):   # curiosity MSE by contact type
@@ -758,6 +853,8 @@ def main(args):
                           "wm/identity_baseline": last_wm[2]})
             if last_sac is not None:
                 d.update({"sac/critic_loss": last_sac[0], "sac/actor_loss": last_sac[1]})
+            if last_qh is not None:              # --multihead-q: per-component policy value
+                d.update({f"sac/q_{k}": float(v) for k, v in zip(REWARD_COMPONENTS, last_qh)})
             wlog(d, step)
             with open(out_dir / "metrics.jsonl", "a") as f:    # local metrics record (esp. when --no-wandb)
                 f.write(json.dumps({"step": step, **{k: float(v) for k, v in d.items()}}) + "\n")
@@ -893,8 +990,31 @@ def parse_args():
                    help="delta: safety-reward deadband on the per-joint -tau*qddot (N*m*rad/s^2). Default 9 "
                         "re-pinned 2026-06-12 from real-arm calibration at P8/D16 (true-dt args: all benign "
                         "motion incl. max-violence reversals <=7.4; user-labeled-bad grabs/blocks/jerks "
-                        ">=10.7). Sim-side distribution unverified at 9 — recheck before long sim pretrains. "
-                        "The pre-2026-06 0.05 penalized all motion -> policy froze; the old 15 never fired.")
+                        ">=10.7). SIM runs: use 15 with --lambda-safe 0.1 — measured 2026-06-12 "
+                        "(runs/sim_scales/kp499.json): sim's saturated PD torque puts even smooth motion at "
+                        "args>9 on 33%% of joint-samples, so the real-arm (9, 2.2) pair freezes sim policies. "
+                        "The pre-2026-06 0.05 penalized all motion -> policy froze; the old 15 never fired on hw.")
+    # smoothness / transferability experiment knobs (2026-06-12 sim campaign; all default-off)
+    p.add_argument("--w-action-rate", type=float, default=0.0,
+                   help="weight W on the action-rate penalty -W * mean_dim (a_t - a_{t-1})^2 over consecutive "
+                        "sub-actions incl. the block boundary (legged_gym-style; actions already in [-1,1]). "
+                        "Episode-start boundary masked. Sim scale ref (kp499.json): dither ~1.42, smooth ~0.09 "
+                        "-> W=3 puts dither at -4.3 vs cur_contrib ~+10 while smooth motion pays ~-0.3.")
+    p.add_argument("--w-action-rate2", type=float, default=0.0,
+                   help="weight on the 2nd-order action-rate term mean_dim (a_t - 2a_{t-1} + a_{t-2})^2 "
+                        "(omega^4 rolloff). Off by default; try after the 1st-order term proves out.")
+    p.add_argument("--w-energy", type=float, default=0.0,
+                   help="weight W on the energy penalty -W * mean_substeps mean_i |tau_i * qd_i| (mechanical "
+                        "power; N*m*rad/s). Sim scale ref: dither ~3.3, smooth ~1.4 -> W=1 is a balanced trial. "
+                        "Hardware analogue exists since kt=10 current-torque (2026-06-06).")
+    p.add_argument("--no-torque-obs", action="store_true",
+                   help="zero the u^app slice of proprio (obs -> [q, qd, 0]); shapes unchanged so old ckpts "
+                        "load. Removes the obs channel that is ~96%% saturated sign-bit on hw and the main "
+                        "sim->real proprio mismatch.")
+    p.add_argument("--multihead-q", action="store_true",
+                   help="critic outputs one Q head per reward component (cur/safe/rate/energy), each trained "
+                        "on its own TD target; the actor maximizes the sum (same optimum as the scalar critic). "
+                        "Logs sac/q_<comp> for interpretability.")
     # actor-critic (README; deterministic — entropy/alpha removed 2026-06-12)
     p.add_argument("--gamma", type=float, default=0.9)
     p.add_argument("--tau", type=float, default=0.005, help="Polyak rate (SAC-style target critic)")
