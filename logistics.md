@@ -649,3 +649,44 @@ Caveats: 1 seed per config, 6k sprints; encoder ranks everywhere ≪ safe15's 33
 srate's interaction is bursty, snoise's is small-but-trending. Before trusting the
 winner: one 50–100k confirmation run of the recommended config (+ the no-torque-obs
 re-verify rides along free). Hardware unchanged: (δ=9, λ_safe=2.2), P8/D16, kp=499.11.
+
+## 2026-06-13 — EXPLORATION DEBUG: why the new deterministic policy parks (sim), and what recovers movement/contact
+
+After the `sconf` 100k smoothness-confirmation run (winner recipe) validated smooth motion but
+the arm visibly **parked** (user: "it's not moving at all"), a focused investigation on branch
+`sim/transfer-experiments`. Added **joint-travel logging** (`explore/pose_step` = ‖Δq‖ per
+decision; `pose_range`/`pose_spread` = config-space coverage; in W&B + step print) and an
+**`--explore-noise`** knob (TD3-style collection noise; policy stays deterministic). New default:
+`--video-every 1000`.
+
+**Finding 1 — action-rate weight is NOT the exploration lever.** `--w-action-rate` 3 (sconf) and
+1 (sexpl1) both park: post-warmup `pose_step` collapses 0.22(warmup)→~0.05, contacts ~0. Lowering
+W made it jitter *harder* in place (rate 0.65→1.0) while traveling *less*. The policy parks
+regardless; curiosity (1-step pred error) is satisfied by the policy's own in-place micro-jitter.
+
+**Finding 2 — action scale sets warmup movement, NOT learned-policy movement.** Diffed `safe15`
+(which roamed) vs these runs: the real differences are **action_max 0.3 (safe15) vs 0.1 (mine)**
+and **safe15 = stochastic entropy-SAC (α=0.2) vs the deterministic actor (entropy removed
+2026-06-12)**. Tested action_max 0.1 / 0.3 (sexpl3) / 6.0=removed (snomax): all three plateau at
+the SAME learned-policy `pose_step` ~0.13 despite a 20× cap difference. The cap only scales the
+random-warmup moves; the deterministic policy converges to the same low floor either way. ⇒ the
+**deterministic policy is the movement cap**, not action scale or any penalty.
+
+**Finding 3 — strong collection noise recovers block CONTACT (the standing open problem).**
+`sexpl4` (W&B `1ab42i8w`: explore_noise **0.6**, w_action_rate **0**, action_max 0.3, λ_cur 20)
+sustains **contacts ≈0.105/step** and pose_step ≈0.225 over training — ~10× `sexpl3` and ~**100×
+the historic ~0.001 collapse** (newarch/lcur20/safe15 all died here). The deterministic *eval*
+policy still parks, but the noisy *collection* roams and hits blocks, feeding real contact
+transitions into the buffer (visible in the 1k-step videos). explore_noise 0.3 only *delayed*
+parking; 0.6 sustains it. So aggressive collection noise is a genuine, non-architecture-reverting
+lever for the "interact with blocks" goal.
+
+**Open decision (maintainer):** to make the LEARNED policy roam like safe15 (not just collection),
+re-add the stochastic/entropy actor — but that reverses the deliberate 2026-06-12 deterministic
+decision, so it's held for maintainer sign-off. Alternatives that DON'T revert it: (a) ship
+explore_noise 0.6 as the collection-exploration default (already gets 0.1 contacts/step); (b) an
+RND/state-coverage intrinsic bonus instead of pure 1-step pred error (attacks the "curiosity
+rewards in-place jitter" root cause directly). Runs in flight (100k): `sexpl3` (smooth reference,
+a_max 0.3/W1) and `sexpl4` (best explorer, noise 0.6/W0). `snomax` (a_max removed) retired after
+confirming the cap is irrelevant. Note: even safe15 had contacts collapse post-warmup — entropy
+restores *movement*, not necessarily *block contact*; sexpl4's noise is the better contact lever.
