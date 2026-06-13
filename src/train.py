@@ -604,11 +604,13 @@ def main(args):
     updates_at_stage = 0
     prev_sub_a = np.zeros((args.n_envs, n_dof), np.float64)   # last sub-action of the previous block (action-rate boundary)
     tau_max_arr = np.asarray(env.tau_max, np.float32)
+    prev_qpos_dec = None                                      # last decision's final joint pose (for pose_step travel)
+    recent_qpos = deque(maxlen=200)                           # rolling final-pose history -> pose_spread / pose_range
     recent = {k: deque(maxlen=400) for k in
               ("r_cur", "r_safe", "cur_contrib", "contacts", "table_contacts",
                "motion", "ret", "frac_block", "frac_table",
                "rate", "rate2", "energy", "qd_mean", "tau_sat", "qd_rev",
-               "r_rate", "r_energy")}
+               "r_rate", "r_energy", "pose_step")}
     recent_mse = {k: deque(maxlen=2000) for k in ("mse_block", "mse_table", "mse_none")}
     t0 = time.time()
     last_wm = last_sac = None
@@ -750,6 +752,19 @@ def main(args):
         rate2 = ((sq2 * m2).sum(1) / np.maximum(m2.sum(1), 1.0)).astype(np.float32)
         prev_sub_a = a_env[:, -1].astype(np.float64).copy()
 
+        # --- ACTUAL joint travel (is the arm parked or going somewhere?). pose_step =
+        #     how far the joint vector moved THIS decision; ~0 = frozen/dithering in place.
+        #     pose_spread/pose_range (logged below) = how much of config space the recent
+        #     window covers. These read q directly, so they catch in-place jitter that
+        #     qd_mean misses (high qd + ~0 pose_step = oscillating, not exploring). ---
+        qpos_dec = sub_infos[-1]["qpos"].astype(np.float64)        # (n_envs, n_dof) final pose of the block
+        if prev_qpos_dec is None:
+            prev_qpos_dec = qpos_dec
+        pose_step = np.where(is_start, 0.0,
+                             np.linalg.norm(qpos_dec - prev_qpos_dec, axis=-1)).astype(np.float32)
+        prev_qpos_dec = qpos_dec
+        recent_qpos.append(qpos_dec.copy())
+
         # freeze a FIXED diverse probe set (early warmup obs) so encoder/eff_rank_probe
         # measures encoder health independent of how narrow the policy's behavior gets.
         if args.probe_size > 0 and probe_px is None:
@@ -792,7 +807,7 @@ def main(args):
                          ("frac_block", touch_block), ("frac_table", touch_table),
                          ("rate", rate), ("rate2", rate2), ("energy", energy),
                          ("qd_mean", qd_mean), ("tau_sat", tau_sat), ("qd_rev", qd_rev),
-                         ("r_rate", r_rate), ("r_energy", r_energy)):
+                         ("r_rate", r_rate), ("r_energy", r_energy), ("pose_step", pose_step)):
             recent[key].append(float(np.mean(val)))
 
         # --- advance latent + history; reset timed-out envs ---
@@ -849,8 +864,13 @@ def main(args):
                  "smooth/qd_reversal_frac": np.mean(recent["qd_rev"]),
                  "reward/r_rate": np.mean(recent["r_rate"]),
                  "reward/r_energy": np.mean(recent["r_energy"]),
+                 "explore/pose_step": np.mean(recent["pose_step"]),     # joint travel/decision; ~0 = parked
                  "buffer/transitions": buf.total, "perf/steps_per_sec": sps,
                  "wm/h_fwd": h_fwd}
+            if recent_qpos:    # how much of joint space the recent window covers (parked -> ~0)
+                qarr = np.stack(recent_qpos)                            # (T, n_envs, n_dof)
+                d["explore/pose_spread"] = float(qarr.std(0).mean())    # mean temporal std over joints/envs
+                d["explore/pose_range"] = float((qarr.max(0) - qarr.min(0)).mean())  # mean per-joint sweep
             for key in ("mse_block", "mse_table", "mse_none"):   # curiosity MSE by contact type
                 if recent_mse[key]:
                     d[f"wm/{key}"] = float(np.mean(recent_mse[key]))
@@ -877,6 +897,8 @@ def main(args):
                   f"contacts/s={d['interact/contacts_per_step']:.2f} "
                   f"mse[blk/tbl/none]={d.get('wm/mse_block', float('nan')):.2f}/"
                   f"{d.get('wm/mse_table', float('nan')):.2f}/{d.get('wm/mse_none', float('nan')):.2f} "
+                  f"rate={d['smooth/action_rate']:.2f} pose_step={d['explore/pose_step']:.3f} "
+                  f"pose_range={d.get('explore/pose_range', float('nan')):.2f} "
                   f"h_fwd={h_fwd} sps={sps:.1f}", flush=True)
 
         # --- checkpoint: upload to HF then clear from disk (bounded disk over a long run) ---
