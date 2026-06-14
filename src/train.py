@@ -287,6 +287,33 @@ def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device):
     return float(pred_loss.item()), float(sig.item()), float(idl)
 
 
+def grad_caps_temporal_loss(traj, eps, valid=None):
+    """Grad-CAPS displacement-normalized temporal-smoothness penalty (actor-only).
+
+    traj: (B, L, n_dof) — consecutive policy sub-actions along time (the real applied
+    path; here L = 2*action_block, pi(z_t) concatenated with pi(z_{t+1})). For each
+    interior triple (s_{k-1}, s_k, s_{k+1}):
+
+        acc_k  = ||s_{k-1} - 2 s_k + s_{k+1}||_2     # == ||Da_t - Da_{t+1}||_2 (curvature)
+        disp_k = ||s_{k+1} - s_{k-1}||_2             # net displacement across the window
+        L_k    = acc_k * tanh( 1 / (disp_k + eps) )
+
+    A smooth ramp has acc≈0 -> ≈0 loss at ANY speed (wide motion is free); an in-place
+    zigzag has large acc and tiny disp -> tanh(1/eps)≈1 -> curvature paid in full. disp is
+    a SCALAR magnitude per window (norm over joints), NOT a per-dim reciprocal: a parked
+    joint's 1/eps would otherwise dominate ||1/(d+eps)|| and saturate every window. eps caps
+    the 1/disp blow-up; tanh keeps the factor in [0,1). Norms carry +1e-12 so the gradient
+    is finite at acc=0 / disp=0. `valid` (B, L-2) masks windows (e.g. the join straddling an
+    episode reset) before the mean."""
+    s0, s1, s2 = traj[:, :-2], traj[:, 1:-1], traj[:, 2:]            # (B, L-2, n_dof)
+    acc = ((s0 - 2.0 * s1 + s2).pow(2).sum(-1) + 1e-12).sqrt()       # (B, L-2) curvature
+    disp = ((s2 - s0).pow(2).sum(-1) + 1e-12).sqrt()                 # (B, L-2) net displacement
+    per_window = acc * torch.tanh(1.0 / (disp + eps))               # (B, L-2)
+    if valid is None:
+        return per_window.mean()
+    return (per_window * valid).sum() / valid.sum().clamp_min(1.0)
+
+
 def sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
                args, step, device):
     """Run args.updates_per_step deterministic actor-critic gradient steps on PER
@@ -329,12 +356,30 @@ def sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
             # that never enters r or propagates through Q (the curiosity balance untouched).
             sub = ap.view(ap.shape[0], args.action_block, -1)
             actor_loss = actor_loss + args.actor_rate_reg * sub.diff(dim=1).pow(2).mean()
+        gc_val = 0.0
+        if getattr(args, "lambda_temp", 0) > 0:
+            # Grad-CAPS temporal smoothness (displacement-normalized): penalize the CURVATURE
+            # of the policy's real applied sub-action path across the t->t+1 decision boundary
+            # [pi(z_t) | pi(z_{t+1})], scaled by 1/displacement so a smooth wide ramp is free
+            # and only low-travel zigzag (the in-place jitter that cheaply satisfies 1-step
+            # curiosity) is paid. Actor-only: gradients flow through pi, Q/r untouched.
+            nb = args.action_block
+            apn = actor(znb)                                          # next-state block (WITH grad)
+            traj = torch.cat([ap.view(ap.shape[0], nb, -1),
+                              apn.view(apn.shape[0], nb, -1)], dim=1)  # (B, 2*nb, n_dof)
+            vmask = torch.ones(traj.shape[0], 2 * nb - 2, device=traj.device)
+            done = b["d"].view(-1) > 0.5            # the t->t+1 join spans an episode reset -> not a real path
+            if done.any():
+                vmask[done, nb - 2] = 0.0; vmask[done, nb - 1] = 0.0
+            gc = grad_caps_temporal_loss(traj, args.grad_caps_eps, vmask)
+            actor_loss = actor_loss + args.lambda_temp * gc
+            gc_val = float(gc.item())
         actor_opt.zero_grad(); actor_loss.backward(); actor_opt.step()
         with torch.no_grad():
             for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
                 pt.mul_(1 - args.tau).add_(args.tau * p)
         out = {"critic_loss": float(critic_loss.item()),
-               "actor_loss": float(actor_loss.item()), "zb": zb.detach()}
+               "actor_loss": float(actor_loss.item()), "grad_caps": gc_val, "zb": zb.detach()}
         if q1p.shape[-1] > 1:            # per-head mean Q: which component steers the policy
             out["q_heads"] = (0.5 * (q1p + q2p)).mean(0).detach().cpu().numpy()
     return out
@@ -661,7 +706,7 @@ def main(args):
         res = sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
                          args, step, device)
         if res is not None:
-            last_sac = (res["critic_loss"], res["actor_loss"])
+            last_sac = (res["critic_loss"], res["actor_loss"], res.get("grad_caps", 0.0))
             last_zb = res["zb"]
             last_qh = res.get("q_heads")
         return h_fwd
@@ -886,7 +931,8 @@ def main(args):
                 d.update({"wm/pred_loss": last_wm[0], "wm/sigreg": last_wm[1],
                           "wm/identity_baseline": last_wm[2]})
             if last_sac is not None:
-                d.update({"sac/critic_loss": last_sac[0], "sac/actor_loss": last_sac[1]})
+                d.update({"sac/critic_loss": last_sac[0], "sac/actor_loss": last_sac[1],
+                          "smooth/grad_caps": last_sac[2]})
             if last_qh is not None:              # --multihead-q: per-component policy value
                 d.update({f"sac/q_{k}": float(v) for k, v in zip(REWARD_COMPONENTS, last_qh)})
             wlog(d, step)
@@ -1056,6 +1102,16 @@ def parse_args():
                         "+W * mean (pi(z) sub-action diffs)^2 added to actor_loss. Keeps smoothness "
                         "pressure out of r and Q — the A/B for whether the reward-term variant "
                         "pollutes the curiosity balance.")
+    p.add_argument("--lambda-temp", type=float, default=0.0,
+                   help="Grad-CAPS temporal-smoothness weight lambda_T on the ACTOR loss: "
+                        "+lambda_T * mean_k ||s_{k-1}-2s_k+s_{k+1}|| * tanh(1/(||s_{k+1}-s_{k-1}||+eps)) "
+                        "over the real applied sub-action path across the t->t+1 boundary "
+                        "[pi(z_t)|pi(z_{t+1})]. Unlike --actor-rate-reg / --w-action-rate (squared "
+                        "velocity -> penalizes ALL motion -> parks), this pays only low-travel "
+                        "curvature (in-place zigzag), leaving smooth wide ramps free. Q/r untouched.")
+    p.add_argument("--grad-caps-eps", type=float, default=1e-2,
+                   help="epsilon in the Grad-CAPS 1/(displacement+eps) factor (caps the in-place "
+                        "blow-up before tanh; smaller eps = sharper jitter penalty).")
     p.add_argument("--warmup-random", action="store_true",
                    help="act with uniform random actions during start_steps (restores the pre-2026-06-12 "
                         "warmup as an opt-in): buffer diversity for from-scratch sim runs; acting is "
