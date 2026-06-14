@@ -21,9 +21,9 @@ Rollout-on variant (vs. the single-horizon loss that scores one sampled $h$ agai
 
 ## Actor + actuation
 
-$$a_t=\pi(z_t)=\tanh(\mathrm{MLP}(z_t))\in(-1,1)^n,\quad \Delta q_t=a_t\odot\Delta q^{\max}$$
+$$a_t=\tanh(u_t),\ u_t\sim\mathcal N\!\big(\mu(z_t),\,\sigma(z_t)\big)\ \text{(training)};\qquad a_t=\pi(z_t)=\tanh\!\big(\mu(z_t)\big)\ \text{(deployment)};\qquad \Delta q_t=a_t\odot\Delta q^{\max}$$
 
-The policy is **deterministic** (stochasticity removed 2026-06-12): no Gaussian head, no sampling, no entropy bonus — exploration is driven by the curiosity reward, not action noise.
+The policy is a **Gaussian SAC actor** with a learned, state-dependent spread $\sigma(z_t)$. Sim **training and data collection sample** $a_t$ — the entropy bonus (weight $\alpha$) keeps the policy off the freeze attractor and decorrelates the parallel envs; **eval and hardware deployment act with the deterministic mean** $\tanh(\mu(z_t))$, so every deployed action is reproducible. (Stochasticity was removed 2026-06-12 then re-added 2026-06-14 for training only — the deterministic actor parked.)
 
 $$\tau_t=\mathrm{clip}\!\big(K_p\,\Delta q_t-K_d\,\dot q_t,\ -\tau_i^{\max},\ \tau_i^{\max}\big)$$
 
@@ -36,14 +36,14 @@ $$r_t=\lambda_{\text{safe}}\,r_t^{\text{safe}}+\lambda_{\text{cur}}\,\mathrm{sym
 
 The curiosity error is the **per-dim mean** squared error $\tfrac{1}{d_z}\lVert\cdot\rVert_2^2$ (same normalization as $\mathcal L_{\text{wm}}$), so $r^{\text{cur}}\!\sim\!O(0.1\text{–}1)$ and $\mathrm{symlog}$ stays in its discriminative region. The safety penalty carries its own weight $\lambda_{\text{safe}}$ (not pinned to $1$). With the real-arm-calibrated deadband ($\delta=9$, 2026-06-12: all benign motion incl. max-violence reversals scores $\le7.4$, user-labeled-bad events $\ge10.7$ on true-dt $\ddot q$), $r^{\text{safe}}$ is identically $0$ in normal operation — $\lambda_{\text{safe}}$ scales only genuine events, and $2.2$ makes one median bad substep cancel $\approx$ one decision's curiosity term.
 
-## Actor-critic objective (deterministic)
+## Actor-critic objective (SAC)
 
-$$y=r_t+\gamma\,(1-d_t)\,\min_i Q_{\bar\theta_i}\big(z_{t+1},\,\pi(z_{t+1})\big)$$
+$$a'\sim\pi(\cdot\,|\,z_{t+1}),\qquad y=r_t+\gamma\,(1-d_t)\,\Big(\min_i Q_{\bar\theta_i}\big(z_{t+1},a'\big)-\alpha\log\pi\big(a'\,|\,z_{t+1}\big)\Big)$$
 
 $$\mathcal{L}_Q=\big(Q_\theta(z_t,a_t)-y\big)^2,\qquad
-\mathcal{L}_\pi=-\,\min_i Q_i\big(z_t,\,\pi(z_t)\big)$$
+\mathcal{L}_\pi=\mathbb E_{a\sim\pi(\cdot|z_t)}\big[\alpha\log\pi(a\,|\,z_t)-\textstyle\min_i Q_i(z_t,a)\big]$$
 
-TD3-style: twin critics with a Polyak target $Q_{\bar\theta}$ and a deterministic $\pi$ — the SAC entropy terms ($\alpha\log\pi$) and action sampling were removed 2026-06-12. Real $z_{t+1}$, no WM rollout in the target; $d_t$ via truncation-as-done. Buffer holds $(o_t,q_t,\dot q_t,a_t,r_t,o_{t+1})$ for WM + actor-critic; cap $=10\%$ of the run (capped); PER for sampling, FIFO (ring) eviction.
+SAC with a **fixed** entropy temperature $\alpha$ (re-added 2026-06-14; no learnable $\alpha$): the actor maximizes $Q+\alpha\mathcal H$ over reparameterized squashed-Gaussian samples and the critic learns the soft value. Training samples $a\sim\pi$; **deployment acts with the deterministic mean** $\tanh(\mu(z))$. Twin critics with a Polyak target $Q_{\bar\theta}$. Real $z_{t+1}$, no WM rollout in the target; $d_t$ via truncation-as-done. Buffer holds $(o_t,q_t,\dot q_t,a_t,r_t,o_{t+1})$ for WM + actor-critic; cap $=10\%$ of the run (capped); PER for sampling, FIFO (ring) eviction.
 
 ## Constants
 
@@ -58,6 +58,7 @@ TD3-style: twin critics with a Polyak target $Q_{\bar\theta}$ and a deterministi
 | batch | minibatch size: WM / SAC updates | 128 / 128 |
 | $\gamma$ | actor-critic return discount | 0.9 |
 | $\rho$ | Polyak rate of the target critic $Q_{\bar\theta}$ — slows TD-target drift (the critic's target net, **not** a JEPA EMA teacher; SIGReg needs none) | 0.005 |
+| $\alpha$ | SAC entropy temperature: actor maximizes $Q+\alpha\mathcal H$ (training samples $\pi$; deployment uses the deterministic mean) | 0.2 (re-added 2026-06-14; fixed, not learned. safe15 ran 0.2) |
 | $\lambda_{\text{cur}}$ | reward weight on $\mathrm{symlog}(r^{\text{cur}})$ | 15 (since 2026-06-11; safe15 + the earlier campaign ran 20) |
 | $\lambda_{\text{safe}}$ | reward weight on $r^{\text{safe}}$ | 2.2 (since 2026-06-12; one median bad substep ≈ one decision's curiosity. Was 0.1) |
 | $K_p,K_d$ | sim position-actuator PD gains; hardware reuses them for the obs-torque recompute | 499.11 N·m/rad / 2.731 N·m·s/rad (RBE501 DC-motor model at firmware P=8, since 2026-06-12 — $K_p$ linear in P, was 998.22 at P=16; $K_d$ is back-EMF only, P/D-independent) |

@@ -3,7 +3,8 @@ an intrinsic curiosity reward, on the MuJoCo SO-ARM101 (README is the spec).
 
 Per decision step (action_block env steps), for every parallel env:
   1. encode z_t from (wrist image, proprio) with the current world model
-  2. act a_t = pi(z_t) (deterministic tanh policy); apply it (delta-target PD) over action_block env steps
+  2. act a_t ~ pi(z_t) (SAC sample in sim training; deterministic mean tanh(MLP(z_t)) on
+     hardware/eval); apply it (delta-target PD) over action_block env steps
   3. curiosity   r_cur = ||f(z_{t-H+1:t}, a_t) - z_{t+1}||^2     (1-step pred error)
      reward      r_t   = sum_k r_safe_k + lambda_cur * symlog(r_cur)
   4. store (o_t, q_t, qdot_t, a_t, r_t, o_{t+1}) with PER priority = r_cur
@@ -59,27 +60,49 @@ def to_norm_pixel(px_uint8, device):
     return (t - IMAGENET_MEAN.to(device).view(shp)) / IMAGENET_STD.to(device).view(shp)
 
 
-# ----------------------------------------------------- actor-critic (deterministic)
+# ------------------------------ actor-critic (SAC: stochastic train, deterministic deploy)
 class Actor(nn.Module):
-    """Deterministic policy a = tanh(MLP(z)). The Gaussian head, sampling and entropy
-    machinery were removed 2026-06-12 (user decision: deterministic policy only);
-    exploration comes from the curiosity reward, not action noise. `mean` keeps its
-    name so pre-removal checkpoints load via load_actor_state."""
+    """Gaussian SAC policy with a deterministic-mean deployment path.
 
-    def __init__(self, z_dim, a_dim, hidden=256):
+    `forward(z)` returns the DETERMINISTIC action tanh(mean(z)) — used at eval and on
+    hardware, so every deployed action is reproducible. `sample(z)` returns a squashed
+    Gaussian sample (a, logp, tanh(mean)) — used for sim-training collection and the SAC
+    entropy term. Re-added 2026-06-14: the entropy bonus keeps the policy off the freeze
+    attractor that the 2026-06-12 deterministic actor parked on; the learned mean is what
+    deploys, the stochasticity lives only in training. log_std is a learned, state-dependent
+    head; deterministic-era checkpoints (no log_std) load via load_actor_state and keep its
+    fresh init (deployment never reads it)."""
+
+    def __init__(self, z_dim, a_dim, hidden=256, log_std_range=(-5, 2)):
         super().__init__()
         self.trunk = nn.Sequential(nn.Linear(z_dim, hidden), nn.ReLU(),
                                    nn.Linear(hidden, hidden), nn.ReLU())
         self.mean = nn.Linear(hidden, a_dim)
+        self.log_std = nn.Linear(hidden, a_dim)
+        self.lo, self.hi = log_std_range
 
     def forward(self, z):
+        """Deterministic action (the deployed / eval policy) = tanh(mean)."""
         return torch.tanh(self.mean(self.trunk(z)))
+
+    def sample(self, z):
+        """Stochastic action for training: (a, logp, deterministic_mean). Reparameterized
+        squash with the standard tanh log-prob correction."""
+        h = self.trunk(z)
+        mean, log_std = self.mean(h), self.log_std(h).clamp(self.lo, self.hi)
+        normal = torch.distributions.Normal(mean, log_std.exp())
+        u = normal.rsample()
+        a = torch.tanh(u)
+        logp = (normal.log_prob(u) - torch.log(1 - a.pow(2) + 1e-6)).sum(-1, keepdim=True)
+        return a, logp, torch.tanh(mean)
 
 
 def load_actor_state(actor, sd):
-    """Load an actor state_dict, tolerating pre-2026-06-12 stochastic-SAC checkpoints:
-    their log_std.* head is dropped; everything else must match exactly."""
-    actor.load_state_dict({k: v for k, v in sd.items() if not k.startswith("log_std")})
+    """Load an actor state_dict, tolerating checkpoints from either policy era: stochastic
+    SAC (safe15: has log_std) loads it; the 2026-06-12..06-14 deterministic actor (no
+    log_std) leaves the re-added log_std head at its fresh init. trunk/mean shapes are
+    identical across eras, so strict=False only ever skips the log_std head."""
+    actor.load_state_dict(sd, strict=False)
 
 
 class TwinQ(nn.Module):
@@ -289,16 +312,20 @@ def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device):
 
 def sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
                args, step, device):
-    """Run args.updates_per_step deterministic actor-critic gradient steps on PER
-    samples from buf (TD3-style: twin critics + Polyak target net, but no entropy
-    term and no action sampling — stochasticity removed 2026-06-12; the name stays
-    for caller/W&B-key continuity). The encoder is frozen w.r.t. these updates: z is
-    encoded under no_grad from the CURRENT wm.
+    """Run args.updates_per_step SAC actor-critic gradient steps on PER samples from buf.
+    SAC with a FIXED entropy temperature alpha (getattr default 0.2): the actor maximizes
+    Q + alpha*H over reparameterized squashed-Gaussian samples and the critic learns the
+    soft value (target min Q_bar - alpha*log pi). The entropy bonus is what keeps the policy
+    off the freeze attractor — re-added 2026-06-14; the 2026-06-12 deterministic actor
+    parked. Deployment still acts with the deterministic mean; only training samples. Twin
+    critics + Polyak target kept. The encoder is frozen w.r.t. these updates: z is encoded
+    under no_grad from the CURRENT wm.
     Returns {"critic_loss", "actor_loss", "zb"} from the last completed update, or
     None if the gate is closed (warmup / buffer below batch) or sampling came up dry.
     Shared by the online loop here and offline fine-tuning (offline_train.py)."""
     if step < args.start_steps or buf.total < args.batch_size:
         return None
+    alpha = getattr(args, "alpha", 0.2)        # fixed entropy temperature (no learnable alpha)
     per_beta = min(1.0, args.per_beta_start
                    + (1 - args.per_beta_start) * step / max(args.total_steps, 1))
     out = None
@@ -309,20 +336,26 @@ def sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
         zb = encode_obs(wm, b["px"], b["prop"], device)
         znb = encode_obs(wm, b["px_n"], b["prop_n"], device)
         with torch.no_grad():
-            q1n, q2n = critic_tgt(znb, actor(znb))
-            # scalar critic: (B,1) target as before. multihead: per-head TD targets from
-            # the per-component rewards, min-over-twins applied per head (pessimism per
-            # component); the shared next action keeps the heads' sum == the scalar value.
-            y = b.get("rc", b["r"]) + (1 - b["d"]) * args.gamma * torch.min(q1n, q2n)
+            an, logpn, _ = actor.sample(znb)               # a' ~ pi (entropy bonus on z')
+            q1n, q2n = critic_tgt(znb, an)
+            # scalar critic: (B,1) soft target. multihead: per-head TD targets from the
+            # per-component rewards, min-over-twins per head (pessimism per component); the
+            # shared next action keeps the heads' sum == the scalar value. Entropy is global
+            # (not a reward component) so it is spread equally across the K heads (/K) -> the
+            # head-sum equals the scalar soft target; identical to safe15 at K=1.
+            ent = args.gamma * (1 - b["d"]) * alpha * logpn          # (B,1) discounted entropy
+            y = (b.get("rc", b["r"]) + (1 - b["d"]) * args.gamma * torch.min(q1n, q2n)
+                 - ent / q1n.shape[-1])
         q1, q2 = critic(zb, b["a"])
         critic_loss = (b["w"] * ((q1 - y).pow(2) + (q2 - y).pow(2)).mean(-1, keepdim=True)).mean()
         critic_opt.zero_grad(); critic_loss.backward(); critic_opt.step()
         if args.per_priority == "td":   # ablation: replace curiosity priority with |TD error|
             td = (0.5 * (q1 + q2) - y).sum(-1).abs().detach().cpu().numpy()
             buf.update_priorities(b["e"], b["i"], td)
-        ap = actor(zb)
+        ap, logpp, _ = actor.sample(zb)
         q1p, q2p = critic(zb, ap)
-        actor_loss = (-torch.min(q1p.sum(-1), q2p.sum(-1))).mean()   # sum heads, then twin-min (== old path at K=1)
+        q_min = torch.min(q1p.sum(-1, keepdim=True), q2p.sum(-1, keepdim=True))   # sum heads, then twin-min
+        actor_loss = (alpha * logpp - q_min).mean()                              # maximize Q + alpha*H (== safe15 at K=1)
         if getattr(args, "actor_rate_reg", 0) > 0:
             # action-rate as an actor-loss regularizer instead of a reward term: penalize
             # the policy's own within-block sub-action jerk directly — smoothness pressure
@@ -574,6 +607,14 @@ def main(args):
               f"Keep the e-stop within reach." + ("  [!] " + "; ".join(warns) if warns else ""),
               flush=True)
 
+    # acting mode: SAC sample in sim training (entropy exploration that un-parks the policy
+    # and decorrelates the parallel envs); deterministic mean on hardware, in frozen-policy
+    # collection, and whenever --deterministic-act is set (deployment / eval).
+    stochastic_act = (not args.deterministic_act and not args.frozen_policy
+                      and args.env_backend != "hardware")
+    print(f"[policy] acting={'stochastic sample (training)' if stochastic_act else 'deterministic mean (deploy/eval)'}"
+          f"; alpha={args.alpha}", flush=True)
+
     run = None
     if not args.no_wandb and wandb is not None and os.environ.get("WANDB_API_KEY"):
         # name = the short keyword; every constant/variable goes in the config table.
@@ -684,17 +725,20 @@ def main(args):
             break
         cur_px, cur_prop = obs["image"], obs["proprio"]          # o_t (before acting)
 
-        # --- act (deterministic policy; exploration = curiosity reward, not action noise.
-        #     start_steps no longer randomizes acting — it only delays gradient updates,
-        #     unless --warmup-random opts the uniform-action warmup back in: data-side
-        #     diversity for from-scratch sim runs, still no policy stochasticity) ---
+        # --- act: SAC stochastic sample during sim training (the entropy-driven exploration
+        #     that un-parks the policy and decorrelates the parallel envs), the DETERMINISTIC
+        #     mean on hardware / frozen deployment / eval (stochastic_act is False there).
+        #     --warmup-random still opts in a uniform warmup; --explore-noise adds extra
+        #     collection noise on top (sim only). ---
         with torch.no_grad():
             if args.warmup_random and step < args.start_steps:
                 a = torch.rand(args.n_envs, a_dim, device=device) * 2 - 1
+            elif stochastic_act:
+                a, _, _ = actor.sample(z)
             else:
-                a = actor(z)
-                if args.explore_noise > 0:   # TD3-style collection noise; policy itself stays deterministic
-                    a = (a + args.explore_noise * torch.randn_like(a)).clamp(-1.0, 1.0)
+                a = actor(z)                 # deterministic mean (deployment / eval)
+            if args.explore_noise > 0:       # optional extra collection noise (sim pretrain only)
+                a = (a + args.explore_noise * torch.randn_like(a)).clamp(-1.0, 1.0)
         hist_a = torch.cat([hist_a[1:], a.unsqueeze(0)], 0)
         a_env = a.detach().cpu().numpy().reshape(args.n_envs, args.action_block, n_dof)
 
@@ -1058,14 +1102,23 @@ def parse_args():
                         "pollutes the curiosity balance.")
     p.add_argument("--warmup-random", action="store_true",
                    help="act with uniform random actions during start_steps (restores the pre-2026-06-12 "
-                        "warmup as an opt-in): buffer diversity for from-scratch sim runs; acting is "
-                        "deterministic after warmup either way.")
+                        "warmup as an opt-in): extra buffer diversity for from-scratch sim runs; acting "
+                        "samples ~pi after warmup in sim (deterministic mean on hardware).")
     p.add_argument("--explore-noise", type=float, default=0.0,
-                   help="TD3-style Gaussian noise std added to actions during COLLECTION only (clamped to "
-                        "[-1,1]); the policy/eval remain deterministic. Sim-pretrain remedy for the "
-                        "two-attractor pathology (bang-bang thrash vs frozen lull) seen in from-scratch "
-                        "deterministic runs 2026-06-12; not for hardware.")
-    # actor-critic (README; deterministic — entropy/alpha removed 2026-06-12)
+                   help="extra Gaussian noise std added on TOP of the action during COLLECTION only (clamped "
+                        "to [-1,1]); eval/hardware act with the deterministic mean. Mostly redundant now that "
+                        "sim training samples ~pi (2026-06-14); kept as an extra sim-pretrain knob. Not for "
+                        "hardware.")
+    # actor-critic (README). SAC: stochastic train + entropy alpha, deterministic-mean deploy (2026-06-14).
+    p.add_argument("--alpha", type=float, default=0.2,
+                   help="fixed SAC entropy temperature: actor maximizes Q + alpha*H (re-added 2026-06-14). "
+                        "The entropy bonus keeps the policy off the freeze attractor the 2026-06-12 "
+                        "deterministic actor parked on. Sim training samples ~pi; eval/hardware act with the "
+                        "deterministic mean tanh(MLP(z)). safe15 ran 0.2.")
+    p.add_argument("--deterministic-act", action="store_true",
+                   help="force the deterministic mean even during sim-training collection (default: sample ~pi "
+                        "in sim, mean on hardware/frozen). Reproduces the 2026-06-12 deterministic acting or a "
+                        "clean eval rollout.")
     p.add_argument("--gamma", type=float, default=0.9)
     p.add_argument("--tau", type=float, default=0.005, help="Polyak rate (SAC-style target critic)")
     p.add_argument("--actor-lr", type=float, default=3e-4)
