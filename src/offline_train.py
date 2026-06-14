@@ -288,6 +288,9 @@ def parse_args():
     # SAC (defaults = train.py's except the fine-tune LRs)
     p.add_argument("--gamma", type=float, default=0.9)
     p.add_argument("--tau", type=float, default=0.005)
+    p.add_argument("--alpha", type=float, default=0.2,
+                   help="SAC entropy temperature (actor maximizes Q + alpha*H); offline updates "
+                        "sample ~pi, deployment uses the deterministic mean. safe15 ran 0.2.")
     p.add_argument("--actor-lr", type=float, default=1e-4,
                    help="fine-tune default (train.py uses 3e-4)")
     p.add_argument("--critic-lr", type=float, default=1e-4,

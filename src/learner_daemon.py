@@ -401,6 +401,9 @@ def parse_args():
                         "files otherwise keep their storage forever); 0 disables")
     p.add_argument("--keep-local-ckpts", action="store_true")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--alpha", type=float, default=0.2,
+                   help="SAC entropy temperature (actor maximizes Q + alpha*H); the learner "
+                        "samples ~pi, the deployed collector acts with the deterministic mean. safe15 ran 0.2.")
     p.add_argument("--no-hf", action="store_true", help="never upload (local tests)")
     p.add_argument("--hf-repo", default=None)
     p.add_argument("--no-wandb", action="store_true")

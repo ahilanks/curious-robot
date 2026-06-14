@@ -171,7 +171,7 @@ def main():
         _sync(device)
         t0 = time.perf_counter()
         with torch.no_grad():
-            a = actor(z)                                   # deterministic policy (2026-06-12)
+            a = actor(z)                                   # deterministic mean (deploy/bench); training samples ~pi
         block = a.detach().cpu().numpy().reshape(AB, 6)    # .cpu() forces the MPS sync,
         t1 = time.perf_counter()                            # exactly like the daemon
         dec["t_sample"].append((t0, t1))

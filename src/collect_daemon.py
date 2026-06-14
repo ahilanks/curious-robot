@@ -516,7 +516,7 @@ def main(args):
         cur_px, cur_prop = obs["image"], obs["proprio"]
 
         with torch.no_grad():
-            a = acting.actor(z)        # deterministic policy (stochasticity removed 2026-06-12)
+            a = acting.actor(z)        # deterministic mean (deployment); SAC training samples ~pi (see Actor)
         if not torch.isfinite(a).all():                     # NaN policy: instant reject
             log(out_dir, "NON-FINITE ACTION — reverting to champion")
             flush_pending()
