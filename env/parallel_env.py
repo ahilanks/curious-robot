@@ -28,7 +28,7 @@ import numpy as np
 from .mujoco_env import MujocoSO101Env, DEFAULT_SCENE
 
 _INFO_KEYS = ("applied_torque", "qvel", "qvel_prev", "qpos", "safety_reward",
-              "object_contacts", "table_contacts", "object_motion")
+              "object_contacts", "table_contacts", "object_motion", "ee_pos")
 
 
 class VectorMujocoEnv:

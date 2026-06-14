@@ -651,11 +651,13 @@ def main(args):
     tau_max_arr = np.asarray(env.tau_max, np.float32)
     prev_qpos_dec = None                                      # last decision's final joint pose (for pose_step travel)
     recent_qpos = deque(maxlen=200)                           # rolling final-pose history -> pose_spread / pose_range
+    prev_ee_dec = None                                        # last decision's gripper world xyz (for ee_step travel)
+    recent_ee = deque(maxlen=200)                             # rolling gripper-xyz history -> ee_range (world roaming)
     recent = {k: deque(maxlen=400) for k in
               ("r_cur", "r_safe", "cur_contrib", "contacts", "table_contacts",
                "motion", "ret", "frac_block", "frac_table",
                "rate", "rate2", "energy", "qd_mean", "tau_sat", "qd_rev",
-               "r_rate", "r_energy", "pose_step")}
+               "r_rate", "r_energy", "pose_step", "ee_step", "r_roam")}
     recent_mse = {k: deque(maxlen=2000) for k in ("mse_block", "mse_table", "mse_none")}
     t0 = time.time()
     last_wm = last_sac = None
@@ -810,6 +812,18 @@ def main(args):
         prev_qpos_dec = qpos_dec
         recent_qpos.append(qpos_dec.copy())
 
+        # --- WORLD-SPACE end-effector travel: the honest "is the arm roaming" signal.
+        #     pose_step is joint-space summed over all joints, so smooth distal-wrist motion
+        #     (which only pans the on-arm camera) inflates it while the arm stays put -- the
+        #     gripper world xyz does not move unless the arm actually translates through space. ---
+        ee_dec = sub_infos[-1]["ee_pos"].astype(np.float64)        # (n_envs, 3) gripper world xyz
+        if prev_ee_dec is None:
+            prev_ee_dec = ee_dec
+        ee_step = np.where(is_start, 0.0,
+                           np.linalg.norm(ee_dec - prev_ee_dec, axis=-1)).astype(np.float32)
+        prev_ee_dec = ee_dec
+        recent_ee.append(ee_dec.copy())
+
         # freeze a FIXED diverse probe set (early warmup obs) so encoder/eff_rank_probe
         # measures encoder health independent of how narrow the policy's behavior gets.
         if args.probe_size > 0 and probe_px is None:
@@ -826,7 +840,11 @@ def main(args):
         r_rate = -(args.w_action_rate * rate + args.w_action_rate2 * rate2)       # smoothness penalties (0 unless flagged)
         r_energy = -args.w_energy * energy
         safe_term = args.lambda_safe * r_safe
-        reward = safe_term + cur_term + r_rate + r_energy
+        # anti-freeze roaming reward: pay end-effector WORLD travel so the policy has a reason
+        # to translate through space (curiosity alone is satisfiable by in-place wrist-cam pan).
+        # Grad-CAPS (--lambda-temp) keeps that travel smooth. 0 unless --w-ee-travel set.
+        r_roam = args.w_ee_travel * ee_step
+        reward = safe_term + cur_term + r_rate + r_energy + r_roam
         comps = np.stack([cur_term, safe_term, r_rate, r_energy], -1).astype(np.float32)  # REWARD_COMPONENTS order
 
         # contact-conditioned curiosity MSE (r_cur = ||zhat-z||^2): is the model more
@@ -852,7 +870,8 @@ def main(args):
                          ("frac_block", touch_block), ("frac_table", touch_table),
                          ("rate", rate), ("rate2", rate2), ("energy", energy),
                          ("qd_mean", qd_mean), ("tau_sat", tau_sat), ("qd_rev", qd_rev),
-                         ("r_rate", r_rate), ("r_energy", r_energy), ("pose_step", pose_step)):
+                         ("r_rate", r_rate), ("r_energy", r_energy), ("pose_step", pose_step),
+                         ("ee_step", ee_step), ("r_roam", r_roam)):
             recent[key].append(float(np.mean(val)))
 
         # --- advance latent + history; reset timed-out envs ---
@@ -910,10 +929,19 @@ def main(args):
                  "reward/r_rate": np.mean(recent["r_rate"]),
                  "reward/r_energy": np.mean(recent["r_energy"]),
                  "explore/pose_step": np.mean(recent["pose_step"]),     # joint travel/decision; ~0 = parked
+                 "explore/ee_step": np.mean(recent["ee_step"]),         # WORLD gripper travel/decision; ~0 = frozen-in-space
+                 "reward/r_roam": np.mean(recent["r_roam"]),
                  "buffer/transitions": buf.total, "perf/steps_per_sec": sps,
                  "wm/h_fwd": h_fwd}
+            if recent_ee:      # world-space gripper roaming over the window (frozen-in-space -> ~0)
+                earr = np.stack(recent_ee)                              # (T, n_envs, 3)
+                d["explore/ee_range"] = float(np.linalg.norm(earr.max(0) - earr.min(0), axis=-1).mean())
+                d["explore/ee_spread"] = float(earr.std(0).mean())
             if recent_qpos:    # how much of joint space the recent window covers (parked -> ~0)
                 qarr = np.stack(recent_qpos)                            # (T, n_envs, n_dof)
+                rng = qarr.max(0) - qarr.min(0)                         # (n_envs, n_dof) per-joint sweep
+                d["explore/range_prox"] = float(rng[:, :3].mean())     # base/shoulder/elbow -> gross arm position
+                d["explore/range_dist"] = float(rng[:, 3:].mean())     # wrist/gripper -> local reorient (cam pan)
                 d["explore/pose_spread"] = float(qarr.std(0).mean())    # mean temporal std over joints/envs
                 d["explore/pose_range"] = float((qarr.max(0) - qarr.min(0)).mean())  # mean per-joint sweep
             for key in ("mse_block", "mse_table", "mse_none"):   # curiosity MSE by contact type
@@ -1112,6 +1140,12 @@ def parse_args():
     p.add_argument("--grad-caps-eps", type=float, default=1e-2,
                    help="epsilon in the Grad-CAPS 1/(displacement+eps) factor (caps the in-place "
                         "blow-up before tanh; smaller eps = sharper jitter penalty).")
+    p.add_argument("--w-ee-travel", type=float, default=0.0,
+                   help="anti-freeze roaming reward: +W * ||gripper_xyz_t - gripper_xyz_{t-1}|| (world "
+                        "end-effector travel per decision, episode-start masked). Gives the policy a "
+                        "reason to TRANSLATE through space -- curiosity alone is satisfied by in-place "
+                        "wrist-cam pan from distal jitter (the freeze). Pair with --lambda-temp so the "
+                        "roaming stays smooth. Enters reward (not a separate Q head).")
     p.add_argument("--warmup-random", action="store_true",
                    help="act with uniform random actions during start_steps (restores the pre-2026-06-12 "
                         "warmup as an opt-in): buffer diversity for from-scratch sim runs; acting is "

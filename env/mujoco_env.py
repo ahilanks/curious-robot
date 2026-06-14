@@ -110,6 +110,10 @@ class MujocoSO101Env:
 
         self._wrist_cam_id = _name_lookup(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam")
         self._overhead_cam_id = _name_lookup(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "overhead")
+        # end-effector (gripper) body: world xyz -> the honest "is the arm roaming in space"
+        # signal. Distal-wrist jitter pans the wrist cam without translating this; pose_step
+        # (joint-space) can't tell those apart, the gripper world position can.
+        self._ee_body_id = _name_lookup(self.model, mujoco.mjtObj.mjOBJ_BODY, "gripper")
         self._object_body_ids, self._object_geom_ids = [], []
         self._object_qpos_addrs, self._object_qvel_addrs = [], []
         for i in range(n_objects):
@@ -293,6 +297,7 @@ class MujocoSO101Env:
             "object_contacts": np.int64(n_contact),
             "table_contacts": np.int64(n_table),
             "object_motion": np.float32(obj_motion),
+            "ee_pos": self.data.xpos[self._ee_body_id].copy().astype(np.float32),  # gripper world xyz
         }
         self._prev_qvel = qvel
         return obs, info
