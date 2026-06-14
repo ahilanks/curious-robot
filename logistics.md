@@ -690,3 +690,46 @@ rewards in-place jitter" root cause directly). Runs in flight (100k): `sexpl3` (
 a_max 0.3/W1) and `sexpl4` (best explorer, noise 0.6/W0). `snomax` (a_max removed) retired after
 confirming the cap is irrelevant. Note: even safe15 had contacts collapse post-warmup — entropy
 restores *movement*, not necessarily *block contact*; sexpl4's noise is the better contact lever.
+
+## 2026-06-14 — Grad-CAPS smoothness + anti-freeze attempts (branch `policy/grad-caps-temporal-smoothness`)
+
+**Goal (user):** the action-rate penalty *on reward* freezes the arm (confirmed via video). Try a
+**Grad-CAPS displacement-normalized temporal smoothness loss on the policy** instead — arm should show
+a wide range of motion but be smooth. Keep the deterministic policy (entropy stays out, per 2026-06-12).
+
+**Built (committed, unit-tested):**
+- `grad_caps_temporal_loss` in src/train.py — `‖s_{k-1}-2s_k+s_{k+1}‖·tanh(1/(‖s_{k+1}-s_{k-1}‖+ε))`
+  over the cross-block `[π(z_t)|π(z_{t+1})]` path; actor-only (Q/r untouched). Flags `--lambda-temp`,
+  `--grad-caps-eps`; logs `smooth/grad_caps`. Unlike squared-velocity (`--w-action-rate`,
+  `--actor-rate-reg`) it pays only curvature, so a smooth wide ramp is free — verified in unit tests.
+- **World-space instrumentation** (the old metrics were blind to the freeze): env emits gripper world
+  xyz `ee_pos`; train logs `explore/ee_step` (per-decision world travel), `explore/ee_range`/`ee_spread`
+  (world coverage), `explore/range_prox` vs `range_dist` (base vs wrist joint sweep).
+- Anti-freeze reward levers: `--w-ee-travel` (gripper world travel), `--w-prox-travel` (base/shoulder/
+  elbow travel).
+
+**Result — Grad-CAPS is a correct SMOOTHNESS tool but NOT an anti-freeze tool. The arm stays FROZEN.**
+1. **pose_step lies.** It is joint-space summed over all joints, so smooth distal-WRIST motion (which
+   only pans the arm-mounted camera and cheaply satisfies 1-step curiosity) inflates it while the arm
+   never translates. Initial "Grad-CAPS moves 3× the baseline" read was WRONG; the **overhead** video
+   frame-diff is the honest world-motion signal (~0.1–0.6/255 ≈ warmup-random 0.59 ⇒ ≈ frozen).
+2. **Grad-CAPS (λ_temp 1):** smoothest actions of all (a_rate2, qd_rev lowest) but world-frozen.
+   Smooth distal panning costs ~0 Grad-CAPS, so it can't force translation.
+3. **`--w-ee-travel` (gripper xyz reward):** FAILED. Gripper sits ~6 cm off the wrist axis, so a 0.3 rad
+   wrist wiggle moves it ~1.9 cm — the reward is gamed by distal wiggle (overhead stayed frozen; w=100
+   did it jerkily, Grad-CAPS λ=1 lost the tug-of-war).
+4. **`--w-prox-travel` (base/shoulder/elbow reward):** FAILED. w=100 drove `prox_step` 0.495 (3.5×
+   control) but `ee_range` stayed flat (0.40 vs control 0.43) and the overhead shows the arm in the SAME
+   config across the whole clip — i.e. smooth in-place **oscillation**, not roaming.
+
+**Root cause (confirms the 2026-06-13 finding):** every PER-STEP motion reward is gamed by smooth
+in-place oscillation; the deterministic policy never widens world coverage. This is the deterministic-
+policy exploration problem, not a smoothness problem. **Wide world-space motion needs an exploration
+mechanism, not another shaped per-step reward.** Two real paths (user to choose):
+(a) **re-add entropy/stochastic actor + keep Grad-CAPS** — proven roamer (safe15, α=0.2); reverses the
+2026-06-12 deterministic decision; recommended.
+(b) **coverage/RND novelty bonus** rewarding NEW poses (not per-step motion), keep deterministic —
+honors the decision but experimental.
+Either way **keep Grad-CAPS for smoothness** — it does its job; it just can't un-freeze.
+User chose: STOP & write up (this entry). Code on branch, not merged. wandb runs: base0/wrate3/gcaps1
+(wave 1), ee0/ee30/ee100 (gripper-roam), prox0/prox40/prox100 (proximal-roam); videos every 1k.
