@@ -657,7 +657,7 @@ def main(args):
               ("r_cur", "r_safe", "cur_contrib", "contacts", "table_contacts",
                "motion", "ret", "frac_block", "frac_table",
                "rate", "rate2", "energy", "qd_mean", "tau_sat", "qd_rev",
-               "r_rate", "r_energy", "pose_step", "ee_step", "r_roam")}
+               "r_rate", "r_energy", "pose_step", "ee_step", "prox_step", "r_roam")}
     recent_mse = {k: deque(maxlen=2000) for k in ("mse_block", "mse_table", "mse_none")}
     t0 = time.time()
     last_wm = last_sac = None
@@ -809,6 +809,12 @@ def main(args):
             prev_qpos_dec = qpos_dec
         pose_step = np.where(is_start, 0.0,
                              np.linalg.norm(qpos_dec - prev_qpos_dec, axis=-1)).astype(np.float32)
+        # proximal-joint travel (base/shoulder/elbow = joints 0-2): the GROSS-repositioning
+        # signal a wrist wiggle cannot fake (unlike ee_step, whose gripper xyz moves ~6 cm per
+        # 0.3 rad of wrist rotation). The roam reward pays THIS so the only way to earn it is to
+        # actually swing/reach the arm through space; Grad-CAPS keeps the swings smooth.
+        prox_step = np.where(is_start, 0.0,
+                             np.linalg.norm(qpos_dec[:, :3] - prev_qpos_dec[:, :3], axis=-1)).astype(np.float32)
         prev_qpos_dec = qpos_dec
         recent_qpos.append(qpos_dec.copy())
 
@@ -843,7 +849,7 @@ def main(args):
         # anti-freeze roaming reward: pay end-effector WORLD travel so the policy has a reason
         # to translate through space (curiosity alone is satisfiable by in-place wrist-cam pan).
         # Grad-CAPS (--lambda-temp) keeps that travel smooth. 0 unless --w-ee-travel set.
-        r_roam = args.w_ee_travel * ee_step
+        r_roam = args.w_ee_travel * ee_step + args.w_prox_travel * prox_step
         reward = safe_term + cur_term + r_rate + r_energy + r_roam
         comps = np.stack([cur_term, safe_term, r_rate, r_energy], -1).astype(np.float32)  # REWARD_COMPONENTS order
 
@@ -871,7 +877,7 @@ def main(args):
                          ("rate", rate), ("rate2", rate2), ("energy", energy),
                          ("qd_mean", qd_mean), ("tau_sat", tau_sat), ("qd_rev", qd_rev),
                          ("r_rate", r_rate), ("r_energy", r_energy), ("pose_step", pose_step),
-                         ("ee_step", ee_step), ("r_roam", r_roam)):
+                         ("ee_step", ee_step), ("prox_step", prox_step), ("r_roam", r_roam)):
             recent[key].append(float(np.mean(val)))
 
         # --- advance latent + history; reset timed-out envs ---
@@ -930,6 +936,7 @@ def main(args):
                  "reward/r_energy": np.mean(recent["r_energy"]),
                  "explore/pose_step": np.mean(recent["pose_step"]),     # joint travel/decision; ~0 = parked
                  "explore/ee_step": np.mean(recent["ee_step"]),         # WORLD gripper travel/decision; ~0 = frozen-in-space
+                 "explore/prox_step": np.mean(recent["prox_step"]),     # base/shoulder/elbow travel/decision (gross reposition)
                  "reward/r_roam": np.mean(recent["r_roam"]),
                  "buffer/transitions": buf.total, "perf/steps_per_sec": sps,
                  "wm/h_fwd": h_fwd}
@@ -1142,10 +1149,14 @@ def parse_args():
                         "blow-up before tanh; smaller eps = sharper jitter penalty).")
     p.add_argument("--w-ee-travel", type=float, default=0.0,
                    help="anti-freeze roaming reward: +W * ||gripper_xyz_t - gripper_xyz_{t-1}|| (world "
-                        "end-effector travel per decision, episode-start masked). Gives the policy a "
-                        "reason to TRANSLATE through space -- curiosity alone is satisfied by in-place "
-                        "wrist-cam pan from distal jitter (the freeze). Pair with --lambda-temp so the "
-                        "roaming stays smooth. Enters reward (not a separate Q head).")
+                        "end-effector travel per decision, episode-start masked). NOTE: gripper xyz also "
+                        "moves ~6cm per 0.3rad wrist rotation, so this is gameable by distal wiggle; "
+                        "prefer --w-prox-travel. Pair with --lambda-temp. Enters reward (not a Q head).")
+    p.add_argument("--w-prox-travel", type=float, default=0.0,
+                   help="anti-freeze roaming reward on PROXIMAL joints: +W * ||q[0:3]_t - q[0:3]_{t-1}|| "
+                        "(base/shoulder/elbow travel per decision, episode-start masked). A wrist wiggle "
+                        "cannot fake it, so the only way to earn it is to actually swing/reach the arm "
+                        "through space. Pair with --lambda-temp for smooth swings. Reward, not a Q head.")
     p.add_argument("--warmup-random", action="store_true",
                    help="act with uniform random actions during start_steps (restores the pre-2026-06-12 "
                         "warmup as an opt-in): buffer diversity for from-scratch sim runs; acting is "
