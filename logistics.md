@@ -690,3 +690,45 @@ rewards in-place jitter" root cause directly). Runs in flight (100k): `sexpl3` (
 a_max 0.3/W1) and `sexpl4` (best explorer, noise 0.6/W0). `snomax` (a_max removed) retired after
 confirming the cap is irrelevant. Note: even safe15 had contacts collapse post-warmup — entropy
 restores *movement*, not necessarily *block contact*; sexpl4's noise is the better contact lever.
+
+## Log — 2026-06-15 — α re-add VALIDATED (partial) at 20k sim: encoder un-parked, but lags safe15's pace
+
+**Resolves the open maintainer decision above** (re-add the stochastic/entropy actor). The α=0.2
+re-add shipped as commit `2e3217c` (Option 1: SAC stochastic-train / deterministic-deploy = exactly
+safe15's scheme); this 20k sim run tests whether it restores the encoder stability + WM prediction
+that the 2026-06-12 fully-deterministic actor lost (it parked → eff_rank 1.3–3.8 everywhere).
+
+**Run** — W&B `alpha20k` = **`6bl63r0y`** (state `finished`, step 19999), ran on a RunPod A100-80GB,
+**not pushed** (results recorded here from W&B cloud). Config = safe15 reproduced exactly — λ_cur 20,
+λ_safe **0.1**, δ **15**, α 0.2, action_max 0.3, β 0.3, H_fwd,max 1, 8 envs, start_steps 1000,
+action_block 5, H_bwd 3, γ 0.9 — with `train.py`'s **hardware** safety defaults (δ=9, λ_safe=2.2)
+overridden to these sim-calibrated values (the defaults are freeze-grade in smooth sim). Two earlier
+aborts: `ry7rxgs3` stopped @1300 by a session interrupt; relaunched detached (`setsid`) as `6bl63r0y`,
+which ran to completion. Video every 1k steps (dual-cam) as requested.
+
+| metric | **alpha20k @20k** | safe15 @20k (bar) | safe15 @100k | det-era (parked) |
+|---|---|---|---|---|
+| `encoder/eff_rank` | **12.88 ↑** | 22.72 | 33.61 | 1.3–3.8 |
+| `encoder/z_std` | **0.914** | 0.953 | 0.984 | →low |
+| `encoder/feat_corr` | **0.208** | 0.158 | 0.127 | →1 |
+| WM pred/persist (`pred_loss÷identity_baseline`) | **0.338** | 0.149 | 0.130 | — |
+| `reward/r_cur` | **0.665** | 0.724 | 0.777 | — |
+| `reward/r_safe` | **−30.0** | −36.5 | −31.2 | — |
+| `interact/contacts_per_step` | **0.034** | 0.0003 | 0.0009 | ~0.001 |
+
+**Verdict — PARTIAL PASS.** The α re-add does its core job: it **un-parked the encoder**. eff_rank
+climbed to 12.9 and was *still rising* at 20k (vs the deterministic era's 1.3–3.8 collapse); z_std 0.91
+(not →0), feat_corr 0.21 (not →1); the WM **beats persistence** (0.34 < 1). Squarely in safe15's
+*healthy regime*, and it actually makes **~100× more block contact** than safe15 did (0.034 vs
+0.0003/step) — a plus for the "interact with blocks" goal. **But it does NOT numerically tie safe15 at
+the same step**: eff_rank 12.9 vs 22.7 (~57%) and pred/persist 0.34 vs 0.15 (~2× the loss ratio).
+Same direction and regime, quantitatively behind. r_cur / r_safe are comparable.
+
+**Confounds (why the gap, all plausible, none verified):** (1) sim plant is now **kp=499.11** (safe15
+ran kp=998.22) — softer plant, baked into the branch XML, can't revert without diverging the branch;
+(2) different seed; (3) **eff_rank had not plateaued at 20k** — safe15 needed ~100k to reach 33.6, so
+a 20k-vs-20k slice may understate where this lands at 100k (untested). Note `eff_rank_probe` is a
+rollout-probe fallback (probe_v1 gone from HF) → not comparable to safe15's probe; the batch
+`encoder/eff_rank` above is the apples-to-apples metric. **Next** (if pursued): a 100k run at kp=499 to
+see whether eff_rank/pred close on safe15, or accept the healthy-regime result as sufficient for the
+α-re-add goal. Read via `wandb.Api().run(".../curious-robot/6bl63r0y")`.
