@@ -163,3 +163,78 @@ _(add a dated entry per run)_
   non-freezing / WM-safe, but does not by itself solve explore-toward-objects** — that remains THE open
   problem (curiosity gradient points away from blocks; reward-shaping / λ_cur / intrinsic-exploration
   territory, orthogonal to the safety weighting). Final ckpt on HF (`safe15/ckpt_0100000.pt`).
+- 2026-06-16 — **entropy (search) is the missing ingredient, not intrinsic-reward magnitude or shape:
+  α=0 collapses regardless of curiosity weight OR an added RND novelty bonus.** Tested the hypothesis
+  that removing the SAC entropy term (α=0) and compensating with a stronger / better-shaped intrinsic
+  reward keeps the arm exploring and the encoder healthy. It does not.
+  - **Infra / perf** (`src/train.py`, `env/`): (1) **render-skip** — `step_block` keeps only the final
+    substep's obs but rendered all `action_block=5` wrist frames; skipping the 4 discarded renders is a
+    *pure* speedup (render is read-only → trajectory bit-identical) → **dec-steps/s 2.7→4.7 (~1.8×)** single-run.
+    (2) New collapse/stall diagnostics: `interact/arm_speed` (mean |q̇|, direct stall signal),
+    `policy/entropy` + `policy/action_absmean` (policy-collapse signal), `wm/pred_over_identity`.
+    (3) α=0 supported cleanly (`log_alpha=-inf`, entropy terms vanish, no NaN). (4) New composable intrinsic
+    rewards: `--lambda-rnd` (RND) and `--lambda-knn` (k-NN state-entropy coverage), each added iff weight≠0.
+    (5) 5-way concurrency OOMs the 80 GB A100 at the step-1000 WM-engagement (5×~20 GB ViT-backward peaks)
+    → run with `--wm-grad-checkpoint` (~4× lower peak, numerically identical grads).
+  - **Sweep 1 — α=0 × λ_cur ∈ {20,50,100,200}** (+ α=0.2 control; λ_safe=0.1, β=0.3, seed=0; W&B names
+    `a0_lcur{20,50,100,200}`, `a02_lcur20`). Identical seeded warmup ⇒ identical buffer/encoder at step 1000,
+    diverging *only* by α/λ_cur. **Monotonically null in λ_cur.** Every α=0 run collapses identically: policy
+    → saturated bang-bang (`a|·|`=1.00, entropy ≈ −500), `eff_rank_probe` pinned **1.5–3.6**, contacts → 0 — at
+    λ_cur=20 *and* 200. Only the α=0.2 control stays healthy (eff_rank ≈ 6, entropy ≈ +5, `a|·|`=0.62, contacts
+    ≈0.035). **Smoking gun:** under α=0 `r_cur` *falls* (0.26→0.10) while under α=0.2 it *rises* (0.26→0.58) — the
+    deterministic policy starves its own curiosity (the WM learns its narrow behaviour), the stochastic one keeps
+    generating surprise. ⇒ λ_cur is a reward *scale* (scale-invariant on the optimal policy once curiosity
+    dominates safety), not an exploration knob.
+  - **Sweep 2 — α=0 + curiosity(λ_cur=20) + RND**, λ_rnd ∈ {5,10,20,40} (W&B `rnd_l{5,10,20,40}`; baseline
+    `a0_lcur20`=λ_rnd 0). RND = frozen random target + chasing predictor on the latent z, predictor trained in the
+    SAC loop, reward mean-normalised (raw RND err ~0.005 is ~1000× below cur_contrib → normalise to ~O(λ_rnd)).
+    **RND does not rescue α=0.** *Transient* effect only: at step ~1200 the policy is markedly less saturated
+    (entropy −67/−95, `a|·|` 0.82/0.85 for λ5/λ20 vs baseline −450/→1.0), but by step ~3000–3500 **all** RND runs
+    fall into the same basin — eff_rank 2.1–3.5, `a|·|` 0.94–1.00, entropy −301…−515, contacts ≤0.03 — far below the
+    α=0.2 control. λ_rnd=20 is the *least* collapsed (entropy −301, `a|·|` 0.94, contacts 0.028) but still collapses.
+    **Two reinforcing causes:** (a) RND on the *co-trained* latent z is coupled to the very encoder that's collapsing
+    — as eff_rank(z)→2 the RND distances vanish, so RND can't prevent the collapse it depends on; (b) α=0 removes the
+    *stochastic search* — a deterministic policy commits to one trajectory, the RND predictor learns it, the bonus
+    drops, and with no entropy the policy can't escape.
+
+  | run | α | λ_cur | λ_rnd | eff_rank_p | entropy | act_abs | contacts/s | verdict |
+  |-----|---|-------|-------|-----------|---------|---------|-----------|---------|
+  | a02_lcur20 | 0.2 | 20 | 0 | ~6 | +5 | 0.62 | 0.035 | **healthy** |
+  | a0_lcur20 | 0 | 20 | 0 | 2.9 | −512 | 1.00 | 0.000 | collapsed |
+  | a0_lcur200 | 0 | 200 | 0 | 3.6 | −521 | 1.00 | 0.000 | collapsed |
+  | rnd_l5 | 0 | 20 | 5 | 2.1 | −515 | 1.00 | 0.002 | collapsed |
+  | rnd_l10 | 0 | 20 | 10 | 2.3 | −435 | 1.00 | 0.008 | collapsed |
+  | rnd_l20 | 0 | 20 | 20 | 2.4 | −301 | 0.94 | 0.028 | collapsed (least) |
+  | rnd_l40 | 0 | 20 | 40 | 3.5 | −492 | 1.00 | 0.000 | collapsed |
+
+  **Synthesis:** the missing ingredient for exploration-without-stalling is *search* (policy entropy), not the
+  *magnitude* (λ_cur) or *shape* (RND) of the intrinsic reward. Curiosity and RND are *rewards*; SAC's exploration
+  is the entropy term. Open follow-ups: (i) RND on a *fixed* encoding (raw obs / frozen random encoder) to decouple
+  novelty from the collapsing z and isolate cause (a) from (b); (ii) RND/coverage as a bonus in the *working* α>0
+  regime to attack the standing explore-toward-blocks problem; (iii) a small target-entropy floor instead of α=0.
+- 2026-06-16 (cont.) — **isolating "search, not the entropy reward" + the collapse is a stable attractor.**
+  Three follow-ups confirmed the synthesis. New code: `--actor-logstd-min` (policy-std floor), `--explore-noise`
+  (post-tanh DDPG/TD3 action noise), both at α=0.
+  - **std-floor (α=0, log_std≥−1/0):** *defeated by tanh mean-saturation* — flooring the std bounds the std but
+    the greedy α=0 mean still drives to the ±1 rails, where a floored std produces ~no action variation. Re-collapsed
+    by ~2.5k (entropy −370…−400, `a|·|`→1.0, eff_rank 2–4). Don't floor std; inject in action space.
+  - **action-noise (α=0 + curiosity, ε ∈ {0.3,0.5,0.8}):** *saturation-proof and it works at the right level —
+    NON-MONOTONIC.* ε=0.5 held eff_rank ≈5 (≈ the α=0.2 control) through 3.4k with the arm moving — **the closest
+    anything came to meeting the 3 criteria WITHOUT the entropy term** (policy still saturated, but the noise keeps
+    the *data*/encoder diverse). ε=0.3 too weak (collapsed, arm_speed→0.76 = stalling); ε=0.8 dipped (eff_rank 2.4,
+    over-randomised). ⇒ a *sufficient* external search source substitutes for the entropy term — confirming search,
+    not the entropy reward, is the necessary ingredient — but it's finicky (a tuned band, unlike the self-tuning α).
+  - **`rnd_l20_nosafe` (pure curiosity+RND, λ_safe=0, α=0) → 20k:** *the α=0 collapse is a STABLE ATTRACTOR, not a
+    transient.* Run ~6× past first collapse, no recovery: entropy pinned −510 the entire run, `a|·|`=1.0, eff_rank
+    wobbled 2.0–4.3 and **declined to 2.0 by 19.5k** (lowest of the run). Once the policy saturates there is no
+    un-saturating force in the reward, so recovery is mechanically impossible. (`logstd_min`/`explore-noise`/`lambda-rnd`
+    are the new knobs; std-floor noted as a trap in `--help`.)
+  - **Anatomy of prediction error under collapse (read off `rnd_l20_nosafe`):** (1) absolute WM error `r_cur` and the
+    persistence baseline *both rise* in lockstep (latent-scale artifact — collapsed encoder inflates the magnitude of
+    its few active dims, `z_std` 0.29→0.43), so the scale-invariant **`pred/per` ratio is FLAT ≈0.55–0.6 the whole
+    run** — the WM nails the degenerate behaviour to a fixed relative accuracy and plateaus. ⇒ **"prediction improving"
+    is a TRAP health metric**: low `pred/per` means the behaviour is trivially predictable (collapsed), not that the
+    model is healthy. (2) The **RND predictor error → ~0 almost immediately** and stays there: the predictor learns the
+    narrow collapsed state-distribution perfectly, so its novelty signal vanishes — *the coverage signal dies with the
+    coverage*, the mechanistic reason RND can't self-rescue on the co-trained latent. The honest health signals remain
+    `encoder/eff_rank_probe` (+`z_std`/`feat_corr`) and `policy/entropy`/`interact/arm_speed` — NOT `pred/per`.

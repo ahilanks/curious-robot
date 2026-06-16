@@ -90,8 +90,9 @@ class VectorMujocoEnv:
 
         def run(env, ab):
             obs, infos = None, []
-            for a_k in ab:
-                obs, info = env.step(a_k)
+            last = len(ab) - 1
+            for k, a_k in enumerate(ab):
+                obs, info = env.step(a_k, render=(k == last))      # render only the kept (final) obs
                 infos.append(info)
             return obs, infos
         self._pending = self._map(run, self.envs, list(action_blocks))
@@ -141,8 +142,9 @@ def _env_worker(remote, parent_remote, env_kwargs):
                 remote.send(env.step(data))
             elif cmd == "step_block":          # run a whole action_block in-worker: 1 IPC round-trip / decision
                 obs, infos = None, []
-                for a_k in data:               # data: (action_block, n_dof)
-                    obs, info = env.step(a_k)
+                last = len(data) - 1
+                for k, a_k in enumerate(data): # data: (action_block, n_dof)
+                    obs, info = env.step(a_k, render=(k == last))  # render only the kept (final) obs
                     infos.append(info)
                 remote.send((obs, infos))      # final obs + per-substep info list
             elif cmd == "reset":

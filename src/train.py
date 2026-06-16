@@ -95,6 +95,18 @@ class TwinQ(nn.Module):
         return self.q1(za), self.q2(za)
 
 
+class RNDNet(nn.Module):
+    """Small MLP for RND target/predictor over the latent z (Burda et al. 2018)."""
+    def __init__(self, z_dim, hidden=256, out_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(z_dim, hidden), nn.ReLU(),
+                                 nn.Linear(hidden, hidden), nn.ReLU(),
+                                 nn.Linear(hidden, out_dim))
+
+    def forward(self, z):
+        return self.net(z)
+
+
 # ------------------------------------------------------------------------ buffer
 class ReplayBuffer:
     """Per-env ring buffers (so WM windows stay inside one env's contiguous stream)
@@ -211,6 +223,34 @@ class ReplayBuffer:
 def encode_obs(wm, px_uint8, proprio_np, device):
     return wm.encode(to_norm_pixel(px_uint8, device),
                      torch.as_tensor(proprio_np, device=device).float())
+
+
+@torch.no_grad()
+def knn_state_entropy_reward(z, buf, k):
+    """Coverage / particle state-entropy reward (RE3/APT-style): for each latent z_t,
+    reward = log(1 + mean distance to its k nearest neighbours among a buffer of recent
+    visited latents). It pays to be FAR from the visited manifold -> the policy is pushed
+    to low-density (frontier) regions -> the visitation manifold inflates toward uniform
+    coverage (max state entropy). Unlike prediction-error curiosity this measures novelty
+    (distance) DIRECTLY, so it is immune to the noisy-TV problem and doesn't vanish as the
+    WM learns. z:(B,D), buf:(M,D) -> (B,). Returns 0 until the buffer holds >k latents.
+    Caveat: buf latents are encoded by an earlier (co-trained) encoder, so keep buf recent."""
+    if buf.shape[0] <= k:
+        return torch.zeros(z.shape[0], device=z.device)
+    d = torch.cdist(z, buf)                                   # (B, M) pairwise latent dist
+    kth = d.topk(k, dim=1, largest=False).values             # k nearest per row
+    return torch.log1p(kth.mean(dim=1))                       # (B,)
+
+
+@torch.no_grad()
+def rnd_novelty_reward(rnd_pred, rnd_target, z):
+    """RND novelty (Burda 2018): squared error of a trained predictor against a FROZEN
+    randomly-initialised target, evaluated on the latent z. High for z unlike those the
+    predictor has been trained on (off the visited manifold), -> 0 as a region is visited
+    and the predictor learns it. The target is deterministic, so (unlike WM prediction
+    error) it is immune to the noisy-TV problem and doesn't depend on the WM's dynamics.
+    z:(B,D) -> (B,). Note: z is the co-trained latent, so keep the predictor learning."""
+    return (rnd_pred(z) - rnd_target(z)).pow(2).mean(-1)
 
 
 @torch.no_grad()
@@ -377,18 +417,28 @@ def main(args):
     sigreg = SIGReg(knots=17, num_proj=1024).to(device)
     z_dim = wm.z_dim
 
-    actor = Actor(z_dim, a_dim).to(device)
+    actor = Actor(z_dim, a_dim, log_std_range=(args.actor_logstd_min, 2)).to(device)
     critic = TwinQ(z_dim, a_dim).to(device)
     critic_tgt = TwinQ(z_dim, a_dim).to(device)
     critic_tgt.load_state_dict(critic.state_dict())
     for p in critic_tgt.parameters():
         p.requires_grad_(False)
-    log_alpha = torch.tensor(float(np.log(args.alpha)), device=device)   # fixed entropy temp
+    # fixed entropy temp; alpha=0 -> log_alpha=-inf -> alpha.exp()=0 cleanly disables the
+    # entropy bonus (the SAC entropy terms are alpha*logp with finite logp, so 0*logp=0, no NaN)
+    log_alpha = torch.tensor(float(np.log(args.alpha)) if args.alpha > 0 else float("-inf"),
+                             device=device)
 
     actor_opt = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
     critic_opt = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
     wm_opt = torch.optim.AdamW([p for p in wm.parameters() if p.requires_grad],
                                lr=args.wm_lr, weight_decay=1e-3)
+
+    # RND novelty (only trained/used when --lambda-rnd != 0): frozen random target + chasing predictor
+    rnd_target = RNDNet(z_dim, args.rnd_hidden, args.rnd_out_dim).to(device)
+    for p in rnd_target.parameters():
+        p.requires_grad_(False)
+    rnd_pred = RNDNet(z_dim, args.rnd_hidden, args.rnd_out_dim).to(device)
+    rnd_opt = torch.optim.Adam(rnd_pred.parameters(), lr=args.rnd_lr)
 
     cap = int(np.clip(args.buffer_frac * args.total_steps, 1000, 50_000))
     cap_per_env = max(cap // args.n_envs, args.history_size + args.h_fwd_max + 8)
@@ -420,6 +470,8 @@ def main(args):
     z = encode_obs(wm, obs["image"], obs["proprio"], device)        # (n_envs, z_dim)
     hist_z = z.unsqueeze(0).repeat(H, 1, 1)
     hist_a = torch.zeros(H, args.n_envs, a_dim, device=device)
+    knn_buf = torch.zeros(0, z_dim, device=device)    # recent-latent buffer for the k-NN coverage reward
+    rnd_ema = None                                    # running mean of the RND error, to normalize its arbitrary scale
     is_start = np.ones(args.n_envs, bool)
     ep_len = np.zeros(args.n_envs, np.int64)
     ep_ret = np.zeros(args.n_envs, np.float32)
@@ -429,10 +481,11 @@ def main(args):
     updates_at_stage = 0
     recent = {k: deque(maxlen=400) for k in
               ("r_cur", "r_safe", "cur_contrib", "contacts", "table_contacts",
-               "motion", "ret", "frac_block", "frac_table")}
+               "motion", "ret", "frac_block", "frac_table", "arm_speed",
+               "r_knn", "knn_contrib", "r_rnd", "rnd_contrib")}
     recent_mse = {k: deque(maxlen=2000) for k in ("mse_block", "mse_table", "mse_none")}
     t0 = time.time()
-    last_wm = last_sac = None
+    last_wm = last_sac = last_rnd = None
     last_zb = None
     video_on = imageio is not None and args.video_every > 0
     wrist_buf = deque(maxlen=args.video_steps)      # train-video clips (per-env frames, tiled)
@@ -455,7 +508,7 @@ def main(args):
         these GPU updates overlap the env workers rendering the next decision. Update
         count and schedule are identical to the serial loop; they just see the buffer
         minus the single in-flight transition (added after wait) -- negligible off-policy."""
-        nonlocal last_wm, last_sac, last_zb, updates_at_stage
+        nonlocal last_wm, last_sac, last_zb, last_rnd, updates_at_stage
         # --- world-model co-training: autoregressive MSE rollout + beta*SIGReg ---
         if step >= args.start_steps and step % args.wm_update_every == 0:
             batch = buf.sample_wm(args.wm_batch_size, H + h_fwd)
@@ -502,7 +555,14 @@ def main(args):
                     for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
                         pt.mul_(1 - args.tau).add_(args.tau * p)
                 last_zb = zb.detach()
-                last_sac = (float(critic_loss.item()), float(actor_loss.item()))
+                # entropy (-mean logp) and mean |a|: with alpha=0 these reveal whether the
+                # policy collapses to (near-)deterministic -> arm stall -> data/encoder collapse
+                last_sac = (float(critic_loss.item()), float(actor_loss.item()),
+                            float((-logpp).mean().item()), float(ap.abs().mean().item()))
+                if args.lambda_rnd:   # train RND predictor to chase the frozen target on visited z
+                    rnd_loss = (rnd_pred(zb.detach()) - rnd_target(zb.detach())).pow(2).mean()
+                    rnd_opt.zero_grad(); rnd_loss.backward(); rnd_opt.step()
+                    last_rnd = float(rnd_loss.item())
         return h_fwd
 
     for step in range(args.total_steps):
@@ -514,6 +574,10 @@ def main(args):
                 a = torch.rand(args.n_envs, a_dim, device=device) * 2 - 1   # warmup
             else:
                 a, _, _ = actor.sample(z)
+                if args.explore_noise > 0:   # DDPG/TD3-style action-space exploration noise: keeps the
+                    a = (a + args.explore_noise * torch.randn_like(a)).clamp(-1, 1)  # APPLIED actions (and
+                    # hence the data + encoder) diverse even when the alpha=0 policy saturates tanh -- a
+                    # search mechanism that, unlike a log_std floor, isn't squashed near the tanh rails.
         hist_a = torch.cat([hist_a[1:], a.unsqueeze(0)], 0)
         a_env = a.detach().cpu().numpy().reshape(args.n_envs, args.action_block, n_dof)
 
@@ -528,12 +592,15 @@ def main(args):
         contacts = np.zeros(args.n_envs, np.float32)
         table_contacts = np.zeros(args.n_envs, np.float32)
         motion = np.zeros(args.n_envs, np.float32)
+        arm_speed = np.zeros(args.n_envs, np.float32)
         for info in sub_infos:
             r_safe += info["safety_reward"]
             contacts += info["object_contacts"].astype(np.float32)
             table_contacts += info["table_contacts"].astype(np.float32)
             motion += info["object_motion"]
+            arm_speed += np.abs(info["qvel"]).mean(axis=1)   # mean joint speed -> direct arm-stall signal
         r_safe /= args.action_block      # one r_safe per decision (README: Env(a_t) -> r_safe_t)
+        arm_speed /= args.action_block
 
         # freeze a FIXED diverse probe set (early warmup obs) so encoder/eff_rank_probe
         # measures encoder health independent of how narrow the policy's behavior gets.
@@ -546,9 +613,27 @@ def main(args):
                 print(f"[probe] froze {len(probe_px)} obs for encoder/eff_rank_probe", flush=True)
 
         z_next = encode_obs(wm, obs["image"], obs["proprio"], device)
-        r_cur = curiosity_reward(wm, hist_z, hist_a, z_next).cpu().numpy()        # (n_envs,) >= 0
-        cur_term = args.lambda_cur * np.log1p(r_cur)         # lambda_cur * symlog(r_cur)  (r_cur>=0)
-        reward = args.lambda_safe * r_safe + cur_term        # r = lambda_safe*r_safe + lambda_cur*symlog(r_cur)
+        r_cur = curiosity_reward(wm, hist_z, hist_a, z_next).cpu().numpy()        # (n_envs,) >= 0; PER + diagnostics
+        # --- intrinsic reward: composable terms, each added iff its weight != 0 ---
+        cur_term = args.lambda_cur * np.log1p(r_cur) if args.lambda_cur else np.zeros_like(r_cur)  # lambda_cur*symlog(r_cur)
+        if args.lambda_rnd:                                   # RND novelty (frozen random target)
+            r_rnd = rnd_novelty_reward(rnd_pred, rnd_target, z_next).cpu().numpy()
+            # The raw RND error scale is arbitrary (random net + z scale) and shrinks as the predictor
+            # learns, so normalize by a running mean of it -> rnd_term ~ O(lambda_rnd), centered at
+            # lambda_rnd for a typical state and higher for relatively-novel z (and non-vanishing as the
+            # predictor learns). Lazy-init to the first batch so the scale is right from step 0.
+            m = float(r_rnd.mean())
+            rnd_ema = m if rnd_ema is None else 0.995 * rnd_ema + 0.005 * m
+            rnd_term = args.lambda_rnd * r_rnd / (rnd_ema + 1e-8)
+        else:
+            r_rnd = np.zeros_like(r_cur); rnd_term = np.zeros_like(r_cur)
+        if args.lambda_knn:                                  # k-NN coverage / state-entropy (alt to RND)
+            r_knn = knn_state_entropy_reward(z_next, knn_buf, args.knn_k).cpu().numpy()
+            knn_buf = torch.cat([knn_buf, z_next.detach()], 0)[-args.knn_buffer:]          # ring of recent latents
+        else:
+            r_knn = np.zeros_like(r_cur)
+        knn_term = args.lambda_knn * r_knn
+        reward = args.lambda_safe * r_safe + cur_term + rnd_term + knn_term   # safe + curiosity + RND + coverage
 
         # contact-conditioned curiosity MSE (r_cur = ||zhat-z||^2): is the model more
         # surprised poking a block than scraping the table or moving in free space?
@@ -568,8 +653,10 @@ def main(args):
                 r=reward, d=done, is_start=is_start.copy(), prio=r_cur)
         for key, val in (("r_cur", r_cur), ("r_safe", r_safe), ("cur_contrib", cur_term),
                          ("contacts", contacts), ("table_contacts", table_contacts),
-                         ("motion", motion), ("ret", reward),
-                         ("frac_block", touch_block), ("frac_table", touch_table)):
+                         ("motion", motion), ("ret", reward), ("arm_speed", arm_speed),
+                         ("frac_block", touch_block), ("frac_table", touch_table),
+                         ("r_knn", r_knn), ("knn_contrib", knn_term),
+                         ("r_rnd", r_rnd), ("rnd_contrib", rnd_term)):
             recent[key].append(float(np.mean(val)))
 
         # --- advance latent + history; reset timed-out envs ---
@@ -608,12 +695,17 @@ def main(args):
             safe_m, cur_m = np.mean(recent["r_safe"]), np.mean(recent["cur_contrib"])
             d = {"reward/r_cur": np.mean(recent["r_cur"]),
                  "reward/r_safe": safe_m,
+                 "reward/r_rnd": np.mean(recent["r_rnd"]),            # raw RND novelty error
+                 "reward/rnd_contrib": np.mean(recent["rnd_contrib"]),  # lambda_rnd * symlog(r_rnd)
+                 "reward/r_knn": np.mean(recent["r_knn"]),            # raw kNN coverage reward
+                 "reward/knn_contrib": np.mean(recent["knn_contrib"]),  # lambda_knn * r_knn
                  "reward/cur_contrib": cur_m,                 # lambda_cur * symlog(r_cur)
                  "reward/safe_cur_ratio": abs(safe_m) / max(abs(cur_m), 1e-6),
                  "reward/total": np.mean(recent["ret"]),
                  "interact/contacts_per_step": np.mean(recent["contacts"]),
                  "interact/table_contacts_per_step": np.mean(recent["table_contacts"]),
                  "interact/object_motion": np.mean(recent["motion"]),
+                 "interact/arm_speed": np.mean(recent["arm_speed"]),   # mean joint |qvel|: stall -> 0
                  "interact/frac_touch_block": np.mean(recent["frac_block"]),
                  "interact/frac_touch_table": np.mean(recent["frac_table"]),
                  "buffer/transitions": buf.total, "perf/steps_per_sec": sps,
@@ -631,19 +723,24 @@ def main(args):
                           "encoder/feat_corr_probe": p_corr})
             if last_wm is not None:
                 d.update({"wm/pred_loss": last_wm[0], "wm/sigreg": last_wm[1],
-                          "wm/identity_baseline": last_wm[2]})
+                          "wm/identity_baseline": last_wm[2],
+                          "wm/pred_over_identity": last_wm[0] / max(last_wm[2], 1e-9)})  # <1 beats persistence
             if last_sac is not None:
                 d.update({"sac/critic_loss": last_sac[0], "sac/actor_loss": last_sac[1],
-                          "sac/alpha": float(log_alpha.exp().item())})
+                          "sac/alpha": float(log_alpha.exp().item()),
+                          "policy/entropy": last_sac[2], "policy/action_absmean": last_sac[3]})
+            if last_rnd is not None:
+                d["rnd/pred_loss"] = last_rnd                  # RND predictor MSE (should fall as states are visited)
             wlog(d, step)
             with open(out_dir / "metrics.jsonl", "a") as f:    # local metrics record (esp. when --no-wandb)
                 f.write(json.dumps({"step": step, **{k: float(v) for k, v in d.items()}}) + "\n")
-            print(f"[step {step}] r_safe={safe_m:.3f} cur_contrib={cur_m:.3f} "
-                  f"safe:cur={d['reward/safe_cur_ratio']:.2f} "
+            print(f"[step {step}] sps={sps:.1f} arm_spd={d['interact/arm_speed']:.3f} "
                   f"contacts/s={d['interact/contacts_per_step']:.2f} "
-                  f"mse[blk/tbl/none]={d.get('wm/mse_block', float('nan')):.2f}/"
-                  f"{d.get('wm/mse_table', float('nan')):.2f}/{d.get('wm/mse_none', float('nan')):.2f} "
-                  f"h_fwd={h_fwd} sps={sps:.1f}", flush=True)
+                  f"r_cur={d['reward/r_cur']:.3f} cur_contrib={cur_m:.2f} "
+                  f"pred/persist={d.get('wm/pred_over_identity', float('nan')):.2f} "
+                  f"effrank_p={d.get('encoder/eff_rank_probe', float('nan')):.1f} "
+                  f"zstd_p={d.get('encoder/z_std_probe', float('nan')):.2f} "
+                  f"H={d.get('policy/entropy', float('nan')):.2f} h_fwd={h_fwd}", flush=True)
 
         # --- checkpoint: upload to HF then clear from disk (bounded disk over a long run) ---
         if args.save_every > 0 and step > 0 and step % args.save_every == 0:
@@ -755,9 +852,33 @@ def parse_args():
                         "leaves gentle reaching / light contact / pickup (-tau*qddot<~15) penalty-free while "
                         "penalizing hard impacts and violent high-torque reversals (~40-560). The old 0.05 "
                         "penalized essentially all motion -> safety dominates -> policy freezes.")
+    # intrinsic exploration reward terms -- COMPOSABLE: each is added to the reward iff its
+    # weight != 0, so they stack (e.g. --lambda-cur 20 --lambda-rnd 1 = curiosity + RND).
+    # r_cur is always computed (PER priority + contact-bucket diagnostics) regardless of lambda_cur.
+    p.add_argument("--lambda-rnd", type=float, default=0.0,
+                   help="weight on the RND novelty reward: lambda_rnd*symlog(||pred(z)-target(z)||^2); 0 disables. "
+                        "Random-network distillation -- predictor chases a FROZEN random net on the latent z: high "
+                        "for novel z (off the visited manifold), ->0 as visited; stationary target (no noisy-TV). "
+                        "Add to the curiosity reward by setting lambda_rnd>0 alongside lambda_cur.")
+    p.add_argument("--rnd-out-dim", type=int, default=128, help="RND target/predictor output dim")
+    p.add_argument("--rnd-hidden", type=int, default=256, help="RND target/predictor hidden dim")
+    p.add_argument("--rnd-lr", type=float, default=1e-4, help="RND predictor Adam lr")
+    p.add_argument("--lambda-knn", type=float, default=0.0,
+                   help="weight on the k-NN coverage reward log(1+mean kNN latent dist); 0 disables (alt to RND)")
+    p.add_argument("--knn-k", type=int, default=12, help="k for the k-NN state-entropy estimate")
+    p.add_argument("--knn-buffer", type=int, default=4096,
+                   help="size of the recent-latent ring buffer the k-NN reward measures novelty against")
     # SAC (README)
     p.add_argument("--gamma", type=float, default=0.9)
     p.add_argument("--alpha", type=float, default=0.2, help="fixed entropy temperature")
+    p.add_argument("--actor-logstd-min", type=float, default=-5.0,
+                   help="lower clamp on policy log_std. Raise it (e.g. -1 -> std>=0.37, 0 -> std>=1) to floor "
+                        "policy std. NOTE: defeated by tanh saturation (the alpha=0 mean drives to +-1 where std "
+                        "produces ~no action variation) -- use --explore-noise for saturation-proof exploration.")
+    p.add_argument("--explore-noise", type=float, default=0.0,
+                   help="std of Gaussian noise added to the APPLIED action post-tanh, then clipped to [-1,1] "
+                        "(DDPG/TD3-style). Restores action-space search WITHOUT the entropy term, and -- unlike a "
+                        "log_std floor -- is not squashed when the alpha=0 policy saturates tanh. Only during rollout.")
     p.add_argument("--tau", type=float, default=0.005, help="Polyak rate")
     p.add_argument("--actor-lr", type=float, default=3e-4)
     p.add_argument("--critic-lr", type=float, default=3e-4)

@@ -261,8 +261,11 @@ class MujocoSO101Env:
         self._prev_obj_xpos = xpos
         return n_obj, n_table, motion
 
-    def step(self, action: np.ndarray) -> tuple[dict[str, np.ndarray], dict]:
-        """One env step: delta-target PD actuation, frame_skip substeps, safety reward."""
+    def step(self, action: np.ndarray, render: bool = True) -> tuple[dict[str, np.ndarray], dict]:
+        """One env step: delta-target PD actuation, frame_skip substeps, safety reward.
+        render=False skips the (OSMesa, CPU-bound) wrist render and returns image=None --
+        used for the non-final substeps of an action_block, whose image is discarded
+        anyway (only the block's final obs is kept). Cuts renders ~action_block-fold."""
         qpos_now = self.data.qpos[:self.n_dof].copy()
         qvel_before = self.data.qvel[:self.n_dof].copy().astype(np.float32)
         target = self.adapter.ctrl_target(action, qpos_now)
@@ -284,7 +287,7 @@ class MujocoSO101Env:
         qvel = self.data.qvel[:self.n_dof].copy().astype(np.float32)
         r_safe = float(safety_reward_np(applied_torque, qvel, qvel_before, self.tau_max,
                                         dt_safe=self.dt_safe, delta=self.safety_delta))
-        obs = self._get_obs()
+        obs = self._get_obs(render=render)
         info = {
             "applied_torque": applied_torque,
             "qvel": qvel,
@@ -313,9 +316,12 @@ class MujocoSO101Env:
 
     # --- Observation ----------------------------------------------------------
 
-    def _get_obs(self) -> dict[str, np.ndarray]:
-        self._wrist_renderer.update_scene(self.data, camera=self._wrist_cam_id)
-        wrist = self._wrist_renderer.render().copy()
+    def _get_obs(self, render: bool = True) -> dict[str, np.ndarray]:
+        if render:
+            self._wrist_renderer.update_scene(self.data, camera=self._wrist_cam_id)
+            wrist = self._wrist_renderer.render().copy()
+        else:
+            wrist = None                       # discarded substep: skip the costly render
         proprio = np.concatenate([
             self.data.qpos[:self.n_dof].astype(np.float32),
             self.data.qvel[:self.n_dof].astype(np.float32),
