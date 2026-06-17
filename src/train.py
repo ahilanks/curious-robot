@@ -525,6 +525,17 @@ def main(args):
         VecEnv = SubprocVectorMujocoEnv if args.env_backend == "subproc" else VectorMujocoEnv
     if args.start_steps < 0:                      # default-aware: skip random warmup on a real arm
         args.start_steps = 0 if args.env_backend == "hardware" else 1000
+    # Safety params are regime-dependent (sim vs real arm are MEASURED to differ): the real-arm
+    # (delta=9, lambda_safe=2.2) pair freezes sim policies, while sim's calibrated balance is
+    # (delta=15, lambda_safe=0.1). Resolve by backend unless the user set them explicitly, so one
+    # binary is safe in both regimes (a bare sim run no longer inherits the hardware deadband).
+    _hw = args.env_backend == "hardware"
+    if args.safety_delta is None:
+        args.safety_delta = 9.0 if _hw else 15.0
+    if args.lambda_safe is None:
+        args.lambda_safe = 2.2 if _hw else 0.1
+    print(f"[safety] {args.env_backend} backend -> delta={args.safety_delta}, "
+          f"lambda_safe={args.lambda_safe}", flush=True)
     env = VecEnv(n_envs=args.n_envs, frame_skip=args.frame_skip,
                  action_max=args.action_max,
                  safety_delta=args.safety_delta, seed=args.seed,
@@ -1056,21 +1067,23 @@ def parse_args():
     p.add_argument("--flatline-window", type=int, default=200)
     p.add_argument("--flatline-tol", type=float, default=0.03)
     # reward ('?' values; sweepable)
-    p.add_argument("--lambda-safe", type=float, default=2.2,
+    p.add_argument("--lambda-safe", type=float, default=None,
                    help="weight on the safety penalty r_safe: r = lambda_safe*r_safe + lambda_cur*symlog(r_cur). "
-                        "Default 2.2 (2026-06-12, real-arm calibration): under delta=9 benign motion scores "
-                        "exactly 0, so lambda_safe scales only genuine events — 2.2 makes one median "
-                        "user-labeled-bad substep cancel ~one decision's curiosity term. 0 ablates safety.")
+                        "Default-aware (explicit value always wins): sim backends use 0.1, the hardware backend "
+                        "uses 2.2 (2026-06-12 real-arm calibration: under delta=9 benign motion scores exactly 0, "
+                        "so lambda_safe scales only genuine events — 2.2 makes one median user-labeled-bad substep "
+                        "cancel ~one decision's curiosity term). 0 ablates safety.")
     p.add_argument("--lambda-cur", type=float, default=15.0,
                    help="curiosity weight on symlog(r_cur). r_cur is the per-dim MEAN squared pred error "
                         "(~O(0.1-1)); 15-20 keeps curiosity audible against raw |r_safe|~50 at lambda_safe 0.1. "
                         "Default 15 (2026-06-11; safe15/campaign history ran 20 — old default 1.0 silently "
                         "shrank curiosity 20x and caused one mis-deploy).")
-    p.add_argument("--safety-delta", type=float, default=9.0,
-                   help="delta: safety-reward deadband on the per-joint -tau*qddot (N*m*rad/s^2). Default 9 "
-                        "re-pinned 2026-06-12 from real-arm calibration at P8/D16 (true-dt args: all benign "
+    p.add_argument("--safety-delta", type=float, default=None,
+                   help="delta: safety-reward deadband on the per-joint -tau*qddot (N*m*rad/s^2). Default-aware "
+                        "(explicit value always wins): sim backends use 15, the hardware backend uses 9. "
+                        "9 re-pinned 2026-06-12 from real-arm calibration at P8/D16 (true-dt args: all benign "
                         "motion incl. max-violence reversals <=7.4; user-labeled-bad grabs/blocks/jerks "
-                        ">=10.7). SIM runs: use 15 with --lambda-safe 0.1 — measured 2026-06-12 "
+                        ">=10.7). SIM uses 15 with lambda_safe 0.1 — measured 2026-06-12 "
                         "(runs/sim_scales/kp499.json): sim's saturated PD torque puts even smooth motion at "
                         "args>9 on 33%% of joint-samples, so the real-arm (9, 2.2) pair freezes sim policies. "
                         "The pre-2026-06 0.05 penalized all motion -> policy froze; the old 15 never fired on hw.")
