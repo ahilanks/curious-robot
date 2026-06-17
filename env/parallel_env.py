@@ -40,8 +40,7 @@ class VectorMujocoEnv:
         overhead_resolution: int = 256,
         frame_skip: int = 6,
         action_max: float = 0.3,
-        dq_max: float = 100.0,
-        safety_delta: float = 0.05,
+        safety_delta: float = 9.0,
         seed: int = 0,
         threads: int = 0,                # 0 = sequential
     ):
@@ -53,7 +52,6 @@ class VectorMujocoEnv:
                 overhead_resolution=overhead_resolution,
                 frame_skip=frame_skip,
                 action_max=action_max,
-                dq_max=dq_max,
                 safety_delta=safety_delta,
                 seed=seed + i,
             )
@@ -214,14 +212,14 @@ class SubprocVectorMujocoEnv:
 
     def __init__(self, n_envs: int = 8, scene_path: str | Path = DEFAULT_SCENE,
                  wrist_resolution: int = 224, overhead_resolution: int = 256,
-                 frame_skip: int = 6, action_max: float = 0.3, dq_max: float = 100.0,
-                 safety_delta: float = 0.05, seed: int = 0, threads: int = 0):
+                 frame_skip: int = 6, action_max: float = 0.3,
+                 safety_delta: float = 9.0, seed: int = 0, threads: int = 0):
         self.n_envs = n_envs                           # `threads` taken for API parity
         self.wrist_resolution = wrist_resolution
         self.overhead_resolution = overhead_resolution
         base = dict(scene_path=str(scene_path), wrist_resolution=wrist_resolution,
                     overhead_resolution=overhead_resolution, frame_skip=frame_skip,
-                    action_max=action_max, dq_max=dq_max, safety_delta=safety_delta)
+                    action_max=action_max, safety_delta=safety_delta)
         ctx = mp.get_context("spawn")                  # fresh procs => no inherited CUDA
         with _render_worker_spawn_env():
             self._workers = [_EnvWorker(ctx, dict(base, seed=seed + i))
@@ -279,13 +277,13 @@ class SubprocSingleEnv:
 
     def __init__(self, scene_path: str | Path = DEFAULT_SCENE,
                  wrist_resolution: int = 224, overhead_resolution: int = 256,
-                 frame_skip: int = 6, action_max: float = 0.3, dq_max: float = 100.0,
-                 safety_delta: float = 0.05, seed: int = 0):
+                 frame_skip: int = 6, action_max: float = 0.3,
+                 safety_delta: float = 9.0, seed: int = 0):
         self.wrist_resolution = wrist_resolution
         self.overhead_resolution = overhead_resolution
         kwargs = dict(scene_path=str(scene_path), wrist_resolution=wrist_resolution,
                       overhead_resolution=overhead_resolution, frame_skip=frame_skip,
-                      action_max=action_max, dq_max=dq_max, safety_delta=safety_delta,
+                      action_max=action_max, safety_delta=safety_delta,
                       seed=seed)
         ctx = mp.get_context("spawn")
         with _render_worker_spawn_env():

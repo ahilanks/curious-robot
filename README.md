@@ -21,7 +21,9 @@ Rollout-on variant (vs. the single-horizon loss that scores one sampled $h$ agai
 
 ## Actor + actuation
 
-$$a_t^{\text{raw}}\sim\pi(\cdot\mid z_t),\quad a_t=\tanh(a_t^{\text{raw}})\in(-1,1)^n,\quad \Delta q_t=a_t\odot\Delta q^{\max}$$
+$$a_t=\tanh(u_t),\ u_t\sim\mathcal N\!\big(\mu(z_t),\,\sigma(z_t)\big)\ \text{(training)};\qquad a_t=\pi(z_t)=\tanh\!\big(\mu(z_t)\big)\ \text{(deployment)};\qquad \Delta q_t=a_t\odot\Delta q^{\max}$$
+
+The policy is a **Gaussian SAC actor** with a learned, state-dependent spread $\sigma(z_t)$. Sim **training and data collection sample** $a_t$ — the entropy bonus (weight $\alpha$) keeps the policy off the freeze attractor and decorrelates the parallel envs; **eval and hardware deployment act with the deterministic mean** $\tanh(\mu(z_t))$, so every deployed action is reproducible. (Stochasticity was removed 2026-06-12 then re-added 2026-06-14 for training only — the deterministic actor parked.)
 
 $$\tau_t=\mathrm{clip}\!\big(K_p\,\Delta q_t-K_d\,\dot q_t,\ -\tau_i^{\max},\ \tau_i^{\max}\big)$$
 
@@ -32,41 +34,40 @@ r_t^{\text{safe}}=-\sum_{i=1}^{n}\frac{|\tau_{i,t}|}{\tau_i^{\max}}\,\max\!\big(
 
 $$r_t=\lambda_{\text{safe}}\,r_t^{\text{safe}}+\lambda_{\text{cur}}\,\mathrm{symlog}\!\big(r_t^{\text{cur}}\big),\qquad (o_{t+1},\,r_t^{\text{safe}})=\mathrm{Env}(a_t)$$
 
-The curiosity error is the **per-dim mean** squared error $\tfrac{1}{d_z}\lVert\cdot\rVert_2^2$ (same normalization as $\mathcal L_{\text{wm}}$), so $r^{\text{cur}}\!\sim\!O(0.1\text{–}1)$ and $\mathrm{symlog}$ stays in its discriminative region. The safety penalty carries its own weight $\lambda_{\text{safe}}$ (not pinned to $1$): under the per-dim-mean $r^{\text{cur}}$ the raw $|r^{\text{safe}}|$ is $\approx5\times$ the curiosity term, so $\lambda_{\text{safe}}\!=\!0.1$ restores a safety:curiosity ratio of $\approx0.5\!:\!1$.
+The curiosity error is the **per-dim mean** squared error $\tfrac{1}{d_z}\lVert\cdot\rVert_2^2$ (same normalization as $\mathcal L_{\text{wm}}$), so $r^{\text{cur}}\!\sim\!O(0.1\text{–}1)$ and $\mathrm{symlog}$ stays in its discriminative region. The safety penalty carries its own weight $\lambda_{\text{safe}}$ (not pinned to $1$). With the real-arm-calibrated deadband ($\delta=9$, 2026-06-12: all benign motion incl. max-violence reversals scores $\le7.4$, user-labeled-bad events $\ge10.7$ on true-dt $\ddot q$), $r^{\text{safe}}$ is identically $0$ in normal operation — $\lambda_{\text{safe}}$ scales only genuine events, and $2.2$ makes one median bad substep cancel $\approx$ one decision's curiosity term.
 
-## SAC objective &nbsp; [le-wm]
+## Actor-critic objective (SAC)
 
-$$y=r_t+\gamma\,(1-d_t)\Big(\min_i Q_{\bar\theta_i}(z_{t+1},a')-\alpha\log\pi(a'\mid z_{t+1})\Big),\quad a'\sim\pi(\cdot\mid z_{t+1})$$
+$$a'\sim\pi(\cdot\,|\,z_{t+1}),\qquad y=r_t+\gamma\,(1-d_t)\,\Big(\min_i Q_{\bar\theta_i}\big(z_{t+1},a'\big)-\alpha\log\pi\big(a'\,|\,z_{t+1}\big)\Big)$$
 
 $$\mathcal{L}_Q=\big(Q_\theta(z_t,a_t)-y\big)^2,\qquad
-\mathcal{L}_\pi=-\,\mathbb{E}_{a\sim\pi}\big[\min_i Q_i(z_t,a)-\alpha\log\pi(a\mid z_t)\big]$$
+\mathcal{L}_\pi=\mathbb E_{a\sim\pi(\cdot|z_t)}\big[\alpha\log\pi(a\,|\,z_t)-\textstyle\min_i Q_i(z_t,a)\big]$$
 
-Real $z_{t+1}$, no WM rollout in the target; $d_t$ via truncation-as-done. Buffer holds $(o_t,q_t,\dot q_t,a_t,r_t,o_{t+1})$ for WM + SAC; cap $=10\%$ of the run (capped); PER for sampling, FIFO (ring) eviction.
+SAC with a **fixed** entropy temperature $\alpha$ (re-added 2026-06-14; no learnable $\alpha$): the actor maximizes $Q+\alpha\mathcal H$ over reparameterized squashed-Gaussian samples and the critic learns the soft value. Training samples $a\sim\pi$; **deployment acts with the deterministic mean** $\tanh(\mu(z))$. Twin critics with a Polyak target $Q_{\bar\theta}$. Real $z_{t+1}$, no WM rollout in the target; $d_t$ via truncation-as-done. Buffer holds $(o_t,q_t,\dot q_t,a_t,r_t,o_{t+1})$ for WM + actor-critic; cap $=10\%$ of the run (capped); PER for sampling, FIFO (ring) eviction.
 
 ## Constants
 
 | Symbol | Meaning | Value |
 |---|---|---|
-| $d_z$ ($d_{\text{vis}},d_{\text{prop}}$) | state dim (vis, proprio) | 256 (192, 64) |
-| $n$ | DOF / action dim | 6 |
-| $H_{\text{bwd}}$ | predictor context (history) | 3 |
-| $H_{\text{fwd}}$ / $H_{\text{fwd,max}}$ | rollout horizon: start / max | 1 / 1 (curriculum off by default; was 20) |
-| $\gamma_{\text{wm}}$ | WM rollout discount | 0.95 |
-| $\beta$ | SIGReg weight | 0.3 |
-| batch | WM batch | 128 |
-| $\gamma$ | SAC discount | 0.9 |
-| $\alpha$ | entropy coef (fixed) | 0.2 |
-| $\rho$ | Polyak target rate | 0.005 |
-| $\lambda_{\text{cur}}$ | curiosity weight | ? |
-| $\lambda_{\text{safe}}$ | safety-penalty weight | 0.1 |
-| $K_p,K_d$ | PD gains | ? |
-| $\Delta q^{\max}$ | per-joint delta clip | large ($\approx\infty$) |
-| $\tau_i^{\max}$ | motor torque limit | 3.35 N·m (all joints) |
-| $\delta$ | safety deadband (on $-\tau\,\ddot q$) | 15 |
-| $\Delta t_{\text{safe}}$ | accel finite-diff window | 10 timesteps |
-| action_block | env steps / decision | 5 |
-| action_max | actor output scale | 0.3 |
-| PER $\alpha$ / $\beta_0$ | priority / IS exponent | 0.6 / 0.4 |
-| flatline window / tol | curriculum trigger | 200 / 0.03 |
-| lr$_{\text{wm}}$ / lr$_{\text{ac}}$ | AdamW / Adam | 5e-5 / 3e-4 |
-| updates_per_step / wm_update_every | SAC updates per decision step / WM update period | 1 / 4 |
+| $d_z$ ($d_{\text{vis}},d_{\text{prop}}$) | latent state size: ViT branch ⊕ proprio branch | 256 (192, 64) |
+| $n$ | joints = action dims per control step | 6 |
+| $H_{\text{bwd}}$ | past latents the predictor conditions on | 3 |
+| $H_{\text{fwd}}$ / $H_{\text{fwd,max}}$ | $\mathcal L_{\text{wm}}$ rollout length: start / cap | 1 / 1 (curriculum off; was 20) |
+| $\gamma_{\text{wm}}$ | discount on far rollout steps in $\mathcal L_{\text{wm}}$ | 0.95 |
+| $\beta$ | SIGReg (anti-collapse) weight in $\mathcal L_{\text{wm}}$ | 0.3 |
+| batch | minibatch size: WM / SAC updates | 128 / 128 |
+| $\gamma$ | actor-critic return discount | 0.9 |
+| $\rho$ | Polyak rate of the target critic $Q_{\bar\theta}$ — slows TD-target drift (the critic's target net, **not** a JEPA EMA teacher; SIGReg needs none) | 0.005 |
+| $\alpha$ | SAC entropy temperature: actor maximizes $Q+\alpha\mathcal H$ (training samples $\pi$; deployment uses the deterministic mean) | 0.2 (re-added 2026-06-14; fixed, not learned. safe15 ran 0.2) |
+| $\lambda_{\text{cur}}$ | reward weight on $\mathrm{symlog}(r^{\text{cur}})$ | 15 (since 2026-06-11; safe15 + the earlier campaign ran 20) |
+| $\lambda_{\text{safe}}$ | reward weight on $r^{\text{safe}}$ | 2.2 (since 2026-06-12; one median bad substep ≈ one decision's curiosity. Was 0.1) |
+| $K_p,K_d$ | sim position-actuator PD gains; hardware reuses them for the obs-torque recompute | 499.11 N·m/rad / 2.731 N·m·s/rad (RBE501 DC-motor model at firmware P=8, since 2026-06-12 — $K_p$ linear in P, was 998.22 at P=16; $K_d$ is back-EMF only, P/D-independent) |
+| $\Delta q^{\max}$ | step-size scale: rad of joint delta per unit tanh action (`action_max` in code) | 0.3 sim default; hardware campaign pinned 0.1 |
+| $\tau_i^{\max}$ | per-joint torque clip; also normalizes $\|\tau\|/\tau^{\max}$ in $r^{\text{safe}}$ | 3.35 N·m (all joints) |
+| $\delta$ | $r^{\text{safe}}$ deadband: $-\tau\,\ddot q$ below it costs nothing | 9 (since 2026-06-12, calibrated on the real arm at P8/D16: benign ≤7.4, labeled-bad ≥10.7. Was 15, which never fired) |
+| $\Delta t_{\text{safe}}$ | control-substep period = $\ddot q$ finite-diff window | 0.030 s (frame_skip 6 × 0.005 s sim step). Hardware paces commands to 0.030 s but divides $\ddot q$ by the **measured** read-to-read dt (~0.044 s) since 2026-06-12 |
+| action_block | substeps the actor commits per decision (action dim $6{\times}5=30$) | 5 |
+| PER $\alpha$ / $\beta_0$ | priority sharpening / importance-weight anneal start | 0.6 / 0.4 |
+| flatline window / tol | bump $H_{\text{fwd}}$ when pred-loss relative change < tol over window | 200 / 0.03 |
+| lr$_{\text{wm}}$ / lr$_{\text{ac}}$ | learning rates: WM (AdamW) / actor+critic (Adam) | 5e-5 / 3e-4 |
+| updates_per_step / wm_update_every | SAC updates per decision / WM update every Nth decision | 1 / 4 |
