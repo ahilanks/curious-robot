@@ -270,3 +270,29 @@ _(add a dated entry per run)_
     travel/decision; ~0=parked), **`prox_step`** (proximal joints 0-2 = gross repositioning a wrist wiggle CAN'T fake — the
     ungameable roam signal), `ee_step` (gripper WORLD-xyz travel/decision), `pose_range`/`pose_spread`/`ee_range`
     (config/world-space coverage of the recent 200-decision window). Env now emits `ee_pos` (gripper world xyz); logged every step.
+
+- 2026-06-17 (cont.) — **MSE-only vs RND-only vs both, x alpha {0, 0.2} (current code, new travel metrics): SEARCH is
+  load-bearing; the intrinsic reward only shapes WHAT moves, it can't substitute for entropy.** `safe15_repro` =
+  safe15's config (alpha=0.2, lcur=20, lsafe=0.1, no RND) on current code -> reproduces safe15 (same `eff_rank_probe`~7
+  at 4k; safe15's 33.6 was at 100k), confirming **no code regression** (runs are byte-identical at step 1000 on a shared seed).
+
+  | run | alpha | reward | prox_step (warmup 0.27) | eff_rank_probe | contacts | verdict |
+  |---|---|---|---|---|---|---|
+  | `rnd_only` | 0 | RND only | **0.03** | 2.1 | 0.01 | collapsed (worst) |
+  | `safe15_repro` | 0.2 | MSE only | 0.18 | 6.6 | 0.008 | healthy, moving |
+  | `a02_oh` | 0.2 | MSE+RND (overhead) | 0.16 | 10.6 | 0.000 | healthy, best encoder, no contacts |
+  | `a02_wrist` | 0.2 | MSE+RND (wrist) | **0.23** | 7.9 | **0.093** | healthy + best interaction |
+
+  - **alpha=0 collapses for EVERY reward, including pure RND.** `rnd_only` (deterministic, reward = RND only) dithered
+    just like the curiosity/z-RND runs: `prox_step` 0.27->0.03 (while `arm_speed` stayed ~1.45 = the trap), `eff_rank_probe`
+    ->2.1, entropy->-486, and **RND novelty self-extinguished 14->0** (the predictor learns the narrow visited frames, so
+    the bonus dies; with no MSE and no search, nothing remains). Pure RND fails HARDEST -- it's a transient, self-consuming,
+    jitter-gameable bonus, not a standing exploration drive.
+  - **alpha=0.2 keeps every config healthy and moving** (`prox` 0.15-0.23, `eff_rank` 7-11, entropy ~0): entropy keeps the
+    data diverse -> encoder stays high-rank -> the actor can move. The reward then sets the *flavour* -- MSE-only roams
+    smoothly; MSE+RND on the wrist starts slower (RND-jitter-gamed early) but **by 10k `a02_wrist` is the best run yet:
+    `prox` 0.23 AND `contacts` 0.093** (~10x the others). As RND faded, MSE+entropy drove the arm to move around AND poke
+    blocks -- the closest to "move around + act curious like a baby."
+  - **RND is transient everywhere** -- `rnd_contrib` -> ~0 by mid-run in every run (the predictor always catches up on the
+    visited distribution). RND gives an early nudge but is never the durable signal; the lasting drivers are entropy (keeps
+    it alive) + curiosity/contacts. **Net: don't run alpha=0; keep entropy on, treat RND as an early bonus not the reward.**
