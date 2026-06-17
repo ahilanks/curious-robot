@@ -51,12 +51,14 @@ def rollout_error(wm, Z, A, H, maxh):
     ctx_z, ctx_a = win(Z, 0), win(A, 0)            # Z[t-H+1..t], A[t-H+1..t]
     cur = wm.predict(ctx_z, wm.action_encoder(ctx_a))
     roll, roll_a = ctx_z, wm.action_encoder(ctx_a)
+    mean_z = Z.mean(0)                              # constant-mean baseline (mean-collapse check)
     out = {}
     for h in range(1, maxh + 1):
         zhat = cur[:, -1]
         z_true = Z[starts + h]
         out[h] = {"pred_mse": float(((zhat - z_true) ** 2).sum(-1).mean()),
-                  "persist_mse": float(((Z[starts] - z_true) ** 2).sum(-1).mean())}
+                  "persist_mse": float(((Z[starts] - z_true) ** 2).sum(-1).mean()),
+                  "mean_mse": float(((mean_z - z_true) ** 2).sum(-1).mean())}
         if h < maxh:
             na = wm.action_encoder(A[starts + h][:, None, :])
             roll = torch.cat([roll[:, 1:], zhat[:, None]], 1)
@@ -100,10 +102,12 @@ def main():
     res = rollout_error(wm, Z, A, ca["history_size"], args.maxh)
     env.close()
 
-    print(f"{'h':>3} {'pred_mse':>12} {'persist_mse':>12} {'pred/persist':>12}")
+    print(f"{'h':>3} {'pred_mse':>12} {'persist_mse':>12} {'mean_mse':>12} {'pred/persist':>12} {'pred/mean':>12}")
     for h, v in res.items():
-        ratio = v["pred_mse"] / max(v["persist_mse"], 1e-9)
-        print(f"{h:>3} {v['pred_mse']:>12.4f} {v['persist_mse']:>12.4f} {ratio:>12.3f}")
+        pp = v["pred_mse"] / max(v["persist_mse"], 1e-9)   # ~1.0 = persistence-collapse
+        pm = v["pred_mse"] / max(v["mean_mse"], 1e-9)       # ~1.0 = mean-collapse (predicts the batch mean)
+        print(f"{h:>3} {v['pred_mse']:>12.4f} {v['persist_mse']:>12.4f} {v['mean_mse']:>12.4f} "
+              f"{pp:>12.3f} {pm:>12.3f}")
     if args.out:
         out = Path(args.out)
     elif args.ckpt:

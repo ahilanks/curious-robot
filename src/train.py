@@ -397,16 +397,22 @@ def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device):
             roll_a = torch.cat([roll_a[:, 1:], a_emb[:, H_bwd - 1 + k].unsqueeze(1)], 1)
             cur = wm.predict(roll, roll_a)
     pred_loss = pred_loss / wsum
-    with torch.no_grad():   # persistence baseline on the SAME discounted h-step schedule (same MSE metric)
+    with torch.no_grad():   # baselines on the SAME discounted h-step schedule (same MSE metric)
         z_last = emb[:, H_bwd - 1]
         idl = sum((gamma_wm ** k) * (z_last - emb[:, H_bwd - 1 + k]).pow(2).mean()
+                  for k in range(1, h + 1)) / wsum                       # persistence (predict z_t)
+        # constant-mean baseline: predict the batch-mean latent for each target step. pred_loss
+        # ~ this => the predictor collapsed to the mean (learned nothing input-dependent); the gap
+        # between idl (persistence) and mbl localizes WHICH trivial solution it fell into.
+        mbl = sum((gamma_wm ** k)
+                  * (emb[:, H_bwd - 1 + k].mean(0, keepdim=True) - emb[:, H_bwd - 1 + k]).pow(2).mean()
                   for k in range(1, h + 1)) / wsum
     sig = sigreg(emb.transpose(0, 1))                      # (T,B,D)
     loss = pred_loss + beta * sig
     opt.zero_grad(); loss.backward()
     torch.nn.utils.clip_grad_norm_([p for p in wm.parameters() if p.requires_grad], 1.0)
     opt.step()
-    return float(pred_loss.item()), float(sig.item()), float(idl)
+    return float(pred_loss.item()), float(sig.item()), float(idl), float(mbl)
 
 
 def grad_caps_temporal_loss(traj, eps, valid=None):
@@ -1138,6 +1144,17 @@ def main(args):
             for key in ("mse_block", "mse_table", "mse_none"):   # curiosity MSE by contact type
                 if recent_mse[key]:
                     d[f"wm/{key}"] = float(np.mean(recent_mse[key]))
+            # signed contact gap: >0 = empty space is MORE novel than blocks (the inversion that
+            # actively steers the policy AWAY from contact). One watchable line vs eyeballing two.
+            if "wm/mse_block" in d and "wm/mse_none" in d:
+                d["wm/mse_contact_gap"] = d["wm/mse_none"] - d["wm/mse_block"]
+            # reward-variance split: how much of the (windowed) reward variance is action-relevant
+            # curiosity vs safety. var_cur_frac ->0 = safety owns all the signal SAC can act on
+            # (the freeze mechanism), even if r_cur is large in absolute terms.
+            cur_v = float(np.var(recent["cur_contrib"]))
+            safe_v = float(np.var(np.asarray(recent["r_safe"], np.float64) * args.lambda_safe))
+            d.update({"reward/var_cur": cur_v, "reward/var_safe": safe_v,
+                      "reward/var_cur_frac": cur_v / max(cur_v + safe_v, 1e-12)})
             if last_zb is not None:
                 z_std, eff_rank, feat_corr = collapse_metrics(last_zb)
                 d.update({"encoder/z_std": z_std, "encoder/eff_rank": eff_rank,
@@ -1148,7 +1165,9 @@ def main(args):
                           "encoder/feat_corr_probe": p_corr})
             if last_wm is not None:
                 d.update({"wm/pred_loss": last_wm[0], "wm/sigreg": last_wm[1],
-                          "wm/identity_baseline": last_wm[2]})
+                          "wm/identity_baseline": last_wm[2], "wm/mean_baseline": last_wm[3],
+                          "wm/pred_vs_persist": last_wm[0] / max(last_wm[2], 1e-9),   # ~1.0 = persistence-collapse
+                          "wm/pred_vs_mean": last_wm[0] / max(last_wm[3], 1e-9)})      # ~1.0 = mean-collapse
             if last_sac is not None:
                 d.update({"sac/critic_loss": last_sac[0], "sac/actor_loss": last_sac[1],
                           "smooth/grad_caps": last_sac[2]})
