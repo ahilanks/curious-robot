@@ -124,6 +124,55 @@ class TwinQ(nn.Module):
         return self.q1(za), self.q2(za)
 
 
+class RunningMeanStd:
+    """Welford running mean/std for RND observation normalization -- the detail that makes RND
+    work, since the frozen random target's outputs are only meaningful when its inputs are
+    stably scaled. shape=() keeps whole-tensor (scalar) stats for the 84x84 frame; shape=(d,)
+    keeps per-dim stats for proprio (whose pos/vel/torque dims live on very different scales).
+    Updated on the live obs stream; the count grows unboundedly so the scale settles to the
+    (early) visited distribution and then barely moves (Burda et al. 2018)."""
+    def __init__(self, shape, device):
+        self.mean = torch.zeros(shape, device=device)
+        self.var = torch.ones(shape, device=device)
+        self.count = 1e-4
+
+    @torch.no_grad()
+    def update(self, x):                                  # x: (..., *shape) -> stats over leading dims
+        axes = tuple(range(x.ndim - self.mean.ndim))
+        b_mean, b_var = x.mean(dim=axes), x.var(dim=axes, unbiased=False)
+        b_count = x.numel() / max(self.mean.numel(), 1)
+        delta = b_mean - self.mean
+        tot = self.count + b_count
+        self.mean = self.mean + delta * b_count / tot
+        m2 = self.var * self.count + b_var * b_count + delta.pow(2) * self.count * b_count / tot
+        self.var, self.count = m2 / tot, tot
+
+    @torch.no_grad()
+    def norm(self, x):
+        return (x - self.mean) / (self.var.sqrt() + 1e-8)
+
+
+class RNDObsNet(nn.Module):
+    """RND target/predictor over the RAW observation (downsampled wrist image + proprio), NOT
+    the co-trained latent z. The raw obs is a STABLE input space, so the frozen random target
+    is a fixed goalpost and novelty tracks genuine state coverage instead of drifting with the
+    encoder. Atari-style conv stack on an 84x84 grayscale frame (Burda et al. 2018) plus a
+    small proprio MLP, concatenated into a linear head."""
+    def __init__(self, prop_dim, out_dim=128, hidden=256):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, 8, stride=4), nn.ReLU(),     # 84 -> 20
+            nn.Conv2d(32, 64, 4, stride=2), nn.ReLU(),    # 20 -> 9
+            nn.Conv2d(64, 64, 3, stride=1), nn.ReLU(),    # 9 -> 7
+            nn.Flatten())
+        self.prop = nn.Sequential(nn.Linear(prop_dim, hidden), nn.ReLU())
+        self.head = nn.Sequential(nn.Linear(64 * 7 * 7 + hidden, hidden), nn.ReLU(),
+                                  nn.Linear(hidden, out_dim))
+
+    def forward(self, img84, prop):
+        return self.head(torch.cat([self.conv(img84), self.prop(prop)], dim=-1))
+
+
 # ------------------------------------------------------------------------ buffer
 class ReplayBuffer:
     """Per-env ring buffers (so WM windows stay inside one env's contiguous stream)
@@ -271,6 +320,56 @@ def curiosity_reward(wm, hist_z, hist_a, z_next):
     a_emb = wm.action_encoder(hist_a.transpose(0, 1))    # (B, H, A_emb)
     pred = wm.predict(z_ctx, a_emb)[:, -1]               # (B, D)
     return (pred - z_next).pow(2).mean(-1)
+
+
+@torch.no_grad()
+def to_rnd_obs(px_uint8, prop_np, img_rms, prop_rms, device, update=False):
+    """Raw obs -> RND inputs. uint8 (...,H,W,3) wrist image -> normalized (B,1,84,84) grayscale
+    (luminance, area-downsampled to the classic RND frame); proprio -> normalized (B,P). Both
+    standardized by a running mean/std and clipped +-5. update=True on the live reward stream
+    advances the obs-norm stats; update=False re-scores buffer samples for predictor training
+    against those same (slowly-frozen) stats."""
+    t = torch.as_tensor(np.ascontiguousarray(px_uint8), device=device).float() / 255.0
+    gray = (t * torch.tensor([0.299, 0.587, 0.114], device=device)).sum(-1)         # (...,H,W) luminance
+    gray = gray.reshape(-1, 1, gray.shape[-2], gray.shape[-1])                       # (B,1,H,W)
+    # area-downsample to the classic 84x84 RND frame. MPS's adaptive_avg_pool2d (which mode="area"
+    # dispatches to) rejects non-divisible input sizes (224 % 84 != 0), so on MPS do the pool on CPU
+    # (device-identical result); CUDA/CPU run it natively.
+    if gray.device.type == "mps":
+        img = F.interpolate(gray.cpu(), size=(84, 84), mode="area").to(device)      # (B,1,84,84)
+    else:
+        img = F.interpolate(gray, size=(84, 84), mode="area")                       # (B,1,84,84)
+    prop = torch.as_tensor(np.ascontiguousarray(prop_np), device=device).float().reshape(img.shape[0], -1)
+    if update:
+        img_rms.update(img); prop_rms.update(prop)
+    return img_rms.norm(img).clamp(-5, 5), prop_rms.norm(prop).clamp(-5, 5)
+
+
+@torch.no_grad()
+def knn_state_entropy_reward(z, buf, k):
+    """Coverage / particle state-entropy reward (RE3/APT-style): for each latent z_t,
+    reward = log(1 + mean distance to its k nearest neighbours among a buffer of recent
+    visited latents). It pays to be FAR from the visited manifold -> the policy is pushed
+    to low-density (frontier) regions -> the visitation manifold inflates toward uniform
+    coverage (max state entropy). Unlike prediction-error curiosity this measures novelty
+    (distance) DIRECTLY, so it is immune to the noisy-TV problem and doesn't vanish as the
+    WM learns. z:(B,D), buf:(M,D) -> (B,). Returns 0 until the buffer holds >k latents.
+    Caveat: buf latents are encoded by an earlier (co-trained) encoder, so keep buf recent."""
+    if buf.shape[0] <= k:
+        return torch.zeros(z.shape[0], device=z.device)
+    d = torch.cdist(z, buf)                                   # (B, M) pairwise latent dist
+    kth = d.topk(k, dim=1, largest=False).values             # k nearest per row
+    return torch.log1p(kth.mean(dim=1))                       # (B,)
+
+
+@torch.no_grad()
+def rnd_novelty_reward(rnd_pred, rnd_target, img84, prop):
+    """RND novelty (Burda 2018): squared error of a trained predictor against a FROZEN
+    randomly-initialised target, evaluated on the RAW obs (downsampled wrist image + proprio),
+    NOT the latent z. High for obs unlike those visited -> 0 as a region is covered. The target
+    is deterministic (immune to the noisy-TV problem) AND the input is the stable raw obs, so
+    the target is a fixed goalpost the co-trained encoder can't move. (B,1,84,84),(B,P) -> (B,)."""
+    return (rnd_pred(img84, prop) - rnd_target(img84, prop)).pow(2).mean(-1)
 
 
 def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device):
@@ -620,6 +719,20 @@ def main(args):
     wm_opt = torch.optim.AdamW([p for p in wm.parameters() if p.requires_grad],
                                lr=args.wm_lr, weight_decay=1e-3)
 
+    # RND novelty (only built/trained/used when --lambda-rnd != 0): frozen random target + chasing
+    # predictor, over the RAW obs (downsampled wrist image + proprio) -- a STABLE input space,
+    # unlike the co-trained latent z which would drift the target out from under the predictor.
+    # At lambda_rnd==0 these are unused (no reward term, no training) so the default path is untouched.
+    rnd_target = rnd_pred = rnd_opt = rnd_img_rms = rnd_prop_rms = None
+    if args.lambda_rnd:
+        rnd_target = RNDObsNet(prop_dim, args.rnd_out_dim, args.rnd_hidden).to(device)
+        for p in rnd_target.parameters():
+            p.requires_grad_(False)
+        rnd_pred = RNDObsNet(prop_dim, args.rnd_out_dim, args.rnd_hidden).to(device)
+        rnd_opt = torch.optim.Adam(rnd_pred.parameters(), lr=args.rnd_lr)
+        rnd_img_rms = RunningMeanStd((), device)             # obs-norm: scalar stats for the 84x84 frame
+        rnd_prop_rms = RunningMeanStd((prop_dim,), device)   # obs-norm: per-dim stats for proprio
+
     # --- resume / warm-start: load wm+sac weights BEFORE the loop (else cold start) ---
     resume_h_fwd = None
     if args.init_ckpt or args.resume_name:
@@ -698,6 +811,7 @@ def main(args):
     z = encode_obs(wm, obs["image"], obs["proprio"], device)        # (n_envs, z_dim)
     hist_z = z.unsqueeze(0).repeat(H, 1, 1)
     hist_a = torch.zeros(H, args.n_envs, a_dim, device=device)
+    knn_buf = torch.zeros(0, z_dim, device=device)    # recent-latent ring buffer for the k-NN coverage reward (--lambda-knn)
     is_start = np.ones(args.n_envs, bool)
     ep_len = np.zeros(args.n_envs, np.int64)
     ep_ret = np.zeros(args.n_envs, np.float32)
@@ -705,6 +819,7 @@ def main(args):
     h_fwd = resume_h_fwd if resume_h_fwd is not None else args.h_fwd_start   # curriculum horizon (resumed if warm-started)
     pred_hist = deque(maxlen=args.flatline_window)    # for the flatline bump trigger
     updates_at_stage = 0
+    rnd_upd = 0                                       # RND predictor update counter (for --rnd-train-every)
     prev_sub_a = np.zeros((args.n_envs, n_dof), np.float64)   # last sub-action of the previous block (action-rate boundary)
     tau_max_arr = np.asarray(env.tau_max, np.float32)
     prev_qpos_dec = None                                      # last decision's final joint pose (for pose_step travel)
@@ -713,10 +828,11 @@ def main(args):
               ("r_cur", "r_safe", "cur_contrib", "contacts", "table_contacts",
                "motion", "ret", "frac_block", "frac_table",
                "rate", "rate2", "energy", "qd_mean", "tau_sat", "qd_rev",
-               "r_rate", "r_energy", "pose_step")}
+               "r_rate", "r_energy", "pose_step",
+               "r_rnd", "rnd_contrib", "r_knn", "knn_contrib")}
     recent_mse = {k: deque(maxlen=2000) for k in ("mse_block", "mse_table", "mse_none")}
     t0 = time.time()
-    last_wm = last_sac = None
+    last_wm = last_sac = last_rnd = None
     last_zb = last_qh = None
     video_on = imageio is not None and args.video_every > 0
     wrist_buf = deque(maxlen=args.video_steps)      # train-video clips (per-env frames, tiled)
@@ -742,7 +858,7 @@ def main(args):
         these GPU updates overlap the env workers rendering the next decision. Update
         count and schedule are identical to the serial loop; they just see the buffer
         minus the single in-flight transition (added after wait) -- negligible off-policy."""
-        nonlocal last_wm, last_sac, last_zb, last_qh, updates_at_stage
+        nonlocal last_wm, last_sac, last_rnd, last_zb, last_qh, updates_at_stage, rnd_upd
         # --- world-model co-training: autoregressive MSE rollout + beta*SIGReg ---
         if step >= args.start_steps and step % args.wm_update_every == 0:
             batch = buf.sample_wm(args.wm_batch_size, H + h_fwd)
@@ -767,6 +883,25 @@ def main(args):
             last_sac = (res["critic_loss"], res["actor_loss"], res.get("grad_caps", 0.0))
             last_zb = res["zb"]
             last_qh = res.get("q_heads")
+        # --- RND predictor training (only when --lambda-rnd != 0): one step every --rnd-train-every
+        #     SAC updates, on the RAW next-obs of a fresh PER batch. The trunk sac_update is a
+        #     module-level fn with no RND in scope, so we draw our own buf.sample_sac batch here and
+        #     train against b["px_n"]/b["prop_n"] (the next-obs raw pixels/proprio the buffer stores). ---
+        if args.lambda_rnd and step >= args.start_steps and buf.total >= args.batch_size:
+            rnd_upd += 1
+            if rnd_upd % args.rnd_train_every == 0:
+                b = buf.sample_sac(args.batch_size, args.per_alpha, per_beta=1.0)
+                if b is not None:
+                    ri, rp = to_rnd_obs(b["px_n"], b["prop_n"], rnd_img_rms, rnd_prop_rms, device)
+                    err = (rnd_pred(ri, rp) - rnd_target(ri, rp)).pow(2).mean(-1)   # (B,) per-sample RND error
+                    # scale each sample's loss by err/MSE (its novelty vs the batch-mean predictor MSE),
+                    # stop-grad so it's a pure weight (avg 1): focuses predictor capacity on currently-novel
+                    # samples. Adam absorbs the shared 1/MSE scalar but NOT the per-sample reweighting, so
+                    # unlike a global loss-divide this actually changes training. Clamp caps outliers.
+                    w = (err.detach() / (err.detach().mean() + 1e-8)).clamp(max=args.rnd_loss_clip)
+                    rnd_loss = (w * err).mean()
+                    rnd_opt.zero_grad(); rnd_loss.backward(); rnd_opt.step()
+                    last_rnd = float(err.mean().item())   # report the UNWEIGHTED predictor MSE (comparable)
         return h_fwd
 
     # graceful stop for data-collection runs: 1st Ctrl-C finishes the in-flight decision and
@@ -887,7 +1022,24 @@ def main(args):
         r_rate = -(args.w_action_rate * rate + args.w_action_rate2 * rate2)       # smoothness penalties (0 unless flagged)
         r_energy = -args.w_energy * energy
         safe_term = args.lambda_safe * r_safe
-        reward = safe_term + cur_term + r_rate + r_energy
+        # --- intrinsic exploration bonuses (COMPOSABLE; each added iff its weight != 0, so the
+        #     default reward is byte-identical to before) ---
+        if args.lambda_rnd:                                   # RND novelty over the raw next-obs (frozen target)
+            rnd_img, rnd_prop = to_rnd_obs(obs["image"], obs["proprio"],
+                                           rnd_img_rms, rnd_prop_rms, device, update=True)
+            r_rnd = rnd_novelty_reward(rnd_pred, rnd_target, rnd_img, rnd_prop).cpu().numpy()
+            # scale the raw error into log1p's active range (obs-RND error ~5e-3 sits in log1p's
+            # linear dead-zone) so symlog actually compresses and lambda_rnd stays O(10..20).
+            rnd_term = args.lambda_rnd * np.log1p(args.rnd_reward_scale * r_rnd)
+        else:
+            r_rnd = np.zeros_like(r_cur); rnd_term = np.zeros_like(r_cur)
+        if args.lambda_knn:                                   # k-NN coverage / state-entropy (alt to RND)
+            r_knn = knn_state_entropy_reward(z_next, knn_buf, args.knn_k).cpu().numpy()
+            knn_buf = torch.cat([knn_buf, z_next.detach()], 0)[-args.knn_buffer:]    # ring of recent latents
+        else:
+            r_knn = np.zeros_like(r_cur)
+        knn_term = args.lambda_knn * r_knn
+        reward = safe_term + cur_term + r_rate + r_energy + rnd_term + knn_term
         comps = np.stack([cur_term, safe_term, r_rate, r_energy], -1).astype(np.float32)  # REWARD_COMPONENTS order
 
         # contact-conditioned curiosity MSE (r_cur = ||zhat-z||^2): is the model more
@@ -913,7 +1065,9 @@ def main(args):
                          ("frac_block", touch_block), ("frac_table", touch_table),
                          ("rate", rate), ("rate2", rate2), ("energy", energy),
                          ("qd_mean", qd_mean), ("tau_sat", tau_sat), ("qd_rev", qd_rev),
-                         ("r_rate", r_rate), ("r_energy", r_energy), ("pose_step", pose_step)):
+                         ("r_rate", r_rate), ("r_energy", r_energy), ("pose_step", pose_step),
+                         ("r_rnd", r_rnd), ("rnd_contrib", rnd_term),
+                         ("r_knn", r_knn), ("knn_contrib", knn_term)):
             recent[key].append(float(np.mean(val)))
 
         # --- advance latent + history; reset timed-out envs ---
@@ -954,6 +1108,10 @@ def main(args):
             safe_m, cur_m = np.mean(recent["r_safe"]), np.mean(recent["cur_contrib"])
             d = {"reward/r_cur": np.mean(recent["r_cur"]),
                  "reward/r_safe": safe_m,
+                 "reward/r_rnd": np.mean(recent["r_rnd"]),            # raw RND novelty error
+                 "reward/rnd_contrib": np.mean(recent["rnd_contrib"]),  # lambda_rnd * symlog(rnd_reward_scale*r_rnd)
+                 "reward/r_knn": np.mean(recent["r_knn"]),            # raw kNN coverage reward
+                 "reward/knn_contrib": np.mean(recent["knn_contrib"]),  # lambda_knn * r_knn
                  "reward/cur_contrib": cur_m,                 # lambda_cur * symlog(r_cur)
                  "reward/safe_cur_ratio": abs(safe_m) / max(abs(cur_m), 1e-6),
                  "reward/total": np.mean(recent["ret"]),
@@ -994,6 +1152,8 @@ def main(args):
             if last_sac is not None:
                 d.update({"sac/critic_loss": last_sac[0], "sac/actor_loss": last_sac[1],
                           "smooth/grad_caps": last_sac[2]})
+            if last_rnd is not None:
+                d["rnd/pred_loss"] = last_rnd                  # RND predictor MSE (should fall as states are visited)
             if last_qh is not None:              # --multihead-q: per-component policy value
                 d.update({f"sac/q_{k}": float(v) for k, v in zip(REWARD_COMPONENTS, last_qh)})
             wlog(d, step)
@@ -1152,6 +1312,37 @@ def parse_args():
                    help="weight W on the energy penalty -W * mean_substeps mean_i |tau_i * qd_i| (mechanical "
                         "power; N*m*rad/s). Sim scale ref: dither ~3.3, smooth ~1.4 -> W=1 is a balanced trial. "
                         "Hardware analogue exists since kt=10 current-torque (2026-06-06).")
+    # intrinsic exploration reward terms -- COMPOSABLE: each is added to the reward iff its
+    # weight != 0, so they stack with curiosity (e.g. --lambda-cur 15 --lambda-rnd 20 = curiosity + RND).
+    p.add_argument("--lambda-rnd", type=float, default=0.0,
+                   help="weight on the RND novelty reward: lambda_rnd*log1p(rnd_reward_scale*||pred(o)-target(o)||^2); "
+                        "0 disables (default). Random-network distillation over the RAW obs o (downsampled wrist "
+                        "image + proprio, NOT the co-trained z): predictor chases a FROZEN random net -> high for "
+                        "novel obs, ->0 as visited; stable input + stationary target (no noisy-TV, no encoder "
+                        "drift). Add to the curiosity reward by setting lambda_rnd>0 alongside lambda_cur.")
+    p.add_argument("--rnd-out-dim", type=int, default=128, help="RND target/predictor output dim")
+    p.add_argument("--rnd-hidden", type=int, default=256, help="RND proprio-MLP / head hidden dim")
+    p.add_argument("--rnd-lr", type=float, default=5e-5,
+                   help="RND predictor Adam lr (lower than a latent-RND default: the obs target is fixed, so the "
+                        "predictor should chase it gently to keep the novelty signal from collapsing too fast)")
+    p.add_argument("--rnd-loss-clip", type=float, default=10.0,
+                   help="clamp on the per-sample RND training-loss weight err/MSE (novelty-prioritized predictor "
+                        "training): caps how much one high-error sample can dominate the batch. Large -> pure "
+                        "err/MSE weighting; ->1 approaches a uniform (standard RND) loss.")
+    p.add_argument("--rnd-reward-scale", type=float, default=200.0,
+                   help="multiply the raw RND error before log1p so it lands in symlog's active range (obs-RND "
+                        "error ~5e-3 is in log1p's linear dead-zone). Default 200 -> typical log1p(~1.0)~0.69, so "
+                        "lambda_rnd~20 gives an O(10) bonus comparable to curiosity. Scales the REWARD only; "
+                        "predictor training (err/MSE-weighted + Adam) is scale-invariant and untouched.")
+    p.add_argument("--rnd-train-every", type=int, default=1,
+                   help="train the RND predictor once every N SAC updates (default 1 = every update). >1 slows the "
+                        "predictor so obs novelty doesn't collapse to ~0 within ~250 steps on the low-diversity "
+                        "visited obs -> the novelty bonus persists through the exploration window.")
+    p.add_argument("--lambda-knn", type=float, default=0.0,
+                   help="weight on the k-NN coverage reward log(1+mean kNN latent dist); 0 disables (default; alt to RND)")
+    p.add_argument("--knn-k", type=int, default=12, help="k for the k-NN state-entropy estimate")
+    p.add_argument("--knn-buffer", type=int, default=4096,
+                   help="size of the recent-latent ring buffer the k-NN reward measures novelty against")
     p.add_argument("--no-torque-obs", action="store_true",
                    help="zero the u^app slice of proprio (obs -> [q, qd, 0]); shapes unchanged so old ckpts "
                         "load. Removes the obs channel that is ~96%% saturated sign-bit on hw and the main "
