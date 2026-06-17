@@ -20,5 +20,9 @@ wandb/
 # os / editor
 .DS_Store
 
+# runtime / daemon artifacts (boot logs, scheduler locks) — machine-local
+*_boot.log
+.claude/scheduled_tasks.lock
+
 # secrets — WANDB/HF/GH tokens; keep local, never commit
 .env
