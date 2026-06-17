@@ -3,7 +3,8 @@ an intrinsic curiosity reward, on the MuJoCo SO-ARM101 (README is the spec).
 
 Per decision step (action_block env steps), for every parallel env:
   1. encode z_t from (wrist image, proprio) with the current world model
-  2. sample a_t ~ pi(.|z_t); apply it (delta-target PD) over action_block env steps
+  2. act a_t ~ pi(z_t) (SAC sample in sim training; deterministic mean tanh(MLP(z_t)) on
+     hardware/eval); apply it (delta-target PD) over action_block env steps
   3. curiosity   r_cur = ||f(z_{t-H+1:t}, a_t) - z_{t+1}||^2     (1-step pred error)
      reward      r_t   = sum_k r_safe_k + lambda_cur * symlog(r_cur)
   4. store (o_t, q_t, qdot_t, a_t, r_t, o_{t+1}) with PER priority = r_cur
@@ -34,8 +35,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from lewm.module import SIGReg                       # noqa: E402
 from model.state_encoder import WorldModel           # noqa: E402
-from env.parallel_env import VectorMujocoEnv, SubprocVectorMujocoEnv   # noqa: E402
 from src.probe import load_probe_hf                  # noqa: E402
+# Env backends are imported lazily in main() so the `hardware` backend does not require mujoco.
 
 try:
     import wandb
@@ -59,8 +60,19 @@ def to_norm_pixel(px_uint8, device):
     return (t - IMAGENET_MEAN.to(device).view(shp)) / IMAGENET_STD.to(device).view(shp)
 
 
-# --------------------------------------------------------------------------- SAC
+# ------------------------------ actor-critic (SAC: stochastic train, deterministic deploy)
 class Actor(nn.Module):
+    """Gaussian SAC policy with a deterministic-mean deployment path.
+
+    `forward(z)` returns the DETERMINISTIC action tanh(mean(z)) — used at eval and on
+    hardware, so every deployed action is reproducible. `sample(z)` returns a squashed
+    Gaussian sample (a, logp, tanh(mean)) — used for sim-training collection and the SAC
+    entropy term. Re-added 2026-06-14: the entropy bonus keeps the policy off the freeze
+    attractor that the 2026-06-12 deterministic actor parked on; the learned mean is what
+    deploys, the stochasticity lives only in training. log_std is a learned, state-dependent
+    head; deterministic-era checkpoints (no log_std) load via load_actor_state and keep its
+    fresh init (deployment never reads it)."""
+
     def __init__(self, z_dim, a_dim, hidden=256, log_std_range=(-5, 2)):
         super().__init__()
         self.trunk = nn.Sequential(nn.Linear(z_dim, hidden), nn.ReLU(),
@@ -70,11 +82,14 @@ class Actor(nn.Module):
         self.lo, self.hi = log_std_range
 
     def forward(self, z):
-        h = self.trunk(z)
-        return self.mean(h), self.log_std(h).clamp(self.lo, self.hi)
+        """Deterministic action (the deployed / eval policy) = tanh(mean)."""
+        return torch.tanh(self.mean(self.trunk(z)))
 
     def sample(self, z):
-        mean, log_std = self(z)
+        """Stochastic action for training: (a, logp, deterministic_mean). Reparameterized
+        squash with the standard tanh log-prob correction."""
+        h = self.trunk(z)
+        mean, log_std = self.mean(h), self.log_std(h).clamp(self.lo, self.hi)
         normal = torch.distributions.Normal(mean, log_std.exp())
         u = normal.rsample()
         a = torch.tanh(u)
@@ -82,12 +97,26 @@ class Actor(nn.Module):
         return a, logp, torch.tanh(mean)
 
 
+def load_actor_state(actor, sd):
+    """Load an actor state_dict, tolerating checkpoints from either policy era: stochastic
+    SAC (safe15: has log_std) loads it; the 2026-06-12..06-14 deterministic actor (no
+    log_std) leaves the re-added log_std head at its fresh init. trunk/mean shapes are
+    identical across eras, so strict=False only ever skips the log_std head."""
+    actor.load_state_dict(sd, strict=False)
+
+
 class TwinQ(nn.Module):
-    def __init__(self, z_dim, a_dim, hidden=256):
+    """Twin Q critics. n_out=1 is the scalar critic; n_out=K (--multihead-q) gives one
+    head per weighted reward component, each trained on its own per-component TD target
+    with the SHARED next action — the actor still maximizes the sum over heads, so the
+    optimum matches the scalar critic; the heads exist to make the value decomposition
+    inspectable (which reward component is steering the policy)."""
+
+    def __init__(self, z_dim, a_dim, hidden=256, n_out=1):
         super().__init__()
         mk = lambda: nn.Sequential(nn.Linear(z_dim + a_dim, hidden), nn.ReLU(),
                                    nn.Linear(hidden, hidden), nn.ReLU(),
-                                   nn.Linear(hidden, 1))
+                                   nn.Linear(hidden, n_out))
         self.q1, self.q2 = mk(), mk()
 
     def forward(self, z, a):
@@ -102,26 +131,29 @@ class ReplayBuffer:
     current WM at sample time, so the co-trained encoder can drift without staleness.
     PER priority = curiosity surprise (raw 1-step prediction error)."""
 
-    def __init__(self, n_envs, cap_per_env, img_hw, a_dim, prop_dim, device):
+    def __init__(self, n_envs, cap_per_env, img_hw, a_dim, prop_dim, device, n_comp=0):
         self.n_envs, self.C, self.device = n_envs, cap_per_env, device
         s = (n_envs, cap_per_env)
         self.pixels = np.zeros((*s, img_hw, img_hw, 3), np.uint8)
         self.proprio = np.zeros((*s, prop_dim), np.float32)
         self.action = np.zeros((*s, a_dim), np.float32)
         self.r = np.zeros(s, np.float32)
+        self.rc = np.zeros((*s, n_comp), np.float32) if n_comp else None   # per-component rewards (--multihead-q)
         self.d = np.zeros(s, np.float32)
         self.is_start = np.zeros(s, bool)
         self.prio = np.zeros(s, np.float64)
         self.head = np.zeros(n_envs, np.int64)
         self.count = np.zeros(n_envs, np.int64)
 
-    def add(self, pixels, proprio, action, r, d, is_start, prio):
+    def add(self, pixels, proprio, action, r, d, is_start, prio, rc=None):
         for e in range(self.n_envs):
             i = self.head[e]
             self.pixels[e, i] = pixels[e]
             self.proprio[e, i] = proprio[e]
             self.action[e, i] = action[e]
             self.r[e, i] = r[e]
+            if self.rc is not None:
+                self.rc[e, i] = rc[e]
             self.d[e, i] = d[e]
             self.is_start[e, i] = is_start[e]
             self.prio[e, i] = prio[e]
@@ -162,13 +194,16 @@ class ReplayBuffer:
         w = (len(e_all) * probs[sel]) ** (-per_beta)
         w = (w / w.max()).astype(np.float32)
         t = lambda x: torch.as_tensor(x, device=self.device)
-        return {
+        out = {
             "px": self.pixels[e, i], "prop": self.proprio[e, i],
             "px_n": self.pixels[e, ni], "prop_n": self.proprio[e, ni],
             "a": t(self.action[e, i]), "r": t(self.r[e, i])[:, None],
             "d": t(self.d[e, i])[:, None], "w": t(w)[:, None],
             "e": e, "i": i,                          # for optional TD-error priority writeback
         }
+        if self.rc is not None:
+            out["rc"] = t(self.rc[e, i])             # (B, K) per-component rewards
+        return out
 
     def update_priorities(self, e, i, prio):
         """Overwrite priorities of sampled transitions (used by --per-priority td)."""
@@ -204,6 +239,19 @@ class ReplayBuffer:
         ee = e[:, None].repeat(T, 1)
         return (self.pixels[ee, idx], self.proprio[ee, idx],
                 torch.as_tensor(self.action[ee, idx], device=self.device))
+
+
+REWARD_COMPONENTS = ("cur", "safe", "rate", "energy")   # --multihead-q head order
+
+
+def scrub_torque_obs(obs, n_dof):
+    """--no-torque-obs: zero the u^app slice of proprio in place (obs -> [q, qd, 0]).
+    Keeps the proprio/encoder shapes (old ckpts still load) while removing the channel
+    that is a near-constant saturated sign bit on hardware (2026-06-11: 96-97% of
+    joint-samples pegged at +/-3.35 under the kp-law recompute) and mostly saturated
+    in sim too — the main sim->real obs-distribution mismatch."""
+    obs["proprio"][..., 2 * n_dof:3 * n_dof] = 0.0
+    return obs
 
 
 # ------------------------------------------------------------------- WM helpers
@@ -262,6 +310,69 @@ def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device):
     return float(pred_loss.item()), float(sig.item()), float(idl)
 
 
+def sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
+               args, step, device):
+    """Run args.updates_per_step SAC actor-critic gradient steps on PER samples from buf.
+    SAC with a FIXED entropy temperature alpha (getattr default 0.2): the actor maximizes
+    Q + alpha*H over reparameterized squashed-Gaussian samples and the critic learns the
+    soft value (target min Q_bar - alpha*log pi). The entropy bonus is what keeps the policy
+    off the freeze attractor — re-added 2026-06-14; the 2026-06-12 deterministic actor
+    parked. Deployment still acts with the deterministic mean; only training samples. Twin
+    critics + Polyak target kept. The encoder is frozen w.r.t. these updates: z is encoded
+    under no_grad from the CURRENT wm.
+    Returns {"critic_loss", "actor_loss", "zb"} from the last completed update, or
+    None if the gate is closed (warmup / buffer below batch) or sampling came up dry.
+    Shared by the online loop here and offline fine-tuning (offline_train.py)."""
+    if step < args.start_steps or buf.total < args.batch_size:
+        return None
+    alpha = getattr(args, "alpha", 0.2)        # fixed entropy temperature (no learnable alpha)
+    per_beta = min(1.0, args.per_beta_start
+                   + (1 - args.per_beta_start) * step / max(args.total_steps, 1))
+    out = None
+    for _ in range(args.updates_per_step):
+        b = buf.sample_sac(args.batch_size, args.per_alpha, per_beta)
+        if b is None:
+            break
+        zb = encode_obs(wm, b["px"], b["prop"], device)
+        znb = encode_obs(wm, b["px_n"], b["prop_n"], device)
+        with torch.no_grad():
+            an, logpn, _ = actor.sample(znb)               # a' ~ pi (entropy bonus on z')
+            q1n, q2n = critic_tgt(znb, an)
+            # scalar critic: (B,1) soft target. multihead: per-head TD targets from the
+            # per-component rewards, min-over-twins per head (pessimism per component); the
+            # shared next action keeps the heads' sum == the scalar value. Entropy is global
+            # (not a reward component) so it is spread equally across the K heads (/K) -> the
+            # head-sum equals the scalar soft target; identical to safe15 at K=1.
+            ent = args.gamma * (1 - b["d"]) * alpha * logpn          # (B,1) discounted entropy
+            y = (b.get("rc", b["r"]) + (1 - b["d"]) * args.gamma * torch.min(q1n, q2n)
+                 - ent / q1n.shape[-1])
+        q1, q2 = critic(zb, b["a"])
+        critic_loss = (b["w"] * ((q1 - y).pow(2) + (q2 - y).pow(2)).mean(-1, keepdim=True)).mean()
+        critic_opt.zero_grad(); critic_loss.backward(); critic_opt.step()
+        if args.per_priority == "td":   # ablation: replace curiosity priority with |TD error|
+            td = (0.5 * (q1 + q2) - y).sum(-1).abs().detach().cpu().numpy()
+            buf.update_priorities(b["e"], b["i"], td)
+        ap, logpp, _ = actor.sample(zb)
+        q1p, q2p = critic(zb, ap)
+        q_min = torch.min(q1p.sum(-1, keepdim=True), q2p.sum(-1, keepdim=True))   # sum heads, then twin-min
+        actor_loss = (alpha * logpp - q_min).mean()                              # maximize Q + alpha*H (== safe15 at K=1)
+        if getattr(args, "actor_rate_reg", 0) > 0:
+            # action-rate as an actor-loss regularizer instead of a reward term: penalize
+            # the policy's own within-block sub-action jerk directly — smoothness pressure
+            # that never enters r or propagates through Q (the curiosity balance untouched).
+            sub = ap.view(ap.shape[0], args.action_block, -1)
+            actor_loss = actor_loss + args.actor_rate_reg * sub.diff(dim=1).pow(2).mean()
+        actor_opt.zero_grad(); actor_loss.backward(); actor_opt.step()
+        with torch.no_grad():
+            for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
+                pt.mul_(1 - args.tau).add_(args.tau * p)
+        out = {"critic_loss": float(critic_loss.item()),
+               "actor_loss": float(actor_loss.item()), "zb": zb.detach()}
+        if q1p.shape[-1] > 1:            # per-head mean Q: which component steers the policy
+            out["q_heads"] = (0.5 * (q1p + q2p)).mean(0).detach().cpu().numpy()
+    return out
+
+
 @torch.no_grad()
 def collapse_metrics(z):
     """Encoder-collapse diagnostics on a batch of latents z (B, D), computed on CPU
@@ -282,6 +393,35 @@ def collapse_metrics(z):
 
 
 # ----------------------------------------------------------------- checkpointing
+def save_buffer(buf, out_dir):
+    """Dump the collected transitions (chronological, per env) to out_dir/buffer_<N>.npz
+    for offline training (e.g. ship to a RunPod GPU). Reconstructs each env's ring into
+    oldest->newest order via start=(head-count)%C; is_start marks episode boundaries so a
+    consumer never builds a WM window across a reset."""
+    px, prop, act, r, d, isx, lengths = [], [], [], [], [], [], []
+    for e in range(buf.n_envs):
+        n = int(buf.count[e])
+        if n == 0:
+            continue
+        start = (int(buf.head[e]) - n) % buf.C
+        idx = (start + np.arange(n)) % buf.C
+        px.append(buf.pixels[e, idx]); prop.append(buf.proprio[e, idx])
+        act.append(buf.action[e, idx]); r.append(buf.r[e, idx])
+        d.append(buf.d[e, idx]); isx.append(buf.is_start[e, idx]); lengths.append(n)
+    if not lengths:
+        print("[frozen] buffer empty -> nothing to save", flush=True)
+        return None
+    path = out_dir / f"buffer_{sum(lengths):07d}.npz"
+    np.savez_compressed(path,
+                        pixels=np.concatenate(px), proprio=np.concatenate(prop),
+                        action=np.concatenate(act), r=np.concatenate(r),
+                        d=np.concatenate(d), is_start=np.concatenate(isx),
+                        env_lengths=np.asarray(lengths, np.int64))
+    print(f"[frozen] saved {sum(lengths)} transitions -> {path} "
+          f"({path.stat().st_size / 1e6:.1f} MB)", flush=True)
+    return path
+
+
 def save_and_upload(state, out_dir, step, repo_id, run_name, enable_hf, keep_local):
     """Save a checkpoint, upload to HF under <run_name>/ckpt_<step>.pt, then (unless
     keep_local) delete the local copy once the upload succeeds -- so disk stays
@@ -331,6 +471,24 @@ def resolve_ckpt(ckpt=None, name="baseline", step=None, hf_repo=None):
     return hf_hub_download(repo_id=repo, filename=target, token=token)
 
 
+def load_init_ckpt(args, wm, actor, critic, critic_tgt, device):
+    """Warm-start / resume: load WM + actor-critic weights so the online loop CONTINUES a
+    prior run instead of starting cold (train.py otherwise only ever SAVES checkpoints,
+    never loads). Resolves a local --init-ckpt or an HF --resume-name[/--resume-step].
+    Returns h_fwd to overwrite the freshly-initialised value. NOTE: optimizer state is
+    not in the checkpoint, so Adam moments restart — lower LRs for bring-up if needed."""
+    path = resolve_ckpt(args.init_ckpt, args.resume_name or args.name, args.resume_step, args.hf_repo)
+    ck = torch.load(path, map_location=device, weights_only=False)
+    wm.load_state_dict(ck["wm"])
+    load_actor_state(actor, ck["actor"])     # drops the log_std head of old stochastic ckpts
+    critic.load_state_dict(ck["critic"])
+    critic_tgt.load_state_dict(ck["critic_tgt"])
+    h_fwd = int(ck.get("h_fwd", args.h_fwd_start))
+    print(f"[resume] loaded wm+actor+critic from {path} "
+          f"(saved step {ck.get('step', '?')}, h_fwd={h_fwd})", flush=True)
+    return h_fwd
+
+
 def tile_frames(imgs):
     """Tile (n_envs, H, W, 3) per-env camera frames into one (rows*H, cols*W, 3) grid,
     so a single train-video clip shows all parallel envs at once."""
@@ -356,9 +514,19 @@ def main(args):
     except ImportError:
         pass
 
-    VecEnv = SubprocVectorMujocoEnv if args.env_backend == "subproc" else VectorMujocoEnv
+    if args.env_backend == "hardware":
+        if args.n_envs != 1:
+            print(f"[hardware] forcing n_envs=1 (was {args.n_envs}; one physical arm)", flush=True)
+            args.n_envs = 1
+        from env.hardware_env import HardwareSO101Env
+        VecEnv = HardwareSO101Env
+    else:
+        from env.parallel_env import VectorMujocoEnv, SubprocVectorMujocoEnv
+        VecEnv = SubprocVectorMujocoEnv if args.env_backend == "subproc" else VectorMujocoEnv
+    if args.start_steps < 0:                      # default-aware: skip random warmup on a real arm
+        args.start_steps = 0 if args.env_backend == "hardware" else 1000
     env = VecEnv(n_envs=args.n_envs, frame_skip=args.frame_skip,
-                 action_max=args.action_max, dq_max=args.dq_max,
+                 action_max=args.action_max,
                  safety_delta=args.safety_delta, seed=args.seed,
                  threads=args.env_threads)
     n_dof = env.n_dof
@@ -378,21 +546,47 @@ def main(args):
     z_dim = wm.z_dim
 
     actor = Actor(z_dim, a_dim).to(device)
-    critic = TwinQ(z_dim, a_dim).to(device)
-    critic_tgt = TwinQ(z_dim, a_dim).to(device)
+    n_q_out = len(REWARD_COMPONENTS) if args.multihead_q else 1
+    critic = TwinQ(z_dim, a_dim, n_out=n_q_out).to(device)
+    critic_tgt = TwinQ(z_dim, a_dim, n_out=n_q_out).to(device)
     critic_tgt.load_state_dict(critic.state_dict())
     for p in critic_tgt.parameters():
         p.requires_grad_(False)
-    log_alpha = torch.tensor(float(np.log(args.alpha)), device=device)   # fixed entropy temp
 
     actor_opt = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
     critic_opt = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
     wm_opt = torch.optim.AdamW([p for p in wm.parameters() if p.requires_grad],
                                lr=args.wm_lr, weight_decay=1e-3)
 
+    # --- resume / warm-start: load wm+sac weights BEFORE the loop (else cold start) ---
+    resume_h_fwd = None
+    if args.init_ckpt or args.resume_name:
+        resume_h_fwd = load_init_ckpt(args, wm, actor, critic, critic_tgt, device)
+
+    # --- frozen-policy data collection: act + buffer, NO gradient updates ---
+    policy_loaded = bool(args.init_ckpt or args.resume_name)
+    if args.frozen_policy and not policy_loaded:
+        msg = ("--frozen-policy with no --init-ckpt/--resume-name -> a RANDOM-init actor "
+               "would drive the arm with no learning to correct it")
+        if args.env_backend == "hardware":
+            raise SystemExit(f"[frozen] REFUSING on hardware: {msg}. "
+                             "Load a policy, e.g. --resume-name safe15 --resume-step 100000.")
+        print(f"[frozen] WARNING: {msg}.", flush=True)
+    if args.frozen_policy:
+        print("[frozen] data-collection mode: NO gradient updates (WM/SAC/curriculum "
+              "all skipped); acting + buffering only. Buffer -> out_dir/buffer_<N>.npz on exit.",
+              flush=True)
+
     cap = int(np.clip(args.buffer_frac * args.total_steps, 1000, 50_000))
     cap_per_env = max(cap // args.n_envs, args.history_size + args.h_fwd_max + 8)
-    buf = ReplayBuffer(args.n_envs, cap_per_env, env.wrist_resolution, a_dim, prop_dim, device)
+    if args.frozen_policy or args.save_buffer:   # collection KEEPS everything -> size the ring to the whole run
+        keep = min(args.total_steps, 50_000)     # (the per-env ring otherwise overwrites the oldest in place)
+        if args.total_steps > 50_000:
+            print(f"[frozen] WARNING: requested {args.total_steps} steps but the buffer holds {keep}/env; "
+                  f"oldest will be overwritten. Split into shorter runs to keep all transitions.", flush=True)
+        cap_per_env = max(cap_per_env, keep)
+    buf = ReplayBuffer(args.n_envs, cap_per_env, env.wrist_resolution, a_dim, prop_dim, device,
+                       n_comp=len(REWARD_COMPONENTS) if args.multihead_q else 0)
     print(f"[buffer] {args.n_envs} x {cap_per_env} = {args.n_envs * cap_per_env} transitions", flush=True)
 
     run_name = args.name
@@ -400,6 +594,26 @@ def main(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     n_params = sum(p.numel() for p in wm.parameters())
     print(f"[run] name={run_name}  out_dir={out_dir}  wm_params={n_params/1e6:.2f}M", flush=True)
+    if args.env_backend == "hardware":
+        loaded = bool(args.init_ckpt or args.resume_name)
+        warns = []
+        if args.action_max > 0.15:
+            warns.append(f"action_max={args.action_max} is large for a real arm")
+        if not loaded:
+            warns.append("no policy loaded (random actor)")
+        print(f"[hardware] SAFETY: n_envs=1, control_dt={env.dt_safe}s, "
+              f"action_max={args.action_max} (<= +/-{args.action_max} rad/joint/step), "
+              f"start_steps={args.start_steps}, policy={'loaded' if loaded else 'RANDOM'}. "
+              f"Keep the e-stop within reach." + ("  [!] " + "; ".join(warns) if warns else ""),
+              flush=True)
+
+    # acting mode: SAC sample in sim training (entropy exploration that un-parks the policy
+    # and decorrelates the parallel envs); deterministic mean on hardware, in frozen-policy
+    # collection, and whenever --deterministic-act is set (deployment / eval).
+    stochastic_act = (not args.deterministic_act and not args.frozen_policy
+                      and args.env_backend != "hardware")
+    print(f"[policy] acting={'stochastic sample (training)' if stochastic_act else 'deterministic mean (deploy/eval)'}"
+          f"; alpha={args.alpha}", flush=True)
 
     run = None
     if not args.no_wandb and wandb is not None and os.environ.get("WANDB_API_KEY"):
@@ -417,6 +631,8 @@ def main(args):
 
     # --- live per-env state (history is (H, n_envs, .) so resets touch one row) ---
     obs = env.reset()
+    if args.no_torque_obs:
+        scrub_torque_obs(obs, n_dof)
     z = encode_obs(wm, obs["image"], obs["proprio"], device)        # (n_envs, z_dim)
     hist_z = z.unsqueeze(0).repeat(H, 1, 1)
     hist_a = torch.zeros(H, args.n_envs, a_dim, device=device)
@@ -424,16 +640,22 @@ def main(args):
     ep_len = np.zeros(args.n_envs, np.int64)
     ep_ret = np.zeros(args.n_envs, np.float32)
 
-    h_fwd = args.h_fwd_start                          # curriculum horizon
+    h_fwd = resume_h_fwd if resume_h_fwd is not None else args.h_fwd_start   # curriculum horizon (resumed if warm-started)
     pred_hist = deque(maxlen=args.flatline_window)    # for the flatline bump trigger
     updates_at_stage = 0
+    prev_sub_a = np.zeros((args.n_envs, n_dof), np.float64)   # last sub-action of the previous block (action-rate boundary)
+    tau_max_arr = np.asarray(env.tau_max, np.float32)
+    prev_qpos_dec = None                                      # last decision's final joint pose (for pose_step travel)
+    recent_qpos = deque(maxlen=200)                           # rolling final-pose history -> pose_spread / pose_range
     recent = {k: deque(maxlen=400) for k in
               ("r_cur", "r_safe", "cur_contrib", "contacts", "table_contacts",
-               "motion", "ret", "frac_block", "frac_table")}
+               "motion", "ret", "frac_block", "frac_table",
+               "rate", "rate2", "energy", "qd_mean", "tau_sat", "qd_rev",
+               "r_rate", "r_energy", "pose_step")}
     recent_mse = {k: deque(maxlen=2000) for k in ("mse_block", "mse_table", "mse_none")}
     t0 = time.time()
     last_wm = last_sac = None
-    last_zb = None
+    last_zb = last_qh = None
     video_on = imageio is not None and args.video_every > 0
     wrist_buf = deque(maxlen=args.video_steps)      # train-video clips (per-env frames, tiled)
     over_buf = deque(maxlen=args.video_steps)
@@ -444,6 +666,9 @@ def main(args):
                   if not args.no_hf else None)
         if loaded is not None:
             probe_px, probe_prop = loaded[0][:args.probe_size], loaded[1][:args.probe_size]
+            if args.no_torque_obs:               # probe obs must match the scrubbed training obs
+                probe_prop = probe_prop.copy()
+                probe_prop[..., 2 * n_dof:3 * n_dof] = 0.0
             print(f"[probe] loaded {len(probe_px)} uniform-pose obs from HF ({args.probe_id})", flush=True)
         else:
             print(f"[probe] HF probe '{args.probe_id}' unavailable; falling back to warmup-rollout probe",
@@ -455,7 +680,7 @@ def main(args):
         these GPU updates overlap the env workers rendering the next decision. Update
         count and schedule are identical to the serial loop; they just see the buffer
         minus the single in-flight transition (added after wait) -- negligible off-policy."""
-        nonlocal last_wm, last_sac, last_zb, updates_at_stage
+        nonlocal last_wm, last_sac, last_zb, last_qh, updates_at_stage
         # --- world-model co-training: autoregressive MSE rollout + beta*SIGReg ---
         if step >= args.start_steps and step % args.wm_update_every == 0:
             batch = buf.sample_wm(args.wm_batch_size, H + h_fwd)
@@ -474,66 +699,115 @@ def main(args):
                         h_fwd += 1; updates_at_stage = 0; pred_hist.clear()
                         print(f"[curriculum] step={step} H_fwd -> {h_fwd}", flush=True)
         # --- SAC updates (PER; encoder is frozen w.r.t. SAC, z encoded under no_grad) ---
-        if step >= args.start_steps and buf.total >= args.batch_size:
-            per_beta = min(1.0, args.per_beta_start
-                           + (1 - args.per_beta_start) * step / max(args.total_steps, 1))
-            alpha = log_alpha.exp()
-            for _ in range(args.updates_per_step):
-                b = buf.sample_sac(args.batch_size, args.per_alpha, per_beta)
-                if b is None:
-                    break
-                zb = encode_obs(wm, b["px"], b["prop"], device)
-                znb = encode_obs(wm, b["px_n"], b["prop_n"], device)
-                with torch.no_grad():
-                    an, logpn, _ = actor.sample(znb)
-                    q1n, q2n = critic_tgt(znb, an)
-                    y = b["r"] + (1 - b["d"]) * args.gamma * (torch.min(q1n, q2n) - alpha * logpn)
-                q1, q2 = critic(zb, b["a"])
-                critic_loss = (b["w"] * ((q1 - y).pow(2) + (q2 - y).pow(2))).mean()
-                critic_opt.zero_grad(); critic_loss.backward(); critic_opt.step()
-                if args.per_priority == "td":   # ablation: replace curiosity priority with |TD error|
-                    td = (0.5 * (q1 + q2) - y).abs().detach().squeeze(1).cpu().numpy()
-                    buf.update_priorities(b["e"], b["i"], td)
-                ap, logpp, _ = actor.sample(zb)
-                q1p, q2p = critic(zb, ap)
-                actor_loss = (alpha * logpp - torch.min(q1p, q2p)).mean()
-                actor_opt.zero_grad(); actor_loss.backward(); actor_opt.step()
-                with torch.no_grad():
-                    for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
-                        pt.mul_(1 - args.tau).add_(args.tau * p)
-                last_zb = zb.detach()
-                last_sac = (float(critic_loss.item()), float(actor_loss.item()))
+        res = sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
+                         args, step, device)
+        if res is not None:
+            last_sac = (res["critic_loss"], res["actor_loss"])
+            last_zb = res["zb"]
+            last_qh = res.get("q_heads")
         return h_fwd
 
+    # graceful stop for data-collection runs: 1st Ctrl-C finishes the in-flight decision and
+    # saves; a 2nd Ctrl-C (default handler restored) force-quits.
+    _stop = {"flag": False}
+    if args.frozen_policy or args.save_buffer:
+        import signal
+        def _on_sigint(signum, frame):
+            _stop["flag"] = True
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            print("\n[frozen] stop requested -> finishing this decision then saving "
+                  "(Ctrl-C again to force-quit).", flush=True)
+        signal.signal(signal.SIGINT, _on_sigint)
+
     for step in range(args.total_steps):
+        if _stop["flag"]:
+            print(f"[frozen] graceful stop at step {step} ({buf.total} transitions).", flush=True)
+            break
         cur_px, cur_prop = obs["image"], obs["proprio"]          # o_t (before acting)
 
-        # --- act ---
+        # --- act: SAC stochastic sample during sim training (the entropy-driven exploration
+        #     that un-parks the policy and decorrelates the parallel envs), the DETERMINISTIC
+        #     mean on hardware / frozen deployment / eval (stochastic_act is False there).
+        #     --warmup-random still opts in a uniform warmup; --explore-noise adds extra
+        #     collection noise on top (sim only). ---
         with torch.no_grad():
-            if step < args.start_steps:
-                a = torch.rand(args.n_envs, a_dim, device=device) * 2 - 1   # warmup
-            else:
+            if args.warmup_random and step < args.start_steps:
+                a = torch.rand(args.n_envs, a_dim, device=device) * 2 - 1
+            elif stochastic_act:
                 a, _, _ = actor.sample(z)
+            else:
+                a = actor(z)                 # deterministic mean (deployment / eval)
+            if args.explore_noise > 0:       # optional extra collection noise (sim pretrain only)
+                a = (a + args.explore_noise * torch.randn_like(a)).clamp(-1.0, 1.0)
         hist_a = torch.cat([hist_a[1:], a.unsqueeze(0)], 0)
         a_env = a.detach().cpu().numpy().reshape(args.n_envs, args.action_block, n_dof)
 
         # --- async actor-learner: launch the env rollout for this decision, then run
         #     the GPU updates on buffered data WHILE the workers render -> overlap CPU/GPU ---
         env.step_block_async(a_env)
-        h_fwd = learner_updates(step, h_fwd)
+        if not args.frozen_policy:                # frozen: skip ALL gradient work (data collection only)
+            h_fwd = learner_updates(step, h_fwd)
         obs, sub_infos = env.step_block_wait()
+        if args.no_torque_obs:
+            scrub_torque_obs(obs, n_dof)
 
-        # --- accumulate safety reward + interaction stats over the action_block ---
+        # --- accumulate safety reward + interaction + smoothness stats over the action_block ---
         r_safe = np.zeros(args.n_envs, np.float32)
         contacts = np.zeros(args.n_envs, np.float32)
         table_contacts = np.zeros(args.n_envs, np.float32)
         motion = np.zeros(args.n_envs, np.float32)
+        energy = np.zeros(args.n_envs, np.float32)      # mean_i |tau_i * qd_i| (mechanical power)
+        qd_mean = np.zeros(args.n_envs, np.float32)
+        tau_sat = np.zeros(args.n_envs, np.float32)
+        qd_rev = np.zeros(args.n_envs, np.float32)      # sign-flip fraction of qd between substeps
+        prev_qd = None
         for info in sub_infos:
             r_safe += info["safety_reward"]
             contacts += info["object_contacts"].astype(np.float32)
             table_contacts += info["table_contacts"].astype(np.float32)
             motion += info["object_motion"]
+            tau, qd = info["applied_torque"], info["qvel"]
+            energy += np.abs(tau * qd).mean(-1)
+            qd_mean += np.abs(qd).mean(-1)
+            tau_sat += (np.abs(tau) > 0.95 * tau_max_arr).mean(-1).astype(np.float32)
+            if prev_qd is not None:
+                qd_rev += ((qd * prev_qd) < 0).mean(-1).astype(np.float32)
+            prev_qd = qd
         r_safe /= args.action_block      # one r_safe per decision (README: Env(a_t) -> r_safe_t)
+        energy /= args.action_block
+        qd_mean /= args.action_block
+        tau_sat /= args.action_block
+        qd_rev /= max(args.action_block - 1, 1)
+
+        # --- action-rate (legged_gym-style smoothness): mean per-dim squared delta over
+        #     consecutive sub-actions, including the boundary pair with the previous
+        #     block's last sub-action. On an episode's first decision the boundary (and
+        #     the 2nd-order term spanning it) is masked out — never penalize the
+        #     cross-reset jump. Computed for every run (logged); enters the reward only
+        #     when --w-action-rate/--w-action-rate2 > 0. ---
+        seq = np.concatenate([prev_sub_a[:, None, :], a_env.astype(np.float64)], axis=1)  # (n_envs, 1+B, n_dof)
+        d1 = np.diff(seq, axis=1)                          # (n_envs, B, n_dof)
+        d2 = np.diff(seq, n=2, axis=1)                     # (n_envs, B-1, n_dof)
+        sq1, sq2 = (d1 ** 2).mean(-1), (d2 ** 2).mean(-1)  # per-pair, per-dim mean
+        m1, m2 = np.ones_like(sq1), np.ones_like(sq2)
+        m1[is_start, 0] = 0.0
+        m2[is_start, 0] = 0.0
+        rate = ((sq1 * m1).sum(1) / m1.sum(1)).astype(np.float32)
+        rate2 = ((sq2 * m2).sum(1) / np.maximum(m2.sum(1), 1.0)).astype(np.float32)
+        prev_sub_a = a_env[:, -1].astype(np.float64).copy()
+
+        # --- ACTUAL joint travel (is the arm parked or going somewhere?). pose_step =
+        #     how far the joint vector moved THIS decision; ~0 = frozen/dithering in place.
+        #     pose_spread/pose_range (logged below) = how much of config space the recent
+        #     window covers. These read q directly, so they catch in-place jitter that
+        #     qd_mean misses (high qd + ~0 pose_step = oscillating, not exploring). ---
+        qpos_dec = sub_infos[-1]["qpos"].astype(np.float64)        # (n_envs, n_dof) final pose of the block
+        if prev_qpos_dec is None:
+            prev_qpos_dec = qpos_dec
+        pose_step = np.where(is_start, 0.0,
+                             np.linalg.norm(qpos_dec - prev_qpos_dec, axis=-1)).astype(np.float32)
+        prev_qpos_dec = qpos_dec
+        recent_qpos.append(qpos_dec.copy())
 
         # freeze a FIXED diverse probe set (early warmup obs) so encoder/eff_rank_probe
         # measures encoder health independent of how narrow the policy's behavior gets.
@@ -548,7 +822,11 @@ def main(args):
         z_next = encode_obs(wm, obs["image"], obs["proprio"], device)
         r_cur = curiosity_reward(wm, hist_z, hist_a, z_next).cpu().numpy()        # (n_envs,) >= 0
         cur_term = args.lambda_cur * np.log1p(r_cur)         # lambda_cur * symlog(r_cur)  (r_cur>=0)
-        reward = args.lambda_safe * r_safe + cur_term        # r = lambda_safe*r_safe + lambda_cur*symlog(r_cur)
+        r_rate = -(args.w_action_rate * rate + args.w_action_rate2 * rate2)       # smoothness penalties (0 unless flagged)
+        r_energy = -args.w_energy * energy
+        safe_term = args.lambda_safe * r_safe
+        reward = safe_term + cur_term + r_rate + r_energy
+        comps = np.stack([cur_term, safe_term, r_rate, r_energy], -1).astype(np.float32)  # REWARD_COMPONENTS order
 
         # contact-conditioned curiosity MSE (r_cur = ||zhat-z||^2): is the model more
         # surprised poking a block than scraping the table or moving in free space?
@@ -565,11 +843,15 @@ def main(args):
         ep_ret += reward
         done = (ep_len >= args.max_episode_steps).astype(np.float32)
         buf.add(pixels=cur_px, proprio=cur_prop, action=a.detach().cpu().numpy(),
-                r=reward, d=done, is_start=is_start.copy(), prio=r_cur)
+                r=reward, d=done, is_start=is_start.copy(), prio=r_cur,
+                rc=comps if args.multihead_q else None)
         for key, val in (("r_cur", r_cur), ("r_safe", r_safe), ("cur_contrib", cur_term),
                          ("contacts", contacts), ("table_contacts", table_contacts),
                          ("motion", motion), ("ret", reward),
-                         ("frac_block", touch_block), ("frac_table", touch_table)):
+                         ("frac_block", touch_block), ("frac_table", touch_table),
+                         ("rate", rate), ("rate2", rate2), ("energy", energy),
+                         ("qd_mean", qd_mean), ("tau_sat", tau_sat), ("qd_rev", qd_rev),
+                         ("r_rate", r_rate), ("r_energy", r_energy), ("pose_step", pose_step)):
             recent[key].append(float(np.mean(val)))
 
         # --- advance latent + history; reset timed-out envs ---
@@ -580,6 +862,8 @@ def main(args):
         if len(done_envs):
             for e in done_envs:
                 o_e = env.reset_one(int(e))
+                if args.no_torque_obs:
+                    scrub_torque_obs(o_e, n_dof)
                 obs["image"][e] = o_e["image"]
                 obs["proprio"][e] = o_e["proprio"]
             z_reset = encode_obs(wm, obs["image"][done_envs], obs["proprio"][done_envs], device)
@@ -616,8 +900,21 @@ def main(args):
                  "interact/object_motion": np.mean(recent["motion"]),
                  "interact/frac_touch_block": np.mean(recent["frac_block"]),
                  "interact/frac_touch_table": np.mean(recent["frac_table"]),
+                 "smooth/action_rate": np.mean(recent["rate"]),
+                 "smooth/action_rate2": np.mean(recent["rate2"]),
+                 "smooth/energy": np.mean(recent["energy"]),
+                 "smooth/qd_mean": np.mean(recent["qd_mean"]),
+                 "smooth/tau_sat_frac": np.mean(recent["tau_sat"]),
+                 "smooth/qd_reversal_frac": np.mean(recent["qd_rev"]),
+                 "reward/r_rate": np.mean(recent["r_rate"]),
+                 "reward/r_energy": np.mean(recent["r_energy"]),
+                 "explore/pose_step": np.mean(recent["pose_step"]),     # joint travel/decision; ~0 = parked
                  "buffer/transitions": buf.total, "perf/steps_per_sec": sps,
                  "wm/h_fwd": h_fwd}
+            if recent_qpos:    # how much of joint space the recent window covers (parked -> ~0)
+                qarr = np.stack(recent_qpos)                            # (T, n_envs, n_dof)
+                d["explore/pose_spread"] = float(qarr.std(0).mean())    # mean temporal std over joints/envs
+                d["explore/pose_range"] = float((qarr.max(0) - qarr.min(0)).mean())  # mean per-joint sweep
             for key in ("mse_block", "mse_table", "mse_none"):   # curiosity MSE by contact type
                 if recent_mse[key]:
                     d[f"wm/{key}"] = float(np.mean(recent_mse[key]))
@@ -633,8 +930,9 @@ def main(args):
                 d.update({"wm/pred_loss": last_wm[0], "wm/sigreg": last_wm[1],
                           "wm/identity_baseline": last_wm[2]})
             if last_sac is not None:
-                d.update({"sac/critic_loss": last_sac[0], "sac/actor_loss": last_sac[1],
-                          "sac/alpha": float(log_alpha.exp().item())})
+                d.update({"sac/critic_loss": last_sac[0], "sac/actor_loss": last_sac[1]})
+            if last_qh is not None:              # --multihead-q: per-component policy value
+                d.update({f"sac/q_{k}": float(v) for k, v in zip(REWARD_COMPONENTS, last_qh)})
             wlog(d, step)
             with open(out_dir / "metrics.jsonl", "a") as f:    # local metrics record (esp. when --no-wandb)
                 f.write(json.dumps({"step": step, **{k: float(v) for k, v in d.items()}}) + "\n")
@@ -643,13 +941,15 @@ def main(args):
                   f"contacts/s={d['interact/contacts_per_step']:.2f} "
                   f"mse[blk/tbl/none]={d.get('wm/mse_block', float('nan')):.2f}/"
                   f"{d.get('wm/mse_table', float('nan')):.2f}/{d.get('wm/mse_none', float('nan')):.2f} "
+                  f"rate={d['smooth/action_rate']:.2f} pose_step={d['explore/pose_step']:.3f} "
+                  f"pose_range={d.get('explore/pose_range', float('nan')):.2f} "
                   f"h_fwd={h_fwd} sps={sps:.1f}", flush=True)
 
         # --- checkpoint: upload to HF then clear from disk (bounded disk over a long run) ---
         if args.save_every > 0 and step > 0 and step % args.save_every == 0:
             state = {"step": step, "wm": wm.state_dict(), "actor": actor.state_dict(),
                      "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
-                     "log_alpha": log_alpha.detach().cpu(), "h_fwd": h_fwd, "args": vars(args)}
+                     "h_fwd": h_fwd, "args": vars(args)}
             save_and_upload(state, out_dir, step,
                             args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
                             run_name, not args.no_hf, args.keep_local_ckpts)
@@ -670,13 +970,16 @@ def main(args):
                     print(f"[video] {tag} failed (non-fatal): {ex}", flush=True)
             wrist_buf.clear(); over_buf.clear()
 
-    # --- final checkpoint ---
-    state = {"step": args.total_steps, "wm": wm.state_dict(), "actor": actor.state_dict(),
-             "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
-             "log_alpha": log_alpha.detach().cpu(), "h_fwd": h_fwd, "args": vars(args)}
-    save_and_upload(state, out_dir, args.total_steps,
-                    args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
-                    run_name, not args.no_hf, args.keep_local_ckpts)
+    # --- final: collected data (frozen / --save-buffer) and/or model checkpoint ---
+    if args.frozen_policy or args.save_buffer:
+        save_buffer(buf, out_dir)
+    if not args.frozen_policy:                    # frozen: weights are unchanged, skip the re-upload
+        state = {"step": args.total_steps, "wm": wm.state_dict(), "actor": actor.state_dict(),
+                 "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
+                 "h_fwd": h_fwd, "args": vars(args)}
+        save_and_upload(state, out_dir, args.total_steps,
+                        args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
+                        run_name, not args.no_hf, args.keep_local_ckpts)
     env.close()
     if run is not None:
         run.finish()
@@ -687,17 +990,28 @@ def parse_args():
     p = argparse.ArgumentParser(description="Curious Robot: JEPA+SIGReg WM + SAC curiosity on SO-ARM101")
     # schedule / infra
     p.add_argument("--total-steps", type=int, default=200_000)
-    p.add_argument("--start-steps", type=int, default=1000, help="random-action warmup (decision steps)")
+    p.add_argument("--start-steps", type=int, default=-1,
+                   help="update warmup (decision steps): no WM/SAC gradient steps before this; acting is "
+                        "ALWAYS the deterministic policy (the random-action warmup was removed with the "
+                        "rest of the policy stochasticity). Default-aware: 0 on hardware, 1000 in sim")
     p.add_argument("--n-envs", type=int, default=8)
     p.add_argument("--env-threads", type=int, default=0,
                    help=">0 steps envs on a thread pool (inproc backend only)")
-    p.add_argument("--env-backend", choices=("subproc", "inproc"), default="subproc",
+    p.add_argument("--env-backend", choices=("subproc", "inproc", "hardware"), default="subproc",
                    help="subproc: each env in a CUDA-free worker process, needed on "
                         "GPU+EGL to avoid the MuJoCo-render/CUDA SIGABRT; "
-                        "inproc: envs in this process (sequential or --env-threads)")
+                        "inproc: envs in this process (sequential or --env-threads); "
+                        "hardware: one physical SO-ARM101 via env/hardware_env.py (forces n_envs=1)")
     p.add_argument("--frame-skip", type=int, default=6)
     p.add_argument("--max-episode-steps", type=int, default=200, help="decision steps before truncation-as-done")
     p.add_argument("--seed", type=int, default=0)
+    # resume / warm-start (train.py otherwise never loads a checkpoint)
+    p.add_argument("--init-ckpt", default=None,
+                   help="local .pt to warm-start wm+actor+critic+critic_tgt+h_fwd before the loop")
+    p.add_argument("--resume-name", default=None,
+                   help="resume from an HF run name (e.g. safe15) instead of a local --init-ckpt")
+    p.add_argument("--resume-step", type=int, default=None,
+                   help="checkpoint step for --resume-name (default: latest available)")
     p.add_argument("--name", default="baseline",
                    help="short run keyword; drives the W&B run name, runs/<name>/, and HF "
                         "<name>/ckpt_*.pt. Keep it short and identifiable -- every constant/var "
@@ -721,8 +1035,8 @@ def parse_args():
                         "falls back to a warmup-rollout probe if unavailable")
     # action / actuation (README)
     p.add_argument("--action-block", type=int, default=5)
-    p.add_argument("--action-max", type=float, default=0.3)
-    p.add_argument("--dq-max", type=float, default=100.0, help="README dq^max (~inf; clip rarely binds)")
+    p.add_argument("--action-max", type=float, default=0.3,
+                   help="README dq^max: rad of joint delta per unit tanh action")
     # world model (README; the '?' values below are sweepable, not pinned in README)
     p.add_argument("--history-size", type=int, default=3, help="H_bwd")
     p.add_argument("--h-fwd-start", type=int, default=1)
@@ -742,23 +1056,71 @@ def parse_args():
     p.add_argument("--flatline-window", type=int, default=200)
     p.add_argument("--flatline-tol", type=float, default=0.03)
     # reward ('?' values; sweepable)
-    p.add_argument("--lambda-safe", type=float, default=0.1,
+    p.add_argument("--lambda-safe", type=float, default=2.2,
                    help="weight on the safety penalty r_safe: r = lambda_safe*r_safe + lambda_cur*symlog(r_cur). "
-                        "Default 0.1 keeps safety:curiosity ~0.5:1 at steady state under the per-dim-mean r_cur "
-                        "(the literal README weight 1.0 over-weights safety ~5:1 now and freezes the policy); "
-                        "0 ablates safety.")
-    p.add_argument("--lambda-cur", type=float, default=1.0,
+                        "Default 2.2 (2026-06-12, real-arm calibration): under delta=9 benign motion scores "
+                        "exactly 0, so lambda_safe scales only genuine events — 2.2 makes one median "
+                        "user-labeled-bad substep cancel ~one decision's curiosity term. 0 ablates safety.")
+    p.add_argument("--lambda-cur", type=float, default=15.0,
                    help="curiosity weight on symlog(r_cur). r_cur is the per-dim MEAN squared pred error "
-                        "(~O(0.1-1)), so lambda_cur~1 keeps cur_term O(1) in symlog's sensitive region. README '?'")
-    p.add_argument("--safety-delta", type=float, default=15.0,
-                   help="delta: safety-reward deadband on the per-joint -tau*qddot (N*m*rad/s^2). Default 15 "
-                        "leaves gentle reaching / light contact / pickup (-tau*qddot<~15) penalty-free while "
-                        "penalizing hard impacts and violent high-torque reversals (~40-560). The old 0.05 "
-                        "penalized essentially all motion -> safety dominates -> policy freezes.")
-    # SAC (README)
+                        "(~O(0.1-1)); 15-20 keeps curiosity audible against raw |r_safe|~50 at lambda_safe 0.1. "
+                        "Default 15 (2026-06-11; safe15/campaign history ran 20 — old default 1.0 silently "
+                        "shrank curiosity 20x and caused one mis-deploy).")
+    p.add_argument("--safety-delta", type=float, default=9.0,
+                   help="delta: safety-reward deadband on the per-joint -tau*qddot (N*m*rad/s^2). Default 9 "
+                        "re-pinned 2026-06-12 from real-arm calibration at P8/D16 (true-dt args: all benign "
+                        "motion incl. max-violence reversals <=7.4; user-labeled-bad grabs/blocks/jerks "
+                        ">=10.7). SIM runs: use 15 with --lambda-safe 0.1 — measured 2026-06-12 "
+                        "(runs/sim_scales/kp499.json): sim's saturated PD torque puts even smooth motion at "
+                        "args>9 on 33%% of joint-samples, so the real-arm (9, 2.2) pair freezes sim policies. "
+                        "The pre-2026-06 0.05 penalized all motion -> policy froze; the old 15 never fired on hw.")
+    # smoothness / transferability experiment knobs (2026-06-12 sim campaign; all default-off)
+    p.add_argument("--w-action-rate", type=float, default=0.0,
+                   help="weight W on the action-rate penalty -W * mean_dim (a_t - a_{t-1})^2 over consecutive "
+                        "sub-actions incl. the block boundary (legged_gym-style; actions already in [-1,1]). "
+                        "Episode-start boundary masked. Sim scale ref (kp499.json): dither ~1.42, smooth ~0.09 "
+                        "-> W=3 puts dither at -4.3 vs cur_contrib ~+10 while smooth motion pays ~-0.3.")
+    p.add_argument("--w-action-rate2", type=float, default=0.0,
+                   help="weight on the 2nd-order action-rate term mean_dim (a_t - 2a_{t-1} + a_{t-2})^2 "
+                        "(omega^4 rolloff). Off by default; try after the 1st-order term proves out.")
+    p.add_argument("--w-energy", type=float, default=0.0,
+                   help="weight W on the energy penalty -W * mean_substeps mean_i |tau_i * qd_i| (mechanical "
+                        "power; N*m*rad/s). Sim scale ref: dither ~3.3, smooth ~1.4 -> W=1 is a balanced trial. "
+                        "Hardware analogue exists since kt=10 current-torque (2026-06-06).")
+    p.add_argument("--no-torque-obs", action="store_true",
+                   help="zero the u^app slice of proprio (obs -> [q, qd, 0]); shapes unchanged so old ckpts "
+                        "load. Removes the obs channel that is ~96%% saturated sign-bit on hw and the main "
+                        "sim->real proprio mismatch.")
+    p.add_argument("--multihead-q", action="store_true",
+                   help="critic outputs one Q head per reward component (cur/safe/rate/energy), each trained "
+                        "on its own TD target; the actor maximizes the sum (same optimum as the scalar critic). "
+                        "Logs sac/q_<comp> for interpretability.")
+    p.add_argument("--actor-rate-reg", type=float, default=0.0,
+                   help="action-rate as an ACTOR-LOSS regularizer (vs --w-action-rate's reward term): "
+                        "+W * mean (pi(z) sub-action diffs)^2 added to actor_loss. Keeps smoothness "
+                        "pressure out of r and Q — the A/B for whether the reward-term variant "
+                        "pollutes the curiosity balance.")
+    p.add_argument("--warmup-random", action="store_true",
+                   help="act with uniform random actions during start_steps (restores the pre-2026-06-12 "
+                        "warmup as an opt-in): extra buffer diversity for from-scratch sim runs; acting "
+                        "samples ~pi after warmup in sim (deterministic mean on hardware).")
+    p.add_argument("--explore-noise", type=float, default=0.0,
+                   help="extra Gaussian noise std added on TOP of the action during COLLECTION only (clamped "
+                        "to [-1,1]); eval/hardware act with the deterministic mean. Mostly redundant now that "
+                        "sim training samples ~pi (2026-06-14); kept as an extra sim-pretrain knob. Not for "
+                        "hardware.")
+    # actor-critic (README). SAC: stochastic train + entropy alpha, deterministic-mean deploy (2026-06-14).
+    p.add_argument("--alpha", type=float, default=0.2,
+                   help="fixed SAC entropy temperature: actor maximizes Q + alpha*H (re-added 2026-06-14). "
+                        "The entropy bonus keeps the policy off the freeze attractor the 2026-06-12 "
+                        "deterministic actor parked on. Sim training samples ~pi; eval/hardware act with the "
+                        "deterministic mean tanh(MLP(z)). safe15 ran 0.2.")
+    p.add_argument("--deterministic-act", action="store_true",
+                   help="force the deterministic mean even during sim-training collection (default: sample ~pi "
+                        "in sim, mean on hardware/frozen). Reproduces the 2026-06-12 deterministic acting or a "
+                        "clean eval rollout.")
     p.add_argument("--gamma", type=float, default=0.9)
-    p.add_argument("--alpha", type=float, default=0.2, help="fixed entropy temperature")
-    p.add_argument("--tau", type=float, default=0.005, help="Polyak rate")
+    p.add_argument("--tau", type=float, default=0.005, help="Polyak rate (SAC-style target critic)")
     p.add_argument("--actor-lr", type=float, default=3e-4)
     p.add_argument("--critic-lr", type=float, default=3e-4)
     p.add_argument("--batch-size", type=int, default=128)
@@ -774,6 +1136,12 @@ def parse_args():
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--wandb-project", default=None)
     p.add_argument("--no-hf", action="store_true", help="disable HF checkpoint upload")
+    p.add_argument("--frozen-policy", action="store_true",
+                   help="data-collection/eval: act with the loaded policy, NO gradient updates "
+                        "(much higher cadence, learner removed). Refuses on hardware without a loaded policy.")
+    p.add_argument("--save-buffer", action="store_true",
+                   help="dump the replay buffer to out_dir/buffer_<N>.npz on exit (implied by "
+                        "--frozen-policy); enables graceful Ctrl-C save.")
     p.add_argument("--hf-repo", default=None, help="HF repo id (else $HF_UPLOAD_REPO_ID)")
     return p.parse_args()
 

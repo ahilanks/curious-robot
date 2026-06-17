@@ -65,9 +65,8 @@ class MujocoSO101Env:
         wrist_resolution: int = 224,             # 224 for the ViT-tiny encoder
         overhead_resolution: int = 256,
         frame_skip: int = 6,                     # 30 Hz at timestep 0.005
-        action_max: float = 0.3,                 # README action_max (delta scale)
-        dq_max: float = 100.0,                   # README dq_max ~= inf
-        safety_delta: float = 15.0,             # README delta (safety deadband on -tau*qddot)
+        action_max: float = 0.3,                 # README dq^max (delta scale per unit action)
+        safety_delta: float = 9.0,              # README delta (real-arm calibrated 2026-06-12)
         n_objects: int = 10,
         n_cubes: int = 6,
         cube_size_range: tuple[float, float] = (0.012, 0.020),
@@ -107,7 +106,7 @@ class MujocoSO101Env:
         self.ctrl_low = self.model.actuator_ctrlrange[:, 0].copy().astype(np.float32)
         self.ctrl_high = self.model.actuator_ctrlrange[:, 1].copy().astype(np.float32)
         self.adapter = SOArmAdapter(self.ctrl_low, self.ctrl_high,
-                                    action_max=action_max, dq_max=dq_max)
+                                    action_max=action_max)
 
         self._wrist_cam_id = _name_lookup(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam")
         self._overhead_cam_id = _name_lookup(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "overhead")
