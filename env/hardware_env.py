@@ -66,8 +66,9 @@ import numpy as np
 
 from .safety_reward import safety_reward_np
 
-# Superset of env/parallel_env.py::_INFO_KEYS (kept local so this module needs no mujoco).
-# "tau_meas" is hardware-only: the measured torque the live r_safe scored — consumed by
+# Mirrors env/parallel_env.py::_INFO_KEYS (kept local so this module needs no mujoco), minus the
+# sim-only "ee_pos" (gripper world xyz — there is no mujoco world frame on the real arm) and plus
+# the hardware-only "tau_meas": the measured torque the live r_safe scored — consumed by
 # collect_daemon's press watchdog (train.py reads by key and ignores extras).
 _INFO_KEYS = ("applied_torque", "qvel", "qvel_prev", "qpos", "safety_reward",
               "object_contacts", "table_contacts", "object_motion", "tau_meas")
