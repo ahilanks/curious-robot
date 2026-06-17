@@ -3,8 +3,8 @@
 JEPA + SIGReg world model co-trained with SAC under an intrinsic curiosity reward, on a
 MuJoCo SO-ARM101 6-DOF arm in an object soup. **Built from scratch to the `README.md`
 spec** (README = the formulation; this file = the working log). The question every run
-answers: *does the arm interact with the blocks and get curious like a baby, and is it
-learning dynamics?*
+answers: *does the arm move around and act curious like a baby, and is it learning
+world dynamics?*
 
 - **Code** — `lewm/` (verbatim JEPA+SIGReg), `env/` (MuJoCo SO101 + safety reward),
   `model/` (ViT-tiny state encoder), `src/` (train · play_policy · eval_predictor).
@@ -48,6 +48,11 @@ arm-contact set empty → all interaction metrics were silently 0; now verified 
 - **Interacts with blocks** — `interact/contacts_per_step`, `interact/object_motion`,
   `interact/frac_touch_block` rising over training.
 - **Curious / exploring** — `reward/r_cur` non-trivial; rollout videos show varied reaching.
+- **Roaming vs dithering in place** — `explore/prox_step` (proximal-joint travel; a wrist wiggle
+  CAN'T fake it) and `explore/ee_step` (gripper world-xyz travel) > 0; `explore/pose_range`/`ee_range`
+  covering space. **`interact/arm_speed` (|qvel|) is a TRAP** — it stays HIGH for a saturated in-place
+  limit cycle (measured: collapsed policy `arm_speed`≈1.3 but `pose_step` 0.23 < random's 0.89). Use the
+  `explore/*` travel metrics, never velocity, to tell roaming from dithering.
 - **Learning dynamics** — `wm/pred_loss` falling *below* `wm/identity_baseline`; `wm/h_fwd`
   advancing; offline `eval_predictor.py` pred/persist < 1. Bonus signal: `wm/mse_block`
   exceeding `wm/mse_none` means block contacts are the harder-to-predict ("interesting") events.
@@ -238,3 +243,30 @@ _(add a dated entry per run)_
     narrow collapsed state-distribution perfectly, so its novelty signal vanishes — *the coverage signal dies with the
     coverage*, the mechanistic reason RND can't self-rescue on the co-trained latent. The honest health signals remain
     `encoder/eff_rank_probe` (+`z_std`/`feat_corr`) and `policy/entropy`/`interact/arm_speed` — NOT `pred/per`.
+
+- 2026-06-17 — **obs-RND + the freeze is in-place DITHERING, not stillness (measured); curiosity AND arm_speed are both
+  gameable.** Moved RND off the co-trained latent z onto the RAW obs (84×84 grayscale wrist + per-dim-normed proprio;
+  obs-norm `RunningMeanStd`, Atari conv + proprio MLP — `RNDObsNet`). New knobs: `--rnd-reward-scale` (×200 lands the
+  ~5e-3 obs-RND error in log1p's active range so λ_rnd≈20 gives an O(10) bonus, **honest — no EMA divide**), err/MSE-weighted
+  predictor loss (`--rnd-loss-clip`, per-sample novelty weighting that survives Adam), and `--rnd-train-every` + lower
+  `--rnd-lr` to slow the predictor so novelty persists.
+  - **obs-RND is honest but still collapses at α=0.** Unlike latent-RND (error→0 as z collapses, yet the old EMA-divide
+    faked a steady `rnd_contrib`≈13.6 — a *phantom*; see `a0_sf_rnd`), obs-RND's `rnd_contrib` decays *honestly* to ~0.5
+    (raw obs can't collapse; the predictor just learns the narrow visited set). `a0_obsrnd20` (fast) collapsed by ~1250;
+    `a0_obsrnd_slow` (lr 5e-6, train-every-4) **sustained** novelty (`rnd_contrib`≈14 through 1250, eff_rank_probe 6.7 vs
+    the fast run's 1.9) yet the policy still saturated — **entropy −477 while novelty was still 13.2.** A 3× novelty bonus
+    cannot stop the saturation: confirms the α=0 stable-attractor finding with the encoder-collapse confound removed.
+  - **The freeze is a saturated in-place LIMIT CYCLE — measured by rolling out the collapsed ckpt** (random vs ckpt_1000
+    vs ckpt_3000, 100 decisions): collapsed policy `act|·|`=1.00 (bang-bang), `arm_speed`(|qvel|)=1.27, **yet `pose_step`
+    (joint travel/decision)=0.23 vs random's 0.89.** The LEARNED policy travels ~4× LESS than random noise while commanding
+    2× the action — it thrashes in place. ⇒ **`arm_speed` is a TRAP metric** (high |qvel|, ~0 net travel).
+  - **Why it parks (NOT choosing stillness):** delta-target PD (`target=clip(q+a·0.3)`) turns a constant saturated action
+    into oscillation; **curiosity (`cur_contrib`≈4 even when frozen) is harvested from the WM failing to predict its own
+    bang-bang jitter — prediction-error needs no travel**, so dither maximizes it. obs-RND would punish a static scene, but
+    the wrist cam is ON the arm so wrist rotation pans it (fake visual novelty), and RND gets out-earned by
+    curiosity-on-jitter then collapses before it can redirect; the collapsed encoder (eff_rank→1) then removes the actor's
+    ability to represent state-dependent travel, locking the cycle.
+  - **New DEFAULT metrics** (`explore/*`, distinguish roaming from dithering — `arm_speed` can't): `pose_step` (joint
+    travel/decision; ~0=parked), **`prox_step`** (proximal joints 0-2 = gross repositioning a wrist wiggle CAN'T fake — the
+    ungameable roam signal), `ee_step` (gripper WORLD-xyz travel/decision), `pose_range`/`pose_spread`/`ee_range`
+    (config/world-space coverage of the recent 200-decision window). Env now emits `ee_pos` (gripper world xyz); logged every step.

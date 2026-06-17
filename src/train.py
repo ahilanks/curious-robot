@@ -95,16 +95,53 @@ class TwinQ(nn.Module):
         return self.q1(za), self.q2(za)
 
 
-class RNDNet(nn.Module):
-    """Small MLP for RND target/predictor over the latent z (Burda et al. 2018)."""
-    def __init__(self, z_dim, hidden=256, out_dim=128):
-        super().__init__()
-        self.net = nn.Sequential(nn.Linear(z_dim, hidden), nn.ReLU(),
-                                 nn.Linear(hidden, hidden), nn.ReLU(),
-                                 nn.Linear(hidden, out_dim))
+class RunningMeanStd:
+    """Welford running mean/std for RND observation normalization -- the detail that makes RND
+    work, since the frozen random target's outputs are only meaningful when its inputs are
+    stably scaled. shape=() keeps whole-tensor (scalar) stats for the 84x84 frame; shape=(d,)
+    keeps per-dim stats for proprio (whose pos/vel/torque dims live on very different scales).
+    Updated on the live obs stream; the count grows unboundedly so the scale settles to the
+    (early) visited distribution and then barely moves (Burda et al. 2018)."""
+    def __init__(self, shape, device):
+        self.mean = torch.zeros(shape, device=device)
+        self.var = torch.ones(shape, device=device)
+        self.count = 1e-4
 
-    def forward(self, z):
-        return self.net(z)
+    @torch.no_grad()
+    def update(self, x):                                  # x: (..., *shape) -> stats over leading dims
+        axes = tuple(range(x.ndim - self.mean.ndim))
+        b_mean, b_var = x.mean(dim=axes), x.var(dim=axes, unbiased=False)
+        b_count = x.numel() / max(self.mean.numel(), 1)
+        delta = b_mean - self.mean
+        tot = self.count + b_count
+        self.mean = self.mean + delta * b_count / tot
+        m2 = self.var * self.count + b_var * b_count + delta.pow(2) * self.count * b_count / tot
+        self.var, self.count = m2 / tot, tot
+
+    @torch.no_grad()
+    def norm(self, x):
+        return (x - self.mean) / (self.var.sqrt() + 1e-8)
+
+
+class RNDObsNet(nn.Module):
+    """RND target/predictor over the RAW observation (downsampled wrist image + proprio), NOT
+    the co-trained latent z. The raw obs is a STABLE input space, so the frozen random target
+    is a fixed goalpost and novelty tracks genuine state coverage instead of drifting with the
+    encoder. Atari-style conv stack on an 84x84 grayscale frame (Burda et al. 2018) plus a
+    small proprio MLP, concatenated into a linear head."""
+    def __init__(self, prop_dim, out_dim=128, hidden=256):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, 8, stride=4), nn.ReLU(),     # 84 -> 20
+            nn.Conv2d(32, 64, 4, stride=2), nn.ReLU(),    # 20 -> 9
+            nn.Conv2d(64, 64, 3, stride=1), nn.ReLU(),    # 9 -> 7
+            nn.Flatten())
+        self.prop = nn.Sequential(nn.Linear(prop_dim, hidden), nn.ReLU())
+        self.head = nn.Sequential(nn.Linear(64 * 7 * 7 + hidden, hidden), nn.ReLU(),
+                                  nn.Linear(hidden, out_dim))
+
+    def forward(self, img84, prop):
+        return self.head(torch.cat([self.conv(img84), self.prop(prop)], dim=-1))
 
 
 # ------------------------------------------------------------------------ buffer
@@ -226,6 +263,23 @@ def encode_obs(wm, px_uint8, proprio_np, device):
 
 
 @torch.no_grad()
+def to_rnd_obs(px_uint8, prop_np, img_rms, prop_rms, device, update=False):
+    """Raw obs -> RND inputs. uint8 (...,H,W,3) wrist image -> normalized (B,1,84,84) grayscale
+    (luminance, area-downsampled to the classic RND frame); proprio -> normalized (B,P). Both
+    standardized by a running mean/std and clipped +-5. update=True on the live reward stream
+    advances the obs-norm stats; update=False re-scores buffer samples for predictor training
+    against those same (slowly-frozen) stats."""
+    t = torch.as_tensor(np.ascontiguousarray(px_uint8), device=device).float() / 255.0
+    gray = (t * torch.tensor([0.299, 0.587, 0.114], device=device)).sum(-1)         # (...,H,W) luminance
+    gray = gray.reshape(-1, 1, gray.shape[-2], gray.shape[-1])                       # (B,1,H,W)
+    img = F.interpolate(gray, size=(84, 84), mode="area")                           # (B,1,84,84)
+    prop = torch.as_tensor(np.ascontiguousarray(prop_np), device=device).float().reshape(img.shape[0], -1)
+    if update:
+        img_rms.update(img); prop_rms.update(prop)
+    return img_rms.norm(img).clamp(-5, 5), prop_rms.norm(prop).clamp(-5, 5)
+
+
+@torch.no_grad()
 def knn_state_entropy_reward(z, buf, k):
     """Coverage / particle state-entropy reward (RE3/APT-style): for each latent z_t,
     reward = log(1 + mean distance to its k nearest neighbours among a buffer of recent
@@ -243,14 +297,13 @@ def knn_state_entropy_reward(z, buf, k):
 
 
 @torch.no_grad()
-def rnd_novelty_reward(rnd_pred, rnd_target, z):
+def rnd_novelty_reward(rnd_pred, rnd_target, img84, prop):
     """RND novelty (Burda 2018): squared error of a trained predictor against a FROZEN
-    randomly-initialised target, evaluated on the latent z. High for z unlike those the
-    predictor has been trained on (off the visited manifold), -> 0 as a region is visited
-    and the predictor learns it. The target is deterministic, so (unlike WM prediction
-    error) it is immune to the noisy-TV problem and doesn't depend on the WM's dynamics.
-    z:(B,D) -> (B,). Note: z is the co-trained latent, so keep the predictor learning."""
-    return (rnd_pred(z) - rnd_target(z)).pow(2).mean(-1)
+    randomly-initialised target, evaluated on the RAW obs (downsampled wrist image + proprio),
+    NOT the latent z. High for obs unlike those visited -> 0 as a region is covered. The target
+    is deterministic (immune to the noisy-TV problem) AND the input is the stable raw obs, so
+    the target is a fixed goalpost the co-trained encoder can't move. (B,1,84,84),(B,P) -> (B,)."""
+    return (rnd_pred(img84, prop) - rnd_target(img84, prop)).pow(2).mean(-1)
 
 
 @torch.no_grad()
@@ -399,7 +452,7 @@ def main(args):
     VecEnv = SubprocVectorMujocoEnv if args.env_backend == "subproc" else VectorMujocoEnv
     env = VecEnv(n_envs=args.n_envs, frame_skip=args.frame_skip,
                  action_max=args.action_max, dq_max=args.dq_max,
-                 safety_delta=args.safety_delta, seed=args.seed,
+                 safety_delta=args.safety_delta, obs_cam=args.obs_cam, seed=args.seed,
                  threads=args.env_threads)
     n_dof = env.n_dof
     a_dim = n_dof * args.action_block
@@ -407,7 +460,8 @@ def main(args):
     H = args.history_size
 
     wm = WorldModel(n_dof=n_dof, action_block=args.action_block,
-                    history_size=H, dropout=args.wm_dropout).to(device)
+                    history_size=H, dropout=args.wm_dropout,
+                    encoder_norm=args.encoder_norm).to(device)
     if args.wm_grad_checkpoint:  # off by default: ViT-tiny encode activations are sub-GB vs 80GB free,
         try:                     # so recompute-on-backward is pure slowdown here (the H_fwd rollout is in latent space)
             wm.encoder.vit.gradient_checkpointing_enable()
@@ -433,12 +487,16 @@ def main(args):
     wm_opt = torch.optim.AdamW([p for p in wm.parameters() if p.requires_grad],
                                lr=args.wm_lr, weight_decay=1e-3)
 
-    # RND novelty (only trained/used when --lambda-rnd != 0): frozen random target + chasing predictor
-    rnd_target = RNDNet(z_dim, args.rnd_hidden, args.rnd_out_dim).to(device)
+    # RND novelty (only trained/used when --lambda-rnd != 0): frozen random target + chasing
+    # predictor, over the RAW obs (downsampled wrist image + proprio) -- a STABLE input space,
+    # unlike the co-trained latent z which would drift the target out from under the predictor.
+    rnd_target = RNDObsNet(prop_dim, args.rnd_out_dim, args.rnd_hidden).to(device)
     for p in rnd_target.parameters():
         p.requires_grad_(False)
-    rnd_pred = RNDNet(z_dim, args.rnd_hidden, args.rnd_out_dim).to(device)
+    rnd_pred = RNDObsNet(prop_dim, args.rnd_out_dim, args.rnd_hidden).to(device)
     rnd_opt = torch.optim.Adam(rnd_pred.parameters(), lr=args.rnd_lr)
+    rnd_img_rms = RunningMeanStd((), device)             # obs-norm: scalar stats for the 84x84 frame
+    rnd_prop_rms = RunningMeanStd((prop_dim,), device)   # obs-norm: per-dim stats for proprio
 
     cap = int(np.clip(args.buffer_frac * args.total_steps, 1000, 50_000))
     cap_per_env = max(cap // args.n_envs, args.history_size + args.h_fwd_max + 8)
@@ -471,7 +529,6 @@ def main(args):
     hist_z = z.unsqueeze(0).repeat(H, 1, 1)
     hist_a = torch.zeros(H, args.n_envs, a_dim, device=device)
     knn_buf = torch.zeros(0, z_dim, device=device)    # recent-latent buffer for the k-NN coverage reward
-    rnd_ema = None                                    # running mean of the RND error, to normalize its arbitrary scale
     is_start = np.ones(args.n_envs, bool)
     ep_len = np.zeros(args.n_envs, np.int64)
     ep_ret = np.zeros(args.n_envs, np.float32)
@@ -479,10 +536,15 @@ def main(args):
     h_fwd = args.h_fwd_start                          # curriculum horizon
     pred_hist = deque(maxlen=args.flatline_window)    # for the flatline bump trigger
     updates_at_stage = 0
+    rnd_upd = 0                                       # RND predictor update counter (for --rnd-train-every)
     recent = {k: deque(maxlen=400) for k in
               ("r_cur", "r_safe", "cur_contrib", "contacts", "table_contacts",
                "motion", "ret", "frac_block", "frac_table", "arm_speed",
-               "r_knn", "knn_contrib", "r_rnd", "rnd_contrib")}
+               "r_knn", "knn_contrib", "r_rnd", "rnd_contrib",
+               "pose_step", "prox_step", "ee_step")}
+    prev_qpos_dec = prev_ee_dec = None                # last decision's joint pose / gripper xyz (for travel)
+    recent_qpos = deque(maxlen=200)                   # rolling pose history -> pose_spread / pose_range
+    recent_ee = deque(maxlen=200)                     # rolling gripper-xyz history -> ee_range (world roaming)
     recent_mse = {k: deque(maxlen=2000) for k in ("mse_block", "mse_table", "mse_none")}
     t0 = time.time()
     last_wm = last_sac = last_rnd = None
@@ -508,7 +570,7 @@ def main(args):
         these GPU updates overlap the env workers rendering the next decision. Update
         count and schedule are identical to the serial loop; they just see the buffer
         minus the single in-flight transition (added after wait) -- negligible off-policy."""
-        nonlocal last_wm, last_sac, last_zb, last_rnd, updates_at_stage
+        nonlocal last_wm, last_sac, last_zb, last_rnd, updates_at_stage, rnd_upd
         # --- world-model co-training: autoregressive MSE rollout + beta*SIGReg ---
         if step >= args.start_steps and step % args.wm_update_every == 0:
             batch = buf.sample_wm(args.wm_batch_size, H + h_fwd)
@@ -559,10 +621,19 @@ def main(args):
                 # policy collapses to (near-)deterministic -> arm stall -> data/encoder collapse
                 last_sac = (float(critic_loss.item()), float(actor_loss.item()),
                             float((-logpp).mean().item()), float(ap.abs().mean().item()))
-                if args.lambda_rnd:   # train RND predictor to chase the frozen target on visited z
-                    rnd_loss = (rnd_pred(zb.detach()) - rnd_target(zb.detach())).pow(2).mean()
-                    rnd_opt.zero_grad(); rnd_loss.backward(); rnd_opt.step()
-                    last_rnd = float(rnd_loss.item())
+                if args.lambda_rnd:   # train RND predictor on the raw next-obs, once per --rnd-train-every updates
+                    rnd_upd += 1
+                    if rnd_upd % args.rnd_train_every == 0:
+                        ri, rp = to_rnd_obs(b["px_n"], b["prop_n"], rnd_img_rms, rnd_prop_rms, device)
+                        err = (rnd_pred(ri, rp) - rnd_target(ri, rp)).pow(2).mean(-1)   # (B,) per-sample RND error
+                        # scale each sample's loss by err/MSE (its novelty vs the batch-mean predictor MSE),
+                        # stop-grad so it's a pure weight (avg 1): focuses predictor capacity on currently-novel
+                        # samples. Adam absorbs the shared 1/MSE scalar but NOT the per-sample reweighting, so
+                        # unlike a global loss-divide this actually changes training. Clamp caps outliers.
+                        w = (err.detach() / (err.detach().mean() + 1e-8)).clamp(max=args.rnd_loss_clip)
+                        rnd_loss = (w * err).mean()
+                        rnd_opt.zero_grad(); rnd_loss.backward(); rnd_opt.step()
+                        last_rnd = float(err.mean().item())   # report the UNWEIGHTED predictor MSE (comparable)
         return h_fwd
 
     for step in range(args.total_steps):
@@ -602,6 +673,22 @@ def main(args):
         r_safe /= args.action_block      # one r_safe per decision (README: Env(a_t) -> r_safe_t)
         arm_speed /= args.action_block
 
+        # --- ACTUAL travel (is the arm roaming or dithering in place?). |qvel| (arm_speed) can't
+        #     tell the two apart -- a saturated in-place limit cycle has high |qvel| but ~0 net
+        #     travel. These read q / gripper-xyz directly: pose_step = joint move THIS decision;
+        #     prox_step = proximal joints 0-2 (base/shoulder/elbow) = gross repositioning a wrist
+        #     wiggle CANNOT fake; ee_step = gripper WORLD-xyz travel; pose_spread/pose_range/ee_range
+        #     (logged) = how much of config / world space the recent window covers.
+        qpos_dec = sub_infos[-1]["qpos"].astype(np.float64)        # (n_envs, n_dof) block-final joint pose
+        ee_dec = sub_infos[-1]["ee_pos"].astype(np.float64)        # (n_envs, 3) gripper world xyz
+        if prev_qpos_dec is None:
+            prev_qpos_dec, prev_ee_dec = qpos_dec, ee_dec
+        pose_step = np.where(is_start, 0.0, np.linalg.norm(qpos_dec - prev_qpos_dec, axis=-1)).astype(np.float32)
+        prox_step = np.where(is_start, 0.0, np.linalg.norm(qpos_dec[:, :3] - prev_qpos_dec[:, :3], axis=-1)).astype(np.float32)
+        ee_step = np.where(is_start, 0.0, np.linalg.norm(ee_dec - prev_ee_dec, axis=-1)).astype(np.float32)
+        prev_qpos_dec, prev_ee_dec = qpos_dec, ee_dec
+        recent_qpos.append(qpos_dec.copy()); recent_ee.append(ee_dec.copy())
+
         # freeze a FIXED diverse probe set (early warmup obs) so encoder/eff_rank_probe
         # measures encoder health independent of how narrow the policy's behavior gets.
         if args.probe_size > 0 and probe_px is None:
@@ -616,15 +703,15 @@ def main(args):
         r_cur = curiosity_reward(wm, hist_z, hist_a, z_next).cpu().numpy()        # (n_envs,) >= 0; PER + diagnostics
         # --- intrinsic reward: composable terms, each added iff its weight != 0 ---
         cur_term = args.lambda_cur * np.log1p(r_cur) if args.lambda_cur else np.zeros_like(r_cur)  # lambda_cur*symlog(r_cur)
-        if args.lambda_rnd:                                   # RND novelty (frozen random target)
-            r_rnd = rnd_novelty_reward(rnd_pred, rnd_target, z_next).cpu().numpy()
-            # The raw RND error scale is arbitrary (random net + z scale) and shrinks as the predictor
-            # learns, so normalize by a running mean of it -> rnd_term ~ O(lambda_rnd), centered at
-            # lambda_rnd for a typical state and higher for relatively-novel z (and non-vanishing as the
-            # predictor learns). Lazy-init to the first batch so the scale is right from step 0.
-            m = float(r_rnd.mean())
-            rnd_ema = m if rnd_ema is None else 0.995 * rnd_ema + 0.005 * m
-            rnd_term = args.lambda_rnd * r_rnd / (rnd_ema + 1e-8)
+        if args.lambda_rnd:                                   # RND novelty over the raw next-obs (frozen target)
+            rnd_img, rnd_prop = to_rnd_obs(obs["image"], obs["proprio"],
+                                           rnd_img_rms, rnd_prop_rms, device, update=True)
+            r_rnd = rnd_novelty_reward(rnd_pred, rnd_target, rnd_img, rnd_prop).cpu().numpy()
+            # scale the raw error into log1p's active range (obs-RND error ~5e-3 sits in log1p's
+            # linear dead-zone, making the bonus ~lambda*error and ~40x too weak) so symlog actually
+            # compresses and lambda_rnd stays O(10). Honest: a FIXED scalar, not the old EMA-divide
+            # that faked an O(lambda) signal on a vanishing (collapsed-encoder) error.
+            rnd_term = args.lambda_rnd * np.log1p(args.rnd_reward_scale * r_rnd)
         else:
             r_rnd = np.zeros_like(r_cur); rnd_term = np.zeros_like(r_cur)
         if args.lambda_knn:                                  # k-NN coverage / state-entropy (alt to RND)
@@ -656,7 +743,8 @@ def main(args):
                          ("motion", motion), ("ret", reward), ("arm_speed", arm_speed),
                          ("frac_block", touch_block), ("frac_table", touch_table),
                          ("r_knn", r_knn), ("knn_contrib", knn_term),
-                         ("r_rnd", r_rnd), ("rnd_contrib", rnd_term)):
+                         ("r_rnd", r_rnd), ("rnd_contrib", rnd_term),
+                         ("pose_step", pose_step), ("prox_step", prox_step), ("ee_step", ee_step)):
             recent[key].append(float(np.mean(val)))
 
         # --- advance latent + history; reset timed-out envs ---
@@ -705,7 +793,10 @@ def main(args):
                  "interact/contacts_per_step": np.mean(recent["contacts"]),
                  "interact/table_contacts_per_step": np.mean(recent["table_contacts"]),
                  "interact/object_motion": np.mean(recent["motion"]),
-                 "interact/arm_speed": np.mean(recent["arm_speed"]),   # mean joint |qvel|: stall -> 0
+                 "interact/arm_speed": np.mean(recent["arm_speed"]),   # mean joint |qvel|: HIGH even when dithering
+                 "explore/pose_step": np.mean(recent["pose_step"]),    # joint travel/decision; ~0 = parked/dithering
+                 "explore/prox_step": np.mean(recent["prox_step"]),    # proximal joints 0-2 travel: ungameable roam signal
+                 "explore/ee_step": np.mean(recent["ee_step"]),        # gripper WORLD-xyz travel/decision
                  "interact/frac_touch_block": np.mean(recent["frac_block"]),
                  "interact/frac_touch_table": np.mean(recent["frac_table"]),
                  "buffer/transitions": buf.total, "perf/steps_per_sec": sps,
@@ -713,6 +804,11 @@ def main(args):
             for key in ("mse_block", "mse_table", "mse_none"):   # curiosity MSE by contact type
                 if recent_mse[key]:
                     d[f"wm/{key}"] = float(np.mean(recent_mse[key]))
+            if len(recent_qpos) > 1:                             # config / world-space coverage of recent window
+                qarr, earr = np.stack(recent_qpos), np.stack(recent_ee)            # (T,n_envs,n_dof), (T,n_envs,3)
+                d["explore/pose_spread"] = float(qarr.std(0).mean())              # mean temporal std over joints
+                d["explore/pose_range"] = float((qarr.max(0) - qarr.min(0)).mean())  # mean per-joint sweep (rad)
+                d["explore/ee_range"] = float(np.linalg.norm(earr.max(0) - earr.min(0), axis=-1).mean())  # gripper bbox diag (m)
             if last_zb is not None:
                 z_std, eff_rank, feat_corr = collapse_metrics(last_zb)
                 d.update({"encoder/z_std": z_std, "encoder/eff_rank": eff_rank,
@@ -735,6 +831,7 @@ def main(args):
             with open(out_dir / "metrics.jsonl", "a") as f:    # local metrics record (esp. when --no-wandb)
                 f.write(json.dumps({"step": step, **{k: float(v) for k, v in d.items()}}) + "\n")
             print(f"[step {step}] sps={sps:.1f} arm_spd={d['interact/arm_speed']:.3f} "
+                  f"prox={d['explore/prox_step']:.3f} ee={d['explore/ee_step']:.3f} "
                   f"contacts/s={d['interact/contacts_per_step']:.2f} "
                   f"r_cur={d['reward/r_cur']:.3f} cur_contrib={cur_m:.2f} "
                   f"pred/persist={d.get('wm/pred_over_identity', float('nan')):.2f} "
@@ -792,6 +889,10 @@ def parse_args():
                    help="subproc: each env in a CUDA-free worker process, needed on "
                         "GPU+EGL to avoid the MuJoCo-render/CUDA SIGABRT; "
                         "inproc: envs in this process (sequential or --env-threads)")
+    p.add_argument("--obs-cam", choices=("wrist", "overhead"), default="wrist",
+                   help="camera for the OBSERVATION image. wrist (default) = ego-cam on the gripper "
+                        "(visual novelty is gameable by in-place wrist jitter); overhead = fixed 3rd-person "
+                        "(view changes only when the arm/objects actually move -> novelty needs real travel).")
     p.add_argument("--frame-skip", type=int, default=6)
     p.add_argument("--max-episode-steps", type=int, default=200, help="decision steps before truncation-as-done")
     p.add_argument("--seed", type=int, default=0)
@@ -828,7 +929,10 @@ def parse_args():
                         "prediction and disables the H_fwd curriculum")
     p.add_argument("--gamma-wm", type=float, default=0.95)
     p.add_argument("--sigreg-weight", type=float, default=0.3,
-                   help="beta: SIGReg (isotropic-Gaussian) weight, pinned at 0.3")
+                   help="beta: SIGReg (isotropic-Gaussian) weight, pinned at 0.3 (LeWM uses 0.09)")
+    p.add_argument("--encoder-norm", choices=("layernorm", "batchnorm"), default="layernorm",
+                   help="norm inside the encoder projector MLPs (visual_head/fuse/pred_proj). batchnorm = "
+                        "LeWM's choice (couples the batch -> anti-collapse); layernorm = current default.")
     p.add_argument("--wm-batch-size", type=int, default=128)
     p.add_argument("--wm-lr", type=float, default=5e-5)
     p.add_argument("--wm-update-every", type=int, default=4)
@@ -856,13 +960,29 @@ def parse_args():
     # weight != 0, so they stack (e.g. --lambda-cur 20 --lambda-rnd 1 = curiosity + RND).
     # r_cur is always computed (PER priority + contact-bucket diagnostics) regardless of lambda_cur.
     p.add_argument("--lambda-rnd", type=float, default=0.0,
-                   help="weight on the RND novelty reward: lambda_rnd*symlog(||pred(z)-target(z)||^2); 0 disables. "
-                        "Random-network distillation -- predictor chases a FROZEN random net on the latent z: high "
-                        "for novel z (off the visited manifold), ->0 as visited; stationary target (no noisy-TV). "
+                   help="weight on the RND novelty reward: lambda_rnd*log1p(||pred(o)-target(o)||^2); 0 disables. "
+                        "Random-network distillation over the RAW obs o (downsampled wrist image + proprio, NOT "
+                        "the co-trained z): predictor chases a FROZEN random net -> high for novel obs, ->0 as "
+                        "visited; stable input + stationary target (no noisy-TV, no encoder drift). "
                         "Add to the curiosity reward by setting lambda_rnd>0 alongside lambda_cur.")
     p.add_argument("--rnd-out-dim", type=int, default=128, help="RND target/predictor output dim")
-    p.add_argument("--rnd-hidden", type=int, default=256, help="RND target/predictor hidden dim")
-    p.add_argument("--rnd-lr", type=float, default=1e-4, help="RND predictor Adam lr")
+    p.add_argument("--rnd-hidden", type=int, default=256, help="RND proprio-MLP / head hidden dim")
+    p.add_argument("--rnd-lr", type=float, default=5e-5,
+                   help="RND predictor Adam lr (lower than a latent-RND default: the obs target is fixed, so the "
+                        "predictor should chase it gently to keep the novelty signal from collapsing too fast)")
+    p.add_argument("--rnd-loss-clip", type=float, default=10.0,
+                   help="clamp on the per-sample RND training-loss weight err/MSE (novelty-prioritized predictor "
+                        "training): caps how much one high-error sample can dominate the batch. Large -> pure "
+                        "err/MSE weighting; ->1 approaches a uniform (standard RND) loss.")
+    p.add_argument("--rnd-reward-scale", type=float, default=200.0,
+                   help="multiply the raw RND error before log1p so it lands in symlog's active range (obs-RND "
+                        "error ~5e-3 is in log1p's linear dead-zone). Default 200 -> typical log1p(~1.0)~0.69, so "
+                        "lambda_rnd~20 gives an O(10) bonus comparable to curiosity. Scales the REWARD only; "
+                        "predictor training (err/MSE-weighted + Adam) is scale-invariant and untouched.")
+    p.add_argument("--rnd-train-every", type=int, default=1,
+                   help="train the RND predictor once every N SAC updates (default 1 = every update). >1 slows the "
+                        "predictor so obs novelty doesn't collapse to ~0 within ~250 steps on the low-diversity "
+                        "visited obs -> the novelty bonus persists through the exploration window.")
     p.add_argument("--lambda-knn", type=float, default=0.0,
                    help="weight on the k-NN coverage reward log(1+mean kNN latent dist); 0 disables (alt to RND)")
     p.add_argument("--knn-k", type=int, default=12, help="k for the k-NN state-entropy estimate")

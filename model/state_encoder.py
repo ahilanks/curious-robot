@@ -39,18 +39,18 @@ def build_vit_tiny(image_size: int = 224, patch_size: int = 14) -> ViTModel:
 
 class StateEncoder(nn.Module):
     def __init__(self, n_dof: int = 6, vis_dim: int = 192, prop_dim: int = 64,
-                 image_size: int = 224, patch_size: int = 14):
+                 image_size: int = 224, patch_size: int = 14, norm_fn=nn.LayerNorm):
         super().__init__()
         self.vit = build_vit_tiny(image_size, patch_size)
         cls_dim = self.vit.config.hidden_size  # 192
-        self.visual_head = MLP(cls_dim, 4 * cls_dim, vis_dim)   # MLP(ViT_cls) -> 192
+        self.visual_head = MLP(cls_dim, 4 * cls_dim, vis_dim, norm_fn=norm_fn)   # MLP(ViT_cls) -> 192
         self.proprio = ProprioEncoder(n_dof, out_dim=prop_dim)  # MLP(symlog(.)) -> 64
         self.out_dim = vis_dim + prop_dim                       # 256
         # Joint fusion MLP over the concatenated visual+proprio features (README's outer MLP).
         # No final LayerNorm on the fused output: a per-sample LN forces every z onto a
         # fixed-radius sphere, which fights SIGReg's isotropic-Gaussian regularizer (LeWM
         # keeps only BatchNorm inside the projector MLP and no output normalization).
-        self.fuse = MLP(self.out_dim, 4 * self.out_dim, self.out_dim)
+        self.fuse = MLP(self.out_dim, 4 * self.out_dim, self.out_dim, norm_fn=norm_fn)
 
     def forward(self, image_norm: torch.Tensor, proprio: torch.Tensor) -> torch.Tensor:
         """image_norm: (B,3,H,W) normalized; proprio: (B,3*n_dof) -> z: (B, 256)."""
@@ -78,14 +78,16 @@ class WorldModel(JEPA):
         dropout: float = 0.1,
         image_size: int = 224,
         patch_size: int = 14,
+        encoder_norm: str = "layernorm",   # "layernorm" (default) | "batchnorm" (LeWM's projector norm)
     ):
-        encoder = StateEncoder(n_dof, vis_dim, prop_dim, image_size, patch_size)
+        norm_fn = nn.BatchNorm1d if encoder_norm == "batchnorm" else nn.LayerNorm
+        encoder = StateEncoder(n_dof, vis_dim, prop_dim, image_size, patch_size, norm_fn=norm_fn)
         predictor = ARPredictor(
             num_frames=history_size, input_dim=z_dim, hidden_dim=z_dim, output_dim=z_dim,
             depth=depth, heads=heads, dim_head=dim_head, mlp_dim=mlp_dim, dropout=dropout,
         )
         action_encoder = Embedder(input_dim=n_dof * action_block, emb_dim=z_dim)
-        pred_proj = MLP(z_dim, 2048, z_dim)
+        pred_proj = MLP(z_dim, 2048, z_dim, norm_fn=norm_fn)
         super().__init__(encoder=encoder, predictor=predictor,
                          action_encoder=action_encoder, pred_proj=pred_proj)
         self.z_dim = z_dim

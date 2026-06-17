@@ -64,6 +64,7 @@ class MujocoSO101Env:
         scene_path: str | Path = DEFAULT_SCENE,
         wrist_resolution: int = 224,             # 224 for the ViT-tiny encoder
         overhead_resolution: int = 256,
+        obs_cam: str = "wrist",                  # "wrist" (ego) | "overhead" (fixed 3rd-person) -> obs image
         frame_skip: int = 6,                     # 30 Hz at timestep 0.005
         action_max: float = 0.3,                 # README action_max (delta scale)
         dq_max: float = 100.0,                   # README dq_max ~= inf
@@ -111,6 +112,16 @@ class MujocoSO101Env:
 
         self._wrist_cam_id = _name_lookup(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam")
         self._overhead_cam_id = _name_lookup(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "overhead")
+        if obs_cam not in ("wrist", "overhead"):
+            raise ValueError(f"obs_cam must be 'wrist' or 'overhead', got {obs_cam!r}")
+        self.obs_cam = obs_cam
+        # which camera the OBSERVATION image comes from. wrist = ego (pans with the arm, so visual
+        # novelty is gameable by in-place wrist jitter); overhead = fixed 3rd-person (the view only
+        # changes when the arm/objects actually move -> novelty requires real travel; LeWM-style).
+        self._obs_cam_id = self._overhead_cam_id if obs_cam == "overhead" else self._wrist_cam_id
+        # end-effector (gripper) body: world xyz -> the honest "is the arm roaming in space" signal.
+        # Joint |qvel| can't tell roaming from in-place dither; the gripper world position can.
+        self._ee_body_id = _name_lookup(self.model, mujoco.mjtObj.mjOBJ_BODY, "gripper")
         self._object_body_ids, self._object_geom_ids = [], []
         self._object_qpos_addrs, self._object_qvel_addrs = [], []
         for i in range(n_objects):
@@ -293,6 +304,7 @@ class MujocoSO101Env:
             "qvel": qvel,
             "qvel_prev": qvel_before,
             "qpos": self.data.qpos[:self.n_dof].copy().astype(np.float32),
+            "ee_pos": self.data.xpos[self._ee_body_id].copy().astype(np.float32),  # gripper world xyz (roam metric)
             "safety_reward": r_safe,
             "object_contacts": np.int64(n_contact),
             "table_contacts": np.int64(n_table),
@@ -318,7 +330,7 @@ class MujocoSO101Env:
 
     def _get_obs(self, render: bool = True) -> dict[str, np.ndarray]:
         if render:
-            self._wrist_renderer.update_scene(self.data, camera=self._wrist_cam_id)
+            self._wrist_renderer.update_scene(self.data, camera=self._obs_cam_id)
             wrist = self._wrist_renderer.render().copy()
         else:
             wrist = None                       # discarded substep: skip the costly render
