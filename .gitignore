@@ -24,5 +24,3 @@ wandb/
 *_boot.log
 .claude/scheduled_tasks.lock
 
-# secrets — WANDB/HF/GH tokens; keep local, never commit
-.env
