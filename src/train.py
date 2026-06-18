@@ -401,6 +401,39 @@ def score_obs_mse(wm, gpx, gprop, spx, sprop, sact, device, H):
 
 
 @torch.no_grad()
+def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, min_std, horizon, device):
+    """CEM-MPC in LATENT space (the --cem controller): optimize an H-step action SEQUENCE to minimize
+    the TERMINAL latent goal-matching cost C(zhat_H) = ||zhat_H - z_goal||^2, rolling the actions
+    AUTOREGRESSIVELY through the (fixed) world model from the current latent history. Solved by the
+    Cross-Entropy Method: sample sequences -> keep the elites -> refit the per-step Gaussian. MPC: only
+    the FIRST action is returned/executed, re-planned every decision step (longer H = more lookahead but
+    more WM rollout bias, since this WM is 1-step trained). No learned policy and NO reach reward (the
+    reward stays MSE-only) -- goal-reaching is PURE planning. Returns a_t (n_envs, a_dim) in [-1,1]."""
+    Hb, n, D = hist_z.shape                                           # Hb = WM backward context (history_size)
+    a_dim = hist_a.shape[-1]
+    T = max(int(horizon), 1)
+    z0 = hist_z.transpose(0, 1).unsqueeze(1).expand(n, K, Hb, D).reshape(n * K, Hb, D)        # latent history
+    a0 = hist_a.transpose(0, 1).unsqueeze(1).expand(n, K, Hb, a_dim).reshape(n * K, Hb, a_dim)  # action history
+    zg = z_goal.unsqueeze(1).expand(n, K, D).reshape(n * K, D)
+    mu = torch.zeros(n, T, a_dim, device=device)
+    std = torch.full((n, T, a_dim), init_std, device=device)
+    for _ in range(iters):
+        seq = (mu.unsqueeze(1) + std.unsqueeze(1) * torch.randn(n, K, T, a_dim, device=device)).clamp(-1.0, 1.0)
+        sf = seq.reshape(n * K, T, a_dim)
+        z_seq, a_seq = z0, a0                                         # (n*K, Hb, .) growing rollout buffers
+        for h in range(T):                                           # autoregressive WM rollout
+            a_seq = torch.cat([a_seq, sf[:, h:h + 1]], dim=1)        # apply candidate action a_{t+h}
+            znext = wm.predict(z_seq[:, -Hb:], wm.action_encoder(a_seq[:, -Hb:]))[:, -1:]
+            z_seq = torch.cat([z_seq, znext], dim=1)                 # append predicted z_{t+h+1}
+        cost = (z_seq[:, -1] - zg).pow(2).mean(-1).reshape(n, K)     # terminal latent goal-matching cost
+        idx = cost.topk(elite, largest=False, dim=1).indices
+        el = torch.gather(seq, 1, idx[:, :, None, None].expand(n, elite, T, a_dim))
+        mu = el.mean(1)
+        std = el.std(1).clamp_min(min_std)
+    return mu[:, 0].clamp(-1.0, 1.0)                                 # MPC: execute only the first planned action
+
+
+@torch.no_grad()
 def to_rnd_obs(px_uint8, prop_np, img_rms, prop_rms, device, update=False):
     """Raw obs -> RND inputs. uint8 (...,H,W,3) wrist image -> normalized (B,1,84,84) grayscale
     (luminance, area-downsampled to the classic RND frame); proprio -> normalized (B,P). Both
@@ -548,13 +581,8 @@ def sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
         zb = encode_obs(wm, b["px"], b["prop"], device)
         znb = encode_obs(wm, b["px_n"], b["prop_n"], device)
         if goal:
-            # --- goal-conditioned DETERMINISTIC (TD3/DDPG-style) update; NO entropy. z* is
-            #     RE-ENCODED from the raw stored goal obs o* (HER-relabeled in sample_sac) under
-            #     the CURRENT encoder -> drift-immune, and is the SAME z* for the (s) and (s')
-            #     forwards of the transition (else the Bellman backup is corrupt). Reward is the
-            #     dense reach term -||z_{t+1} - z*|| (recomputed HERE so HER relabeling takes
-            #     effect) PLUS the stored curiosity term b["r"] (the live r_cur -> keep exploring
-            #     AROUND a reached goal: "return, then explore"). n_out==1 (multihead forced off). ---
+            # --- goal-conditioned DETERMINISTIC (TD3/DDPG-style) update; NO entropy. (Kept for the
+            #     --goal-explore SAC variant; the --cem controller does NOT use this path.) ---
             zstar = encode_obs(wm, b["goal_px"], b["goal_prop"], device)     # (B, D) detached (no_grad encode)
             with torch.no_grad():
                 an = actor(znb, zstar)                                        # deterministic next action
@@ -563,12 +591,8 @@ def sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
                     c = getattr(args, "td3_noise_clip", 0.5)
                     an = (an + (tn * torch.randn_like(an)).clamp(-c, c)).clamp(-1.0, 1.0)
                 q1n, q2n = critic_tgt(znb, an, zstar)
-                # reach reward for LANDING in z_{t+1}, MASKED to 0 on (a) self-goal transitions
-                # (goal_valid==0: no real goal pursued -> -||z_{t+1}-z_t|| would reward staying put)
-                # and (b) terminal transitions (d==1: z_{t+1} is the next episode's reset state, not
-                # where a_t landed). HER-relabeled rows are goal_valid==1.
                 r_reach = -(znb - zstar).norm(dim=-1, keepdim=True) * b["goal_valid"] * (1 - b["d"])
-                r = args.lambda_reach * r_reach + b["r"]                     # b["r"] = stored curiosity term
+                r = args.lambda_reach * r_reach + b["r"]
                 y = r + (1 - b["d"]) * args.gamma * torch.min(q1n, q2n)
             q1, q2 = critic(zb, b["a"], zstar)
             critic_loss = (b["w"] * ((q1 - y).pow(2) + (q2 - y).pow(2))).mean()
@@ -822,6 +846,10 @@ def main(args):
           f"lambda_safe={args.lambda_safe}", flush=True)
     # --- goal-conditioned Go-Explore: resolve gated coercions BEFORE the env / nets are built
     #     (action_max feeds VecEnv below; the rest gate the deterministic objective downstream) ---
+    if args.cem:
+        args.goal_explore = True             # --cem reuses the archive + goal sampling infra; SAC is skipped
+        print(f"[cem] latent CEM-MPC controller ON: samples={args.cem_samples} iters={args.cem_iters} "
+              f"elites={args.cem_elites} init_std={args.cem_init_std} (reward=MSE only, SAC OFF)", flush=True)
     if args.goal_explore:
         if args.env_backend == "hardware":
             raise SystemExit("[goal-explore] refusing on hardware: dropping dq_max -> action_max=1.0 "
@@ -1070,8 +1098,9 @@ def main(args):
                         h_fwd += 1; updates_at_stage = 0; pred_hist.clear()
                         print(f"[curriculum] step={step} H_fwd -> {h_fwd}", flush=True)
         # --- SAC updates (PER; encoder is frozen w.r.t. SAC, z encoded under no_grad) ---
-        res = sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
-                         args, step, device)
+        res = (None if args.cem else                      # --cem: no learned policy, WM-only training
+               sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
+                          args, step, device))
         if res is not None:
             last_sac = (res["critic_loss"], res["actor_loss"], res.get("grad_caps", 0.0))
             last_zb = res["zb"]
@@ -1142,6 +1171,10 @@ def main(args):
         with torch.no_grad():
             if args.warmup_random and step < args.start_steps:
                 a = torch.rand(args.n_envs, a_dim, device=device) * 2 - 1
+            elif args.cem:                   # CEM-MPC: plan toward the goal latent z* via the WM
+                a = cem_plan(wm, hist_z, hist_a, zstar_env, args.cem_samples, args.cem_iters,
+                             args.cem_elites, args.cem_init_std, args.cem_min_std,
+                             args.cem_horizon, device)
             elif args.goal_explore:
                 a = actor(z, zstar_env)      # deterministic goal-conditioned action a=tanh(mu(z,z*))
             elif stochastic_act:
@@ -1707,6 +1740,22 @@ def parse_args():
                    help="optional TD3 target-policy smoothing: std of clipped noise added to the TARGET action in "
                         "the critic update only (not a collection action). 0 = pure deterministic (DDPG).")
     p.add_argument("--td3-noise-clip", type=float, default=0.5, help="clip for --td3-target-noise.")
+    # --- CEM-MPC controller in LATENT space (--cem): goal-reaching by PLANNING, not a learned policy.
+    #     Reward stays MSE-only; SAC is disabled; the WM provides the latent dynamics. Implies
+    #     --goal-explore (high-MSE goal-latent archive + per-episode goal sampling). ---
+    p.add_argument("--cem", action="store_true",
+                   help="latent CEM-MPC controller: each step, optimize the block action to minimize "
+                        "||zhat_{t+1} - z*|| (z* = goal latent from the archive) via WM rollout. No learned "
+                        "policy, no reach reward (reward stays MSE-only); SAC off. Implies --goal-explore.")
+    p.add_argument("--cem-samples", type=int, default=128, help="CEM action samples per iter (per env)")
+    p.add_argument("--cem-iters", type=int, default=3, help="CEM refit iterations")
+    p.add_argument("--cem-elites", type=int, default=16, help="CEM elite count (top-k lowest cost)")
+    p.add_argument("--cem-init-std", type=float, default=0.5, help="CEM initial action std")
+    p.add_argument("--cem-min-std", type=float, default=0.1, help="CEM elite-refit std floor")
+    p.add_argument("--cem-horizon", type=int, default=5,
+                   help="CEM planning horizon H (block-decisions): minimize terminal ||zhat_H - z*||^2 "
+                        "via autoregressive WM rollout, execute the first action (MPC). Longer = more "
+                        "lookahead but more rollout bias (this WM is 1-step trained).")
     p.add_argument("--gamma", type=float, default=0.9)
     p.add_argument("--tau", type=float, default=0.005, help="Polyak rate (SAC-style target critic)")
     p.add_argument("--actor-lr", type=float, default=3e-4)
