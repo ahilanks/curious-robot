@@ -36,6 +36,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from lewm.module import SIGReg                       # noqa: E402
 from model.state_encoder import WorldModel           # noqa: E402
 from src.probe import load_probe_hf                  # noqa: E402
+from src.goal_explore import GoalArchive             # noqa: E402  (--goal-explore goal archive)
 # Env backends are imported lazily in main() so the `hardware` backend does not require mujoco.
 
 try:
@@ -73,22 +74,26 @@ class Actor(nn.Module):
     head; deterministic-era checkpoints (no log_std) load via load_actor_state and keep its
     fresh init (deployment never reads it)."""
 
-    def __init__(self, z_dim, a_dim, hidden=256, log_std_range=(-5, 2)):
+    def __init__(self, z_dim, a_dim, hidden=256, log_std_range=(-5, 2), goal_dim=0):
         super().__init__()
-        self.trunk = nn.Sequential(nn.Linear(z_dim, hidden), nn.ReLU(),
+        self.goal_dim = goal_dim          # >0 -> goal-conditioned pi(a | z, z*) (--goal-explore)
+        self.trunk = nn.Sequential(nn.Linear(z_dim + goal_dim, hidden), nn.ReLU(),
                                    nn.Linear(hidden, hidden), nn.ReLU())
         self.mean = nn.Linear(hidden, a_dim)
         self.log_std = nn.Linear(hidden, a_dim)
         self.lo, self.hi = log_std_range
 
-    def forward(self, z):
-        """Deterministic action (the deployed / eval policy) = tanh(mean)."""
-        return torch.tanh(self.mean(self.trunk(z)))
+    def _h(self, z, zstar):
+        return self.trunk(torch.cat([z, zstar], -1) if zstar is not None else z)
 
-    def sample(self, z):
+    def forward(self, z, zstar=None):
+        """Deterministic action (deployed / eval / goal-conditioned) = tanh(mean(z[,z*]))."""
+        return torch.tanh(self.mean(self._h(z, zstar)))
+
+    def sample(self, z, zstar=None):
         """Stochastic action for training: (a, logp, deterministic_mean). Reparameterized
         squash with the standard tanh log-prob correction."""
-        h = self.trunk(z)
+        h = self._h(z, zstar)
         mean, log_std = self.mean(h), self.log_std(h).clamp(self.lo, self.hi)
         normal = torch.distributions.Normal(mean, log_std.exp())
         u = normal.rsample()
@@ -112,15 +117,16 @@ class TwinQ(nn.Module):
     optimum matches the scalar critic; the heads exist to make the value decomposition
     inspectable (which reward component is steering the policy)."""
 
-    def __init__(self, z_dim, a_dim, hidden=256, n_out=1):
+    def __init__(self, z_dim, a_dim, hidden=256, n_out=1, goal_dim=0):
         super().__init__()
-        mk = lambda: nn.Sequential(nn.Linear(z_dim + a_dim, hidden), nn.ReLU(),
+        self.goal_dim = goal_dim          # >0 -> goal-conditioned Q(z, a, z*) (--goal-explore)
+        mk = lambda: nn.Sequential(nn.Linear(z_dim + a_dim + goal_dim, hidden), nn.ReLU(),
                                    nn.Linear(hidden, hidden), nn.ReLU(),
                                    nn.Linear(hidden, n_out))
         self.q1, self.q2 = mk(), mk()
 
-    def forward(self, z, a):
-        za = torch.cat([z, a], -1)
+    def forward(self, z, a, zstar=None):
+        za = torch.cat([z, a, zstar], -1) if zstar is not None else torch.cat([z, a], -1)
         return self.q1(za), self.q2(za)
 
 
@@ -180,7 +186,8 @@ class ReplayBuffer:
     current WM at sample time, so the co-trained encoder can drift without staleness.
     PER priority = curiosity surprise (raw 1-step prediction error)."""
 
-    def __init__(self, n_envs, cap_per_env, img_hw, a_dim, prop_dim, device, n_comp=0):
+    def __init__(self, n_envs, cap_per_env, img_hw, a_dim, prop_dim, device, n_comp=0,
+                 goal_explore=False):
         self.n_envs, self.C, self.device = n_envs, cap_per_env, device
         s = (n_envs, cap_per_env)
         self.pixels = np.zeros((*s, img_hw, img_hw, 3), np.uint8)
@@ -193,8 +200,17 @@ class ReplayBuffer:
         self.prio = np.zeros(s, np.float64)
         self.head = np.zeros(n_envs, np.int64)
         self.count = np.zeros(n_envs, np.int64)
+        # --goal-explore: per-transition PURSUED goal obs o* + an episode id for HER future-relabel
+        self.goal_explore = goal_explore
+        if goal_explore:
+            self.goal_px = np.zeros((*s, img_hw, img_hw, 3), np.uint8)
+            self.goal_prop = np.zeros((*s, prop_dim), np.float32)
+            self.goal_valid = np.zeros(s, bool)       # True = a REAL archive goal was pursued (not self-goal)
+            self.ep_id = np.zeros(s, np.int64)        # shared id for all transitions of one episode
+            self.cur_ep = np.zeros(n_envs, np.int64)
 
-    def add(self, pixels, proprio, action, r, d, is_start, prio, rc=None):
+    def add(self, pixels, proprio, action, r, d, is_start, prio, rc=None,
+            goal_px=None, goal_prop=None, goal_valid=None):
         for e in range(self.n_envs):
             i = self.head[e]
             self.pixels[e, i] = pixels[e]
@@ -206,6 +222,15 @@ class ReplayBuffer:
             self.d[e, i] = d[e]
             self.is_start[e, i] = is_start[e]
             self.prio[e, i] = prio[e]
+            if self.goal_explore:
+                if is_start[e]:                       # is_start marks an episode's FIRST step
+                    self.cur_ep[e] += 1
+                self.ep_id[e, i] = self.cur_ep[e]
+                if goal_px is not None:
+                    self.goal_px[e, i] = goal_px[e]
+                    self.goal_prop[e, i] = goal_prop[e]
+                if goal_valid is not None:
+                    self.goal_valid[e, i] = goal_valid[e]
             self.head[e] = (i + 1) % self.C
             self.count[e] = min(self.count[e] + 1, self.C)
 
@@ -230,7 +255,29 @@ class ReplayBuffer:
             return None
         return np.concatenate(es), np.concatenate(isx)
 
-    def sample_sac(self, batch, per_alpha, per_beta):
+    def _future_goal_idx(self, e, i):
+        """HER 'future' strategy: a random LATER transition in the SAME episode as (e, i),
+        respecting the ring's time order (oldest..newest) and episode (ep_id) boundaries.
+        Returns a ring index into env e, or None if (e, i) is the last step of its episode."""
+        n = int(self.count[e])
+        if n == 0:
+            return None
+        if n < self.C:
+            order = np.arange(n)                                       # no wrap: index == time order
+        else:
+            order = (np.arange(self.C) + int(self.head[e])) % self.C   # wrapped: oldest..newest
+        pos = np.where(order == i)[0]
+        if len(pos) == 0:
+            return None
+        fut = order[pos[0] + 1:]                                       # strictly later in time
+        if len(fut) == 0:
+            return None
+        same = fut[self.ep_id[e, fut] == self.ep_id[e, i]]            # same-episode only
+        if len(same) == 0:
+            return None
+        return int(np.random.choice(same))
+
+    def sample_sac(self, batch, per_alpha, per_beta, her_frac=0.0):
         vp = self._valid_pairs()
         if vp is None or len(vp[0]) < batch:
             return None
@@ -252,6 +299,19 @@ class ReplayBuffer:
         }
         if self.rc is not None:
             out["rc"] = t(self.rc[e, i])             # (B, K) per-component rewards
+        if self.goal_explore:                        # raw pursued goal o*; HER-relabel a fraction
+            gpx = self.goal_px[e, i].copy()
+            gprop = self.goal_prop[e, i].copy()
+            gvalid = self.goal_valid[e, i].astype(np.float32).copy()
+            if her_frac > 0:
+                for k in np.where(np.random.rand(batch) < her_frac)[0]:
+                    j = self._future_goal_idx(int(e[k]), int(i[k]))
+                    if j is not None:                # relabel goal -> an achieved future obs (always valid)
+                        gpx[k] = self.pixels[e[k], j]
+                        gprop[k] = self.proprio[e[k], j]
+                        gvalid[k] = 1.0
+            out["goal_px"], out["goal_prop"] = gpx, gprop
+            out["goal_valid"] = t(gvalid)[:, None]   # (B,1) 1=real goal (archive/HER), 0=self-goal fallback
         return out
 
     def update_priorities(self, e, i, prio):
@@ -320,6 +380,24 @@ def curiosity_reward(wm, hist_z, hist_a, z_next):
     a_emb = wm.action_encoder(hist_a.transpose(0, 1))    # (B, H, A_emb)
     pred = wm.predict(z_ctx, a_emb)[:, -1]               # (B, D)
     return (pred - z_next).pow(2).mean(-1)
+
+
+@torch.no_grad()
+def score_obs_mse(wm, gpx, gprop, spx, sprop, sact, device, H):
+    """FAITHFUL one-step WM MSE for a batch of stored (source o_t, action a, goal o_{t+1})
+    triples under the CURRENT wm: predict z_{t+1} from (z_t, a) and compare to the REAL
+    encode(o_{t+1}). The H-frame backward context is fabricated by repeating z_t (the
+    canonical reset-seeding), since the real rolling history is gone once an obs is archived.
+    Same per-dim-mean normalization as curiosity_reward, so it is comparable to the r_cur
+    captured at insert time -> a goal whose re-measured MSE has fallen has been mastered by
+    the WM and can be evicted. Returns (B,) numpy. (--goal-explore archive re-measure.)"""
+    z_src = encode_obs(wm, spx, sprop, device)               # (B, D)
+    z_goal = encode_obs(wm, gpx, gprop, device)              # (B, D)
+    z_ctx = z_src.unsqueeze(1).repeat(1, H, 1)               # (B, H, D)
+    a = torch.as_tensor(sact, device=device).float().unsqueeze(1).repeat(1, H, 1)  # (B,H,a_dim)
+    a_emb = wm.action_encoder(a)                             # (B, H, A_emb)
+    pred = wm.predict(z_ctx, a_emb)[:, -1]                   # (B, D)
+    return (pred - z_goal).pow(2).mean(-1).cpu().numpy()
 
 
 @torch.no_grad()
@@ -458,44 +536,76 @@ def sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
     if step < args.start_steps or buf.total < args.batch_size:
         return None
     alpha = getattr(args, "alpha", 0.2)        # fixed entropy temperature (no learnable alpha)
+    goal = getattr(args, "goal_explore", False)   # goal-conditioned deterministic (TD3-style) path
     per_beta = min(1.0, args.per_beta_start
                    + (1 - args.per_beta_start) * step / max(args.total_steps, 1))
     out = None
     for _ in range(args.updates_per_step):
-        b = buf.sample_sac(args.batch_size, args.per_alpha, per_beta)
+        b = buf.sample_sac(args.batch_size, args.per_alpha, per_beta,
+                           her_frac=(args.her_frac if goal else 0.0))
         if b is None:
             break
         zb = encode_obs(wm, b["px"], b["prop"], device)
         znb = encode_obs(wm, b["px_n"], b["prop_n"], device)
-        with torch.no_grad():
-            an, logpn, _ = actor.sample(znb)               # a' ~ pi (entropy bonus on z')
-            q1n, q2n = critic_tgt(znb, an)
-            # scalar critic: (B,1) soft target. multihead: per-head TD targets from the
-            # per-component rewards, min-over-twins per head (pessimism per component); the
-            # shared next action keeps the heads' sum == the scalar value. Entropy is global
-            # (not a reward component) so it is spread equally across the K heads (/K) -> the
-            # head-sum equals the scalar soft target; identical to safe15 at K=1.
-            ent = args.gamma * (1 - b["d"]) * alpha * logpn          # (B,1) discounted entropy
-            y = (b.get("rc", b["r"]) + (1 - b["d"]) * args.gamma * torch.min(q1n, q2n)
-                 - ent / q1n.shape[-1])
-        q1, q2 = critic(zb, b["a"])
-        critic_loss = (b["w"] * ((q1 - y).pow(2) + (q2 - y).pow(2)).mean(-1, keepdim=True)).mean()
-        critic_opt.zero_grad(); critic_loss.backward(); critic_opt.step()
-        if args.per_priority == "td":   # ablation: replace curiosity priority with |TD error|
-            td = (0.5 * (q1 + q2) - y).sum(-1).abs().detach().cpu().numpy()
-            buf.update_priorities(b["e"], b["i"], td)
-        ap, logpp, _ = actor.sample(zb)
-        q1p, q2p = critic(zb, ap)
-        q_min = torch.min(q1p.sum(-1, keepdim=True), q2p.sum(-1, keepdim=True))   # sum heads, then twin-min
-        actor_loss = (alpha * logpp - q_min).mean()                              # maximize Q + alpha*H (== safe15 at K=1)
-        if getattr(args, "actor_rate_reg", 0) > 0:
+        if goal:
+            # --- goal-conditioned DETERMINISTIC (TD3/DDPG-style) update; NO entropy. z* is
+            #     RE-ENCODED from the raw stored goal obs o* (HER-relabeled in sample_sac) under
+            #     the CURRENT encoder -> drift-immune, and is the SAME z* for the (s) and (s')
+            #     forwards of the transition (else the Bellman backup is corrupt). Reward is the
+            #     dense reach term -||z_{t+1} - z*|| (recomputed HERE so HER relabeling takes
+            #     effect) PLUS the stored curiosity term b["r"] (the live r_cur -> keep exploring
+            #     AROUND a reached goal: "return, then explore"). n_out==1 (multihead forced off). ---
+            zstar = encode_obs(wm, b["goal_px"], b["goal_prop"], device)     # (B, D) detached (no_grad encode)
+            with torch.no_grad():
+                an = actor(znb, zstar)                                        # deterministic next action
+                tn = getattr(args, "td3_target_noise", 0.0)
+                if tn > 0:                                                    # optional TD3 target smoothing
+                    c = getattr(args, "td3_noise_clip", 0.5)
+                    an = (an + (tn * torch.randn_like(an)).clamp(-c, c)).clamp(-1.0, 1.0)
+                q1n, q2n = critic_tgt(znb, an, zstar)
+                # reach reward for LANDING in z_{t+1}, MASKED to 0 on (a) self-goal transitions
+                # (goal_valid==0: no real goal pursued -> -||z_{t+1}-z_t|| would reward staying put)
+                # and (b) terminal transitions (d==1: z_{t+1} is the next episode's reset state, not
+                # where a_t landed). HER-relabeled rows are goal_valid==1.
+                r_reach = -(znb - zstar).norm(dim=-1, keepdim=True) * b["goal_valid"] * (1 - b["d"])
+                r = args.lambda_reach * r_reach + b["r"]                     # b["r"] = stored curiosity term
+                y = r + (1 - b["d"]) * args.gamma * torch.min(q1n, q2n)
+            q1, q2 = critic(zb, b["a"], zstar)
+            critic_loss = (b["w"] * ((q1 - y).pow(2) + (q2 - y).pow(2))).mean()
+            critic_opt.zero_grad(); critic_loss.backward(); critic_opt.step()
+            ap = actor(zb, zstar)
+            q1p, q2p = critic(zb, ap, zstar)
+            actor_loss = (-torch.min(q1p, q2p)).mean()                       # deterministic PG (no entropy)
+        else:
+            with torch.no_grad():
+                an, logpn, _ = actor.sample(znb)               # a' ~ pi (entropy bonus on z')
+                q1n, q2n = critic_tgt(znb, an)
+                # scalar critic: (B,1) soft target. multihead: per-head TD targets from the
+                # per-component rewards, min-over-twins per head (pessimism per component); the
+                # shared next action keeps the heads' sum == the scalar value. Entropy is global
+                # (not a reward component) so it is spread equally across the K heads (/K) -> the
+                # head-sum equals the scalar soft target; identical to safe15 at K=1.
+                ent = args.gamma * (1 - b["d"]) * alpha * logpn          # (B,1) discounted entropy
+                y = (b.get("rc", b["r"]) + (1 - b["d"]) * args.gamma * torch.min(q1n, q2n)
+                     - ent / q1n.shape[-1])
+            q1, q2 = critic(zb, b["a"])
+            critic_loss = (b["w"] * ((q1 - y).pow(2) + (q2 - y).pow(2)).mean(-1, keepdim=True)).mean()
+            critic_opt.zero_grad(); critic_loss.backward(); critic_opt.step()
+            if args.per_priority == "td":   # ablation: replace curiosity priority with |TD error|
+                td = (0.5 * (q1 + q2) - y).sum(-1).abs().detach().cpu().numpy()
+                buf.update_priorities(b["e"], b["i"], td)
+            ap, logpp, _ = actor.sample(zb)
+            q1p, q2p = critic(zb, ap)
+            q_min = torch.min(q1p.sum(-1, keepdim=True), q2p.sum(-1, keepdim=True))   # sum heads, then twin-min
+            actor_loss = (alpha * logpp - q_min).mean()                              # maximize Q + alpha*H (== safe15 at K=1)
+        if not goal and getattr(args, "actor_rate_reg", 0) > 0:
             # action-rate as an actor-loss regularizer instead of a reward term: penalize
             # the policy's own within-block sub-action jerk directly — smoothness pressure
             # that never enters r or propagates through Q (the curiosity balance untouched).
             sub = ap.view(ap.shape[0], args.action_block, -1)
             actor_loss = actor_loss + args.actor_rate_reg * sub.diff(dim=1).pow(2).mean()
         gc_val = 0.0
-        if getattr(args, "lambda_temp", 0) != 0:
+        if not goal and getattr(args, "lambda_temp", 0) != 0:
             # Grad-CAPS temporal smoothness (displacement-normalized): penalize the CURVATURE
             # of the policy's real applied sub-action path across the t->t+1 decision boundary
             # [pi_mean(z_t) | pi_mean(z_{t+1})], scaled by 1/displacement so a smooth wide ramp
@@ -636,10 +746,28 @@ def load_init_ckpt(args, wm, actor, critic, critic_tgt, device):
     path = resolve_ckpt(args.init_ckpt, args.resume_name or args.name, args.resume_step, args.hf_repo)
     ck = torch.load(path, map_location=device, weights_only=False)
     wm.load_state_dict(ck["wm"])
+    h_fwd = int(ck.get("h_fwd", args.h_fwd_start))
+    if getattr(args, "goal_explore", False):
+        # goal-conditioned actor/critic have a WIDER first layer (z_dim + goal_dim). Load them
+        # only from a checkpoint whose shapes match (another goal-explore run); otherwise warm-
+        # start the WM (a trained WM gives meaningful r_cur from step 0) and start the goal-
+        # conditioned policy fresh. (A strict critic load on a z-only ckpt would crash; a
+        # strict=False actor load would silently reinit the wider trunk anyway.)
+        want = actor.trunk[0].weight.shape[1]
+        have = ck["actor"]["trunk.0.weight"].shape[1]
+        if want == have:
+            load_actor_state(actor, ck["actor"])
+            critic.load_state_dict(ck["critic"]); critic_tgt.load_state_dict(ck["critic_tgt"])
+            print(f"[resume] goal-explore: loaded wm+actor+critic from {path} "
+                  f"(saved step {ck.get('step', '?')}, h_fwd={h_fwd})", flush=True)
+        else:
+            print(f"[resume] goal-explore: WM warm-started from {path} (saved step "
+                  f"{ck.get('step', '?')}); actor/critic input {have}!={want} -> fresh "
+                  f"goal-conditioned policy.", flush=True)
+        return h_fwd
     load_actor_state(actor, ck["actor"])     # drops the log_std head of old stochastic ckpts
     critic.load_state_dict(ck["critic"])
     critic_tgt.load_state_dict(ck["critic_tgt"])
-    h_fwd = int(ck.get("h_fwd", args.h_fwd_start))
     print(f"[resume] loaded wm+actor+critic from {path} "
           f"(saved step {ck.get('step', '?')}, h_fwd={h_fwd})", flush=True)
     return h_fwd
@@ -692,6 +820,28 @@ def main(args):
         args.lambda_safe = 2.2 if _hw else 0.1
     print(f"[safety] {args.env_backend} backend -> delta={args.safety_delta}, "
           f"lambda_safe={args.lambda_safe}", flush=True)
+    # --- goal-conditioned Go-Explore: resolve gated coercions BEFORE the env / nets are built
+    #     (action_max feeds VecEnv below; the rest gate the deterministic objective downstream) ---
+    if args.goal_explore:
+        if args.env_backend == "hardware":
+            raise SystemExit("[goal-explore] refusing on hardware: dropping dq_max -> action_max=1.0 "
+                             "(full-radian joint deltas) is unsafe on a real arm. Sim only.")
+        args.deterministic_act = True       # no stochastic collection (the actor.sample path is unused)
+        args.alpha = 0.0                    # kills the entropy terms in sac_update
+        args.explore_noise = 0.0           # no collection noise
+        args.lambda_safe = 0.0             # drop r_safe entirely
+        args.multihead_q = False           # the dense scalar reach reward has no component decomposition
+        args.per_priority = "curiosity"    # td-priority would fight the archive's r_cur scoring
+        if args.action_max == 0.3:         # drop the dq_max scaling unless the user explicitly overrode it
+            args.action_max = 1.0
+        if args.goal_update_every <= 0:
+            args.goal_update_every = args.max_episode_steps
+        if args.goal_rescore_every <= 0:
+            args.goal_rescore_every = args.goal_update_every
+        print(f"[goal-explore] ON: K={args.goal_archive_size} update_every={args.goal_update_every} "
+              f"rescore_every={args.goal_rescore_every} her_frac={args.her_frac} "
+              f"lambda_reach={args.lambda_reach} action_max={args.action_max} "
+              f"(deterministic, alpha=0, lambda_safe=0)", flush=True)
     env = VecEnv(n_envs=args.n_envs, frame_skip=args.frame_skip,
                  action_max=args.action_max,
                  safety_delta=args.safety_delta, seed=args.seed,
@@ -712,10 +862,11 @@ def main(args):
     sigreg = SIGReg(knots=17, num_proj=1024).to(device)
     z_dim = wm.z_dim
 
-    actor = Actor(z_dim, a_dim).to(device)
+    goal_dim = z_dim if args.goal_explore else 0   # z* re-encoded to the same 256-dim latent space
+    actor = Actor(z_dim, a_dim, goal_dim=goal_dim).to(device)
     n_q_out = len(REWARD_COMPONENTS) if args.multihead_q else 1
-    critic = TwinQ(z_dim, a_dim, n_out=n_q_out).to(device)
-    critic_tgt = TwinQ(z_dim, a_dim, n_out=n_q_out).to(device)
+    critic = TwinQ(z_dim, a_dim, n_out=n_q_out, goal_dim=goal_dim).to(device)
+    critic_tgt = TwinQ(z_dim, a_dim, n_out=n_q_out, goal_dim=goal_dim).to(device)
     critic_tgt.load_state_dict(critic.state_dict())
     for p in critic_tgt.parameters():
         p.requires_grad_(False)
@@ -767,8 +918,20 @@ def main(args):
                   f"oldest will be overwritten. Split into shorter runs to keep all transitions.", flush=True)
         cap_per_env = max(cap_per_env, keep)
     buf = ReplayBuffer(args.n_envs, cap_per_env, env.wrist_resolution, a_dim, prop_dim, device,
-                       n_comp=len(REWARD_COMPONENTS) if args.multihead_q else 0)
+                       n_comp=len(REWARD_COMPONENTS) if args.multihead_q else 0,
+                       goal_explore=args.goal_explore)
     print(f"[buffer] {args.n_envs} x {cap_per_env} = {args.n_envs * cap_per_env} transitions", flush=True)
+    archive = (GoalArchive(args.goal_archive_size, env.wrist_resolution, prop_dim, a_dim)
+               if args.goal_explore else None)
+    if archive is not None and (args.init_ckpt or args.resume_name):   # reload archive on goal-explore resume
+        try:
+            _ap = resolve_ckpt(args.init_ckpt, args.resume_name or args.name, args.resume_step, args.hf_repo)
+            _ack = torch.load(_ap, map_location="cpu", weights_only=False)
+            if "goal_archive" in _ack:
+                archive.load_state_dict(_ack["goal_archive"])
+                print(f"[resume] goal archive loaded: {archive.n} goals", flush=True)
+        except Exception as _ex:
+            print(f"[resume] goal archive not loaded ({_ex}); starting empty", flush=True)
 
     run_name = args.name
     out_dir = Path(args.out_dir) if args.out_dir else Path("runs") / run_name
@@ -821,6 +984,30 @@ def main(args):
     is_start = np.ones(args.n_envs, bool)
     ep_len = np.zeros(args.n_envs, np.int64)
     ep_ret = np.zeros(args.n_envs, np.float32)
+
+    # --- goal-conditioned Go-Explore: one pursued goal o* (+ its re-encoded z*) per env ---
+    goal_img_hw = env.wrist_resolution
+    goal_px_env = np.zeros((args.n_envs, goal_img_hw, goal_img_hw, 3), np.uint8)
+    goal_prop_env = np.zeros((args.n_envs, prop_dim), np.float32)
+    zstar_env = torch.zeros(args.n_envs, z_dim, device=device)
+    has_goal = np.zeros(args.n_envs, bool)
+    goal_evictions = 0
+    goal_recent = ({k: deque(maxlen=400) for k in ("dist", "reach")}
+                   if args.goal_explore else None)
+
+    def refresh_goals(env_idx):
+        """Draw a fresh goal obs o* from the archive for each env in env_idx (sets goal_px_env /
+        has_goal). z* is RE-ENCODED from o* every step in the main loop (drift-immune), not here.
+        No-op until the archive fills."""
+        if archive is None or archive.n == 0:
+            return
+        for e in env_idx:
+            k = archive.sample(args.goal_temp)
+            if k is None:
+                continue
+            goal_px_env[e] = archive.gpx[k]
+            goal_prop_env[e] = archive.gprop[k]
+            has_goal[e] = True
 
     h_fwd = resume_h_fwd if resume_h_fwd is not None else args.h_fwd_start   # curriculum horizon (resumed if warm-started)
     pred_hist = deque(maxlen=args.flatline_window)    # for the flatline bump trigger
@@ -928,6 +1115,25 @@ def main(args):
             break
         cur_px, cur_prop = obs["image"], obs["proprio"]          # o_t (before acting)
 
+        # --- goal-explore: (re)sample goals on the cadence, then RE-ENCODE z* EVERY step from the
+        #     raw goal obs (drift-immune collection); self-goal z* = z where no archive goal yet
+        #     (reach is masked for those in sac_update). Log dist/reach over real-goal envs. ---
+        if args.goal_explore:
+            if step % args.goal_update_every == 0:
+                refresh_goals(np.arange(args.n_envs))
+            with torch.no_grad():
+                if has_goal.any():
+                    hg = torch.as_tensor(has_goal, device=device)
+                    zstar_env[hg] = encode_obs(wm, goal_px_env[has_goal], goal_prop_env[has_goal], device)
+                nog = ~has_goal
+                if nog.any():
+                    nog_t = torch.as_tensor(nog, device=device)
+                    zstar_env[nog_t] = z[nog_t]
+                if has_goal.any():
+                    gdist = (z - zstar_env).norm(dim=-1).cpu().numpy()       # ||z_t - z*|| per env
+                    goal_recent["dist"].append(float(gdist[has_goal].mean()))
+                    goal_recent["reach"].append(float((gdist[has_goal] < args.goal_reach_eps).mean()))
+
         # --- act: SAC stochastic sample during sim training (the entropy-driven exploration
         #     that un-parks the policy and decorrelates the parallel envs), the DETERMINISTIC
         #     mean on hardware / frozen deployment / eval (stochastic_act is False there).
@@ -936,6 +1142,8 @@ def main(args):
         with torch.no_grad():
             if args.warmup_random and step < args.start_steps:
                 a = torch.rand(args.n_envs, a_dim, device=device) * 2 - 1
+            elif args.goal_explore:
+                a = actor(z, zstar_env)      # deterministic goal-conditioned action a=tanh(mu(z,z*))
             elif stochastic_act:
                 a, _, _ = actor.sample(z)
             else:
@@ -943,7 +1151,8 @@ def main(args):
             if args.explore_noise > 0:       # optional extra collection noise (sim pretrain only)
                 a = (a + args.explore_noise * torch.randn_like(a)).clamp(-1.0, 1.0)
         hist_a = torch.cat([hist_a[1:], a.unsqueeze(0)], 0)
-        a_env = a.detach().cpu().numpy().reshape(args.n_envs, args.action_block, n_dof)
+        a_np = a.detach().cpu().numpy()
+        a_env = a_np.reshape(args.n_envs, args.action_block, n_dof)
 
         # --- async actor-learner: launch the env rollout for this decision, then run
         #     the GPU updates on buffered data WHILE the workers render -> overlap CPU/GPU ---
@@ -1025,6 +1234,20 @@ def main(args):
         z_next = encode_obs(wm, obs["image"], obs["proprio"], device)
         r_cur = curiosity_reward(wm, hist_z, hist_a, z_next).cpu().numpy()        # (n_envs,) >= 0
         cur_term = args.lambda_cur * np.log1p(r_cur)         # lambda_cur * symlog(r_cur)  (r_cur>=0)
+
+        # --- goal archive: insert this transition (goal = surprising OUTCOME o_{t+1}) scored by
+        #     its TRUE one-step MSE r_cur; periodically re-measure every goal with the current WM
+        #     and evict mastered ones. obs is still o_{t+1} here (done envs reset further below). ---
+        if archive is not None:
+            # ref = same-construction re-measure of THIS transition (eviction baseline); score = true r_cur
+            ref = score_obs_mse(wm, obs["image"], obs["proprio"], cur_px, cur_prop, a_np, device, H)
+            archive.insert_batch(gpx=obs["image"], gprop=obs["proprio"],
+                                 spx=cur_px, sprop=cur_prop, sact=a_np, score=r_cur, ref=ref)
+            if step > 0 and step % args.goal_rescore_every == 0 and archive.n > 0:
+                goal_evictions += archive.rescore_and_evict(
+                    lambda gpx, gprop, spx, sprop, sact:
+                        score_obs_mse(wm, gpx, gprop, spx, sprop, sact, device, H),
+                    args.goal_drop_frac)
         r_rate = -(args.w_action_rate * rate + args.w_action_rate2 * rate2)       # smoothness penalties (0 unless flagged)
         r_energy = -args.w_energy * energy
         safe_term = args.lambda_safe * r_safe
@@ -1045,7 +1268,12 @@ def main(args):
         else:
             r_knn = np.zeros_like(r_cur)
         knn_term = args.lambda_knn * r_knn
-        reward = safe_term + cur_term + r_rate + r_energy + rnd_term + knn_term
+        if args.goal_explore:
+            # buffer reward = the goal-INDEPENDENT curiosity term only; the dense reach term
+            # -||z_{t+1}-z*|| is (re)computed in sac_update so HER relabeling takes effect.
+            reward = cur_term
+        else:
+            reward = safe_term + cur_term + r_rate + r_energy + rnd_term + knn_term
         comps = np.stack([cur_term, safe_term, r_rate, r_energy], -1).astype(np.float32)  # REWARD_COMPONENTS order
 
         # contact-conditioned curiosity MSE (r_cur = ||zhat-z||^2): is the model more
@@ -1062,9 +1290,16 @@ def main(args):
         ep_len += 1
         ep_ret += reward
         done = (ep_len >= args.max_episode_steps).astype(np.float32)
-        buf.add(pixels=cur_px, proprio=cur_prop, action=a.detach().cpu().numpy(),
+        if args.goal_explore:                # store the PURSUED goal o* (self-goal where none yet)
+            g_px = np.where(has_goal[:, None, None, None], goal_px_env, cur_px)
+            g_prop = np.where(has_goal[:, None], goal_prop_env, cur_prop)
+            g_valid = has_goal.copy()        # reach reward only counts where a real goal was pursued
+        else:
+            g_px = g_prop = g_valid = None
+        buf.add(pixels=cur_px, proprio=cur_prop, action=a_np,
                 r=reward, d=done, is_start=is_start.copy(), prio=r_cur,
-                rc=comps if args.multihead_q else None)
+                rc=comps if args.multihead_q else None,
+                goal_px=g_px, goal_prop=g_prop, goal_valid=g_valid)
         for key, val in (("r_cur", r_cur), ("r_safe", r_safe), ("cur_contrib", cur_term),
                          ("contacts", contacts), ("table_contacts", table_contacts),
                          ("motion", motion), ("ret", reward),
@@ -1093,6 +1328,9 @@ def main(args):
             for j, e in enumerate(done_envs):
                 hist_z[:, e] = z_reset[j]
                 hist_a[:, e] = 0.0
+            if args.goal_explore:                  # draw a fresh goal for each reset env
+                has_goal[done_envs] = False
+                refresh_goals([int(e) for e in done_envs])
             if run is not None:
                 wlog({"episode/return": float(ep_ret[done_envs].mean()),
                       "episode/len": float(ep_len[done_envs].mean())}, step)
@@ -1137,6 +1375,14 @@ def main(args):
                  "explore/pose_step": np.mean(recent["pose_step"]),     # joint travel/decision; ~0 = parked
                  "buffer/transitions": buf.total, "perf/steps_per_sec": sps,
                  "wm/h_fwd": h_fwd}
+            if args.goal_explore:
+                d["goal/archive_size"] = archive.n
+                d["goal/archive_mse_mean"] = archive.mean_score()
+                d["goal/evictions"] = goal_evictions
+                if goal_recent["dist"]:
+                    d["goal/dist_to_goal"] = float(np.mean(goal_recent["dist"]))
+                if goal_recent["reach"]:
+                    d["goal/reach_rate"] = float(np.mean(goal_recent["reach"]))
             if recent_qpos:    # how much of joint space the recent window covers (parked -> ~0)
                 qarr = np.stack(recent_qpos)                            # (T, n_envs, n_dof)
                 d["explore/pose_spread"] = float(qarr.std(0).mean())    # mean temporal std over joints/envs
@@ -1175,23 +1421,42 @@ def main(args):
                 d["rnd/pred_loss"] = last_rnd                  # RND predictor MSE (should fall as states are visited)
             if last_qh is not None:              # --multihead-q: per-component policy value
                 d.update({f"sac/q_{k}": float(v) for k, v in zip(REWARD_COMPONENTS, last_qh)})
+            if args.goal_explore:                # no safety in goal-explore -> drop its (zeroed) keys
+                for _k in ("reward/r_safe", "reward/safe_cur_ratio", "reward/var_safe",
+                           "reward/var_cur_frac"):
+                    d.pop(_k, None)
             wlog(d, step)
             with open(out_dir / "metrics.jsonl", "a") as f:    # local metrics record (esp. when --no-wandb)
                 f.write(json.dumps({"step": step, **{k: float(v) for k, v in d.items()}}) + "\n")
-            print(f"[step {step}] r_safe={safe_m:.3f} cur_contrib={cur_m:.3f} "
-                  f"safe:cur={d['reward/safe_cur_ratio']:.2f} "
-                  f"contacts/s={d['interact/contacts_per_step']:.2f} "
-                  f"mse[blk/tbl/none]={d.get('wm/mse_block', float('nan')):.2f}/"
-                  f"{d.get('wm/mse_table', float('nan')):.2f}/{d.get('wm/mse_none', float('nan')):.2f} "
-                  f"rate={d['smooth/action_rate']:.2f} pose_step={d['explore/pose_step']:.3f} "
-                  f"pose_range={d.get('explore/pose_range', float('nan')):.2f} "
-                  f"h_fwd={h_fwd} sps={sps:.1f}", flush=True)
+            if args.goal_explore:           # goal-explore has NO safety: show goal metrics instead
+                print(f"[step {step}] cur_contrib={cur_m:.3f} "
+                      f"dist_goal={d.get('goal/dist_to_goal', float('nan')):.2f} "
+                      f"reach={d.get('goal/reach_rate', 0.0):.2f} "
+                      f"archive={archive.n} evict={goal_evictions} "
+                      f"crit_loss={d.get('sac/critic_loss', float('nan')):.2f} "
+                      f"contacts/s={d['interact/contacts_per_step']:.2f} "
+                      f"mse[blk/tbl/none]={d.get('wm/mse_block', float('nan')):.2f}/"
+                      f"{d.get('wm/mse_table', float('nan')):.2f}/{d.get('wm/mse_none', float('nan')):.2f} "
+                      f"pose_step={d['explore/pose_step']:.3f} "
+                      f"pose_range={d.get('explore/pose_range', float('nan')):.2f} "
+                      f"h_fwd={h_fwd} sps={sps:.1f}", flush=True)
+            else:
+                print(f"[step {step}] r_safe={safe_m:.3f} cur_contrib={cur_m:.3f} "
+                      f"safe:cur={d['reward/safe_cur_ratio']:.2f} "
+                      f"contacts/s={d['interact/contacts_per_step']:.2f} "
+                      f"mse[blk/tbl/none]={d.get('wm/mse_block', float('nan')):.2f}/"
+                      f"{d.get('wm/mse_table', float('nan')):.2f}/{d.get('wm/mse_none', float('nan')):.2f} "
+                      f"rate={d['smooth/action_rate']:.2f} pose_step={d['explore/pose_step']:.3f} "
+                      f"pose_range={d.get('explore/pose_range', float('nan')):.2f} "
+                      f"h_fwd={h_fwd} sps={sps:.1f}", flush=True)
 
         # --- checkpoint: upload to HF then clear from disk (bounded disk over a long run) ---
         if args.save_every > 0 and step > 0 and step % args.save_every == 0:
             state = {"step": step, "wm": wm.state_dict(), "actor": actor.state_dict(),
                      "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
                      "h_fwd": h_fwd, "args": vars(args)}
+            if archive is not None:
+                state["goal_archive"] = archive.state_dict()
             save_and_upload(state, out_dir, step,
                             args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
                             run_name, not args.no_hf, args.keep_local_ckpts)
@@ -1219,6 +1484,8 @@ def main(args):
         state = {"step": args.total_steps, "wm": wm.state_dict(), "actor": actor.state_dict(),
                  "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
                  "h_fwd": h_fwd, "args": vars(args)}
+        if archive is not None:
+            state["goal_archive"] = archive.state_dict()
         save_and_upload(state, out_dir, args.total_steps,
                         args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
                         run_name, not args.no_hf, args.keep_local_ckpts)
@@ -1406,6 +1673,40 @@ def parse_args():
                    help="force the deterministic mean even during sim-training collection (default: sample ~pi "
                         "in sim, mean on hardware/frozen). Reproduces the 2026-06-12 deterministic acting or a "
                         "clean eval rollout.")
+    # --- goal-conditioned Go-Explore (gated; default OFF -> the default path stays byte-identical) ---
+    p.add_argument("--goal-explore", action="store_true",
+                   help="goal-conditioned Go-Explore: a DETERMINISTIC actor pi(a|z,z*) + Q(z,a,z*) chases goals "
+                        "z* drawn (P(k)~MSE_k) from an archive of the highest one-step-WM-MSE states, with a "
+                        "dense reach reward -||z-z*|| + HER, while r_cur stays live ('return, then explore'). "
+                        "Forces deterministic acting (alpha=0, no explore-noise), drops r_safe (lambda_safe=0) "
+                        "and the dq_max action scaling (action_max=1.0), and disables --multihead-q. Sim only.")
+    p.add_argument("--goal-archive-size", type=int, default=64,
+                   help="K: max goals kept in the archive (top-K by capture-time r_cur).")
+    p.add_argument("--goal-update-every", type=int, default=0,
+                   help="THE decisive knob: resample each env's goal every N decision steps (and on reset). "
+                        "Want it slower than policy convergence, faster than full WM mastery. 0 -> one goal per "
+                        "episode (= --max-episode-steps).")
+    p.add_argument("--goal-rescore-every", type=int, default=0,
+                   help="re-measure every archived goal with the CURRENT WM every N steps and evict any whose "
+                        "MSE dropped below --goal-drop-frac of its capture score (the 're-measured -> evict "
+                        "mastered' rule). 0 -> = --goal-update-every.")
+    p.add_argument("--goal-drop-frac", type=float, default=0.5,
+                   help="evict an archived goal when its re-measured one-step MSE falls below this fraction of "
+                        "its capture score (the WM has learned it).")
+    p.add_argument("--goal-temp", type=float, default=1.0,
+                   help="softmax temperature for goal sampling P(k) ~ exp(score_k/temp) (NOT argmax).")
+    p.add_argument("--her-frac", type=float, default=0.5,
+                   help="fraction of SAC transitions whose goal is HER-relabeled to an achieved future obs from "
+                        "the same episode (densifies the reach reward).")
+    p.add_argument("--lambda-reach", type=float, default=1.0,
+                   help="weight on the dense reach reward -||z_{t+1}-z*|| (curiosity keeps its own --lambda-cur). "
+                        "The natural z-scale makes reach dominate far from the goal and r_cur dominate at it.")
+    p.add_argument("--goal-reach-eps", type=float, default=2.0,
+                   help="z-space distance below which a goal counts as REACHED (logged as goal/reach_rate).")
+    p.add_argument("--td3-target-noise", type=float, default=0.0,
+                   help="optional TD3 target-policy smoothing: std of clipped noise added to the TARGET action in "
+                        "the critic update only (not a collection action). 0 = pure deterministic (DDPG).")
+    p.add_argument("--td3-noise-clip", type=float, default=0.5, help="clip for --td3-target-noise.")
     p.add_argument("--gamma", type=float, default=0.9)
     p.add_argument("--tau", type=float, default=0.005, help="Polyak rate (SAC-style target critic)")
     p.add_argument("--actor-lr", type=float, default=3e-4)
