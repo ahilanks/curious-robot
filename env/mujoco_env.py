@@ -64,6 +64,9 @@ class MujocoSO101Env:
         scene_path: str | Path = DEFAULT_SCENE,
         wrist_resolution: int = 224,             # 224 for the ViT-tiny encoder
         overhead_resolution: int = 256,
+        encode_cam: str = "wrist",               # which camera fills obs["image"] (the WM/encoder input);
+                                                 # "overhead" = fixed third-person view (LeWM-style smoother
+                                                 # latent for goal-reaching). Default "wrist" = byte-identical.
         frame_skip: int = 6,                     # 30 Hz at timestep 0.005
         action_max: float = 0.3,                 # README dq^max (delta scale per unit action)
         safety_delta: float = 9.0,              # README delta (real-arm calibrated 2026-06-12)
@@ -110,6 +113,12 @@ class MujocoSO101Env:
 
         self._wrist_cam_id = _name_lookup(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam")
         self._overhead_cam_id = _name_lookup(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "overhead")
+        if encode_cam not in ("wrist", "overhead"):
+            raise ValueError(f"encode_cam must be 'wrist' or 'overhead', got {encode_cam!r}")
+        # the camera the WM/encoder sees (rendered at wrist_resolution into obs["image"]); "overhead"
+        # swaps the egocentric wrist view for the fixed worldbody cam without any other plumbing change.
+        self._encode_cam_id = self._overhead_cam_id if encode_cam == "overhead" else self._wrist_cam_id
+        self.encode_cam = encode_cam
         # end-effector (gripper) body: world xyz -> the honest "is the arm roaming in space"
         # signal. Distal-wrist jitter pans the wrist cam without translating this; pose_step
         # (joint-space) can't tell those apart, the gripper world position can.
@@ -322,7 +331,9 @@ class MujocoSO101Env:
 
     def _get_obs(self, render: bool = True) -> dict[str, np.ndarray]:
         if render:
-            self._wrist_renderer.update_scene(self.data, camera=self._wrist_cam_id)
+            # render the configured encode camera (wrist by default; overhead = fixed view) through the
+            # wrist_resolution renderer, so obs["image"] is always (wrist_resolution, wrist_resolution, 3).
+            self._wrist_renderer.update_scene(self.data, camera=self._encode_cam_id)
             wrist = self._wrist_renderer.render().copy()
         else:
             wrist = None                       # discarded substep: skip the costly render

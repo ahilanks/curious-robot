@@ -870,10 +870,18 @@ def main(args):
               f"rescore_every={args.goal_rescore_every} her_frac={args.her_frac} "
               f"lambda_reach={args.lambda_reach} action_max={args.action_max} "
               f"(deterministic, alpha=0, lambda_safe=0)", flush=True)
-    env = VecEnv(n_envs=args.n_envs, frame_skip=args.frame_skip,
-                 action_max=args.action_max,
-                 safety_delta=args.safety_delta, seed=args.seed,
-                 threads=args.env_threads)
+    if args.wm_cam == "overhead":
+        print(f"[wm-cam] encoder/WM input = OVERHEAD (fixed third-person) camera, not the wrist cam "
+              f"(prototype: LeWM-style smoother latent for goal-reaching).", flush=True)
+    env_kwargs = dict(n_envs=args.n_envs, frame_skip=args.frame_skip,
+                      action_max=args.action_max, encode_cam=args.wm_cam,
+                      safety_delta=args.safety_delta, seed=args.seed,
+                      threads=args.env_threads)
+    if args.env_backend == "subproc":      # GPU EGL render only in the CUDA-free subproc workers
+        env_kwargs["render_backend"] = args.render_backend
+        print(f"[render] subproc workers render via {args.render_backend.upper()} "
+              f"({'GPU, ~100x faster than osmesa' if args.render_backend == 'egl' else 'CPU'})", flush=True)
+    env = VecEnv(**env_kwargs)
     n_dof = env.n_dof
     a_dim = n_dof * args.action_block
     prop_dim = 3 * n_dof
@@ -1023,6 +1031,16 @@ def main(args):
     goal_recent = ({k: deque(maxlen=400) for k in ("dist", "reach")}
                    if args.goal_explore else None)
 
+    def reach_eps_now(step):
+        """Annealed reach threshold for the goal/reach_rate DIAGNOSTIC: linearly from
+        --goal-reach-eps-start down to --goal-reach-eps over anneal_frac*total_steps, then
+        held at the floor. eps_start<=0 -> constant --goal-reach-eps (default, unchanged)."""
+        e0, e1 = args.goal_reach_eps_start, args.goal_reach_eps
+        if e0 <= 0 or e0 <= e1:
+            return e1
+        span = max(int(args.goal_reach_eps_anneal_frac * args.total_steps), 1)
+        return max(e1, e0 - (e0 - e1) * min(step, span) / span)
+
     def refresh_goals(env_idx):
         """Draw a fresh goal obs o* from the archive for each env in env_idx (sets goal_px_env /
         has_goal). z* is RE-ENCODED from o* every step in the main loop (drift-immune), not here.
@@ -1161,7 +1179,7 @@ def main(args):
                 if has_goal.any():
                     gdist = (z - zstar_env).norm(dim=-1).cpu().numpy()       # ||z_t - z*|| per env
                     goal_recent["dist"].append(float(gdist[has_goal].mean()))
-                    goal_recent["reach"].append(float((gdist[has_goal] < args.goal_reach_eps).mean()))
+                    goal_recent["reach"].append(float((gdist[has_goal] < reach_eps_now(step)).mean()))
 
         # --- act: SAC stochastic sample during sim training (the entropy-driven exploration
         #     that un-parks the policy and decorrelates the parallel envs), the DETERMINISTIC
@@ -1416,6 +1434,7 @@ def main(args):
                     d["goal/dist_to_goal"] = float(np.mean(goal_recent["dist"]))
                 if goal_recent["reach"]:
                     d["goal/reach_rate"] = float(np.mean(goal_recent["reach"]))
+                d["goal/reach_eps"] = float(reach_eps_now(step))    # live (annealed) reach threshold
             if recent_qpos:    # how much of joint space the recent window covers (parked -> ~0)
                 qarr = np.stack(recent_qpos)                            # (T, n_envs, n_dof)
                 d["explore/pose_spread"] = float(qarr.std(0).mean())    # mean temporal std over joints/envs
@@ -1545,6 +1564,17 @@ def parse_args():
                         "inproc: envs in this process (sequential or --env-threads); "
                         "hardware: one physical SO-ARM101 via env/hardware_env.py (forces n_envs=1)")
     p.add_argument("--frame-skip", type=int, default=6)
+    p.add_argument("--render-backend", choices=("egl", "osmesa"), default="egl",
+                   help="offscreen render backend for the CUDA-free subproc env workers. 'egl' (default) = "
+                        "GPU offscreen render: ~0.3ms vs osmesa's ~35ms per 224^2 frame (~100x; overhead-cam "
+                        "sps ~2.5 -> ~30+). Coexists with the trainer's CUDA context (CUDA-free workers); the "
+                        "worker forces PYOPENGL_PLATFORM=egl so the parent's osmesa import doesn't leak in. "
+                        "'osmesa' = CPU fallback (no GPU/EGL). Subproc backend only.")
+    p.add_argument("--wm-cam", choices=("wrist", "overhead"), default="wrist",
+                   help="which camera the encoder/WM sees (obs['image']). 'wrist' (default) = egocentric, "
+                        "moves with the arm -> latent jumps ~a full random-pair distance per step (breaks "
+                        "latent L2 planning). 'overhead' = fixed third-person worldbody cam (LeWM-style), a "
+                        "PROTOTYPE for a temporally-smooth goal-reaching latent. Sim only.")
     p.add_argument("--max-episode-steps", type=int, default=200, help="decision steps before truncation-as-done")
     p.add_argument("--seed", type=int, default=0)
     # resume / warm-start (train.py otherwise never loads a checkpoint)
@@ -1735,7 +1765,16 @@ def parse_args():
                    help="weight on the dense reach reward -||z_{t+1}-z*|| (curiosity keeps its own --lambda-cur). "
                         "The natural z-scale makes reach dominate far from the goal and r_cur dominate at it.")
     p.add_argument("--goal-reach-eps", type=float, default=2.0,
-                   help="z-space distance below which a goal counts as REACHED (logged as goal/reach_rate).")
+                   help="z-space distance below which a goal counts as REACHED (logged as goal/reach_rate). "
+                        "This is the FINAL/floor value when --goal-reach-eps-start anneals down to it.")
+    p.add_argument("--goal-reach-eps-start", type=float, default=0.0,
+                   help="if > 0, linearly anneal the reach threshold from this (lenient) value DOWN to "
+                        "--goal-reach-eps over --goal-reach-eps-anneal-frac of training. Lets early "
+                        "'approximate reaches' register (the WM's 1-step precision floor is ~7-9 z-units, "
+                        "well above the 2.0 floor) and tightens over time. 0 = constant (default, unchanged). "
+                        "NOTE: reach_rate is a DIAGNOSTIC only -- it does not affect collection or planning.")
+    p.add_argument("--goal-reach-eps-anneal-frac", type=float, default=0.5,
+                   help="fraction of --total-steps over which --goal-reach-eps-start anneals to --goal-reach-eps.")
     p.add_argument("--td3-target-noise", type=float, default=0.0,
                    help="optional TD3 target-policy smoothing: std of clipped noise added to the TARGET action in "
                         "the critic update only (not a collection action). 0 = pure deterministic (DDPG).")
@@ -1747,10 +1786,13 @@ def parse_args():
                    help="latent CEM-MPC controller: each step, optimize the block action to minimize "
                         "||zhat_{t+1} - z*|| (z* = goal latent from the archive) via WM rollout. No learned "
                         "policy, no reach reward (reward stays MSE-only); SAC off. Implies --goal-explore.")
-    p.add_argument("--cem-samples", type=int, default=128, help="CEM action samples per iter (per env)")
-    p.add_argument("--cem-iters", type=int, default=3, help="CEM refit iterations")
-    p.add_argument("--cem-elites", type=int, default=16, help="CEM elite count (top-k lowest cost)")
-    p.add_argument("--cem-init-std", type=float, default=0.5, help="CEM initial action std")
+    # CEM solver defaults follow the LeWM paper (300 samples / 10 iters / 30 elites / init var 1.0;
+    # PushT uses 30 iters). The first --cem run used 64/3/8/0.5 -- ~15-45x weaker -> drastically
+    # under-optimized in the 5x30=150-d action-sequence space.
+    p.add_argument("--cem-samples", type=int, default=300, help="CEM action samples per iter (per env); LeWM=300")
+    p.add_argument("--cem-iters", type=int, default=10, help="CEM refit iterations; LeWM=10 (30 for PushT)")
+    p.add_argument("--cem-elites", type=int, default=30, help="CEM elite count (top-k lowest cost); LeWM=30")
+    p.add_argument("--cem-init-std", type=float, default=1.0, help="CEM initial action std; LeWM init var=1.0")
     p.add_argument("--cem-min-std", type=float, default=0.1, help="CEM elite-refit std floor")
     p.add_argument("--cem-horizon", type=int, default=5,
                    help="CEM planning horizon H (block-decisions): minimize terminal ||zhat_H - z*||^2 "
