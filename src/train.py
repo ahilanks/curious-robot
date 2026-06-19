@@ -1564,13 +1564,14 @@ def parse_args():
                         "inproc: envs in this process (sequential or --env-threads); "
                         "hardware: one physical SO-ARM101 via env/hardware_env.py (forces n_envs=1)")
     p.add_argument("--frame-skip", type=int, default=6)
-    p.add_argument("--render-backend", choices=("egl", "osmesa"), default="osmesa",
-                   help="offscreen render backend for the CUDA-free subproc env workers. 'osmesa' (default) = "
-                        "CPU, reliable. 'egl' = GPU offscreen render, ~0.3ms vs osmesa's ~35ms per 224^2 frame "
-                        "(~100x; overhead-cam sps ~2.5 -> ~30+) and VALIDATED to run (sps=37) -- but currently "
-                        "FLAKY in the subproc spawn path here (intermittent 'Cannot use EGL'/no-Renderer from a "
-                        "PyOpenGL platform race in the worker bootstrap), so it's opt-in until that's fixed. "
-                        "Subproc backend only (inproc renders in the CUDA main proc -> osmesa).")
+    p.add_argument("--render-backend", choices=("egl", "osmesa"), default="egl",
+                   help="offscreen render backend for the CUDA-free subproc env workers. 'egl' (default) = "
+                        "GPU offscreen render, ~0.3ms vs osmesa's ~35ms per 224^2 frame (~100x; overhead-cam "
+                        "sps ~2.5 -> ~30+). The worker EGL init is made deterministic in parallel_env.py "
+                        "(pinned MUJOCO_EGL_DEVICE_ID + forced NVIDIA ICD so no Mesa-software device is "
+                        "enumerated, + a flock serialising the first eglInitialize across workers). 'osmesa' = "
+                        "CPU offscreen fallback (no GPU / EGL unavailable). Subproc backend only (inproc "
+                        "renders in the CUDA main proc -> osmesa).")
     p.add_argument("--wm-cam", choices=("wrist", "overhead"), default="wrist",
                    help="which camera the encoder/WM sees (obs['image']). 'wrist' (default) = egocentric, "
                         "moves with the arm -> latent jumps ~a full random-pair distance per step (breaks "
