@@ -19,10 +19,12 @@ load_env() {
 }
 load_env
 
-# Headless rendering: MuJoCo defaults to the on-screen GLFW backend, which needs an
-# X11 display. Use OSMesa (CPU offscreen) -- GPU EGL rendering aborts when it shares
-# a GPU with the trainer's CUDA (even across processes), so we render on CPU and keep
-# the GPU for training. Respect an explicit override.
+# Headless rendering: MuJoCo defaults to the on-screen GLFW backend, which needs an X11
+# display. The MAIN process renders under OSMesa (CPU offscreen) -- it shares its process
+# with the trainer's CUDA context, and an EGL render() in the CUDA process can SIGABRT once
+# CUDA work accumulates. The subproc render workers are CUDA-free and default to GPU EGL
+# (~100x faster; see --render-backend / env/parallel_env.py), which coexists with CUDA fine
+# across processes. So this only sets the main proc's backend. Respect an explicit override.
 export MUJOCO_GL="${MUJOCO_GL:-osmesa}"
 
 mkdir -p runs "${WANDB_DIR:-runs/wandb}"
