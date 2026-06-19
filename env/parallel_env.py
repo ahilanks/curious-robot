@@ -11,16 +11,23 @@ The training-loop API is identical across backends:
   * SubprocVectorMujocoEnv -- each env runs in its own `spawn` worker process.
   * SubprocSingleEnv       -- one env in a worker, for the eval/video rollout.
 
-Why the subprocess backends exist: MuJoCo's GPU EGL renderer and PyTorch CUDA cannot
-share a GPU -- accumulating CUDA work aborts a later render() (SIGABRT), even from a
-separate process on this driver. So render workers run on the CPU (OSMesa) in their
-own processes, parallelising across cores while the GPU stays dedicated to training.
+Why the subprocess backends exist: the render workers offscreen-render on the GPU via EGL
+(~0.3ms vs OSMesa's ~35ms per 224^2 frame). EGL and the trainer's CUDA context coexist fine
+on one GPU -- they use different driver subsystems -- but only when they live in SEPARATE
+processes: a render() in the CUDA process itself can SIGABRT once CUDA work accumulates. So
+each env runs in its own CUDA-free `spawn` worker (CUDA_VISIBLE_DEVICES=''), rendering on the
+GPU while the main process owns the CUDA context. `render_backend="osmesa"` falls back to CPU
+offscreen rendering (no GPU / EGL unavailable). See `_render_worker_spawn_env` and
+`_egl_first_init_lock` for the two halves of making the worker EGL init deterministic.
 """
 from __future__ import annotations
 
 import contextlib
+import fcntl
+import glob
 import multiprocessing as mp
 import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import numpy as np
@@ -144,7 +151,8 @@ def _env_worker(remote, parent_remote, env_kwargs):
                    if k == "mujoco" or k.startswith("mujoco.") or k == "env.mujoco_env"]:
             _sys.modules.pop(_m, None)
     from env.mujoco_env import MujocoSO101Env as _Env
-    env = _Env(**env_kwargs)
+    with _egl_first_init_lock(gl):                      # serialise the workers' first EGL context creation
+        env = _Env(**env_kwargs)                        # (builds both Renderers -> the racy eglInitialize)
     try:
         while True:
             cmd, data = remote.recv()
@@ -174,6 +182,38 @@ def _env_worker(remote, parent_remote, env_kwargs):
         remote.close()
 
 
+def _nvidia_egl_icd() -> str | None:
+    """Path to the NVIDIA EGL vendor ICD (glvnd config), or None if not present. Forcing this as
+    the sole __EGL_VENDOR_LIBRARY_FILENAMES makes eglQueryDevicesEXT enumerate ONLY the GPU(s):
+    no Mesa software (llvmpipe) device for a worker to land on by accident, and no multi-ICD
+    probing across nvidia+mesa on every worker (a per-process, driver-shared step that races)."""
+    for d in ("/usr/share/glvnd/egl_vendor.d", "/etc/glvnd/egl_vendor.d"):
+        hits = sorted(glob.glob(os.path.join(d, "*nvidia*.json")))
+        if hits:
+            return hits[0]
+    return None
+
+
+@contextlib.contextmanager
+def _egl_first_init_lock(gl: str):
+    """Serialise the FIRST EGL context creation across the spawn workers. N workers calling
+    eglInitialize on the same GPU within a few ms can race the NVIDIA driver's global device-init
+    path -> intermittent 'Cannot initialize a EGL device display'. An advisory file lock warms the
+    contexts up one worker at a time; once a context exists, rendering is lock-free, so steady-state
+    SPS is unaffected. No-op for osmesa (CPU, no driver-side device init to serialise)."""
+    if gl != "egl":
+        yield
+        return
+    f = open(os.path.join(tempfile.gettempdir(), "mujoco_egl_init.lock"), "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
+
+
 @contextlib.contextmanager
 def _render_worker_spawn_env(gl: str = "egl"):
     """Env that spawned render workers inherit: `gl` render backend and NO visible CUDA device
@@ -181,13 +221,27 @@ def _render_worker_spawn_env(gl: str = "egl"):
     than osmesa (0.3ms vs 35ms per 224^2 frame) and VALIDATED to coexist with the trainer's CUDA
     context across processes on this driver (the old "EGL aborts next to CUDA" caveat does not hold
     here, because the worker is CUDA-free). `gl="osmesa"` = CPU fallback (no GPU / EGL unavailable)."""
-    saved = {k: os.environ.get(k) for k in ("MUJOCO_GL", "PYOPENGL_PLATFORM", "CUDA_VISIBLE_DEVICES")}
+    keys = ("MUJOCO_GL", "PYOPENGL_PLATFORM", "CUDA_VISIBLE_DEVICES",
+            "MUJOCO_EGL_DEVICE_ID", "__EGL_VENDOR_LIBRARY_FILENAMES")
+    saved = {k: os.environ.get(k) for k in keys}
     os.environ["MUJOCO_GL"] = gl
     # CRITICAL: the trainer's main proc imports mujoco under osmesa, which sets PYOPENGL_PLATFORM=osmesa
     # in the (inherited) environment. Children must override it to match `gl`, or PyOpenGL stays locked
     # to osmesa and `import mujoco` under egl raises "Cannot use EGL rendering platform".
     os.environ["PYOPENGL_PLATFORM"] = gl
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    if gl == "egl":
+        # Make GPU selection deterministic (the other half of "deterministic worker EGL init"; the
+        # first-init race is handled by _egl_first_init_lock). Pin the physical GPU index so MuJoCo
+        # uses eglGetPlatformDisplayEXT(devices[id]) instead of looping the (non-deterministic across
+        # processes) eglQueryDevicesEXT order -- which on a box with 2 NVIDIA + 1 Mesa-software EGL
+        # device can silently render a worker on the llvmpipe CPU device. The device id is a GLOBAL
+        # physical index, unaffected by CUDA_VISIBLE_DEVICES; 0 is right on a single-GPU pod (override
+        # via MUJOCO_EGL_DEVICE_ID for multi-GPU). Force the NVIDIA ICD so only the GPU is enumerable.
+        os.environ.setdefault("MUJOCO_EGL_DEVICE_ID", "0")
+        icd = _nvidia_egl_icd()
+        if icd and "__EGL_VENDOR_LIBRARY_FILENAMES" not in os.environ:
+            os.environ["__EGL_VENDOR_LIBRARY_FILENAMES"] = icd
     try:
         yield
     finally:
