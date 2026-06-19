@@ -19,6 +19,7 @@ import platform
 os.environ.setdefault("MUJOCO_GL", "glfw" if platform.system() == "Darwin" else "osmesa")
 
 import argparse
+import contextlib
 import json
 import sys
 import time
@@ -417,19 +418,25 @@ def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, min_std, hor
     zg = z_goal.unsqueeze(1).expand(n, K, D).reshape(n * K, D)
     mu = torch.zeros(n, T, a_dim, device=device)
     std = torch.full((n, T, a_dim), init_std, device=device)
-    for _ in range(iters):
-        seq = (mu.unsqueeze(1) + std.unsqueeze(1) * torch.randn(n, K, T, a_dim, device=device)).clamp(-1.0, 1.0)
-        sf = seq.reshape(n * K, T, a_dim)
-        z_seq, a_seq = z0, a0                                         # (n*K, Hb, .) growing rollout buffers
-        for h in range(T):                                           # autoregressive WM rollout
-            a_seq = torch.cat([a_seq, sf[:, h:h + 1]], dim=1)        # apply candidate action a_{t+h}
-            znext = wm.predict(z_seq[:, -Hb:], wm.action_encoder(a_seq[:, -Hb:]))[:, -1:]
-            z_seq = torch.cat([z_seq, znext], dim=1)                 # append predicted z_{t+h+1}
-        cost = (z_seq[:, -1] - zg).pow(2).mean(-1).reshape(n, K)     # terminal latent goal-matching cost
-        idx = cost.topk(elite, largest=False, dim=1).indices
-        el = torch.gather(seq, 1, idx[:, :, None, None].expand(n, elite, T, a_dim))
-        mu = el.mean(1)
-        std = el.std(1).clamp_min(min_std)
+    # bf16 autocast on the rollout: the WM forwards run on tensor cores (~2-3x), and bf16 keeps
+    # fp32 exponent range so an inference rollout is numerically safe. mu/std/topk stay fp32
+    # (autocast leaves reductions in fp32). No-op off-CUDA.
+    amp = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+           if device.type == "cuda" else contextlib.nullcontext())
+    with amp:
+        for _ in range(iters):
+            seq = (mu.unsqueeze(1) + std.unsqueeze(1) * torch.randn(n, K, T, a_dim, device=device)).clamp(-1.0, 1.0)
+            sf = seq.reshape(n * K, T, a_dim)
+            z_seq, a_seq = z0, a0                                         # (n*K, Hb, .) growing rollout buffers
+            for h in range(T):                                           # autoregressive WM rollout
+                a_seq = torch.cat([a_seq, sf[:, h:h + 1]], dim=1)        # apply candidate action a_{t+h}
+                znext = wm.predict(z_seq[:, -Hb:], wm.action_encoder(a_seq[:, -Hb:]))[:, -1:]
+                z_seq = torch.cat([z_seq, znext], dim=1)                 # append predicted z_{t+h+1}
+            cost = (z_seq[:, -1] - zg).pow(2).mean(-1).reshape(n, K)     # terminal latent goal-matching cost
+            idx = cost.topk(elite, largest=False, dim=1).indices
+            el = torch.gather(seq, 1, idx[:, :, None, None].expand(n, elite, T, a_dim))
+            mu = el.mean(1)
+            std = el.std(1).clamp_min(min_std)
     return mu[:, 0].clamp(-1.0, 1.0)                                 # MPC: execute only the first planned action
 
 
@@ -814,6 +821,11 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available()
                           else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"[device] {device}  MUJOCO_GL={os.environ.get('MUJOCO_GL')}", flush=True)
+    if device.type == "cuda":
+        # Use the A100 tensor cores: TF32 for fp32 matmuls (the CEM rollout is matmul-bound,
+        # 10x5 WM forwards x ~2400 seqs per decision). ~2-4x with negligible accuracy loss.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     torch.manual_seed(args.seed); np.random.seed(args.seed)
 
     try:
@@ -895,6 +907,18 @@ def main(args):
         except Exception as ex:
             print(f"[wm] grad checkpoint not enabled: {ex}", flush=True)
     wm.eval()                                  # train() only inside wm_update
+    if device.type == "cuda" and not args.no_compile:
+        # wm.predict is the CEM inner loop (called 10x5 times/decision); compile fuses the kernels
+        # and cuts launch overhead. dynamic=True tolerates the changing batch/H shapes (CEM 2400 vs
+        # wm_update 128, H_fwd curriculum); suppress_errors falls back to eager on any graph break
+        # so a long run never dies on a compile issue.
+        try:
+            import torch._dynamo as _dynamo      # NB: `import torch._dynamo` would bind `torch` local to main()
+            _dynamo.config.suppress_errors = True
+            wm.predict = torch.compile(wm.predict, dynamic=True)
+            print("[wm] torch.compile(wm.predict) ON (dynamic; dynamo errors -> eager fallback)", flush=True)
+        except Exception as ex:
+            print(f"[wm] torch.compile disabled ({ex})", flush=True)
     sigreg = SIGReg(knots=17, num_proj=1024).to(device)
     z_dim = wm.z_dim
 
@@ -1612,6 +1636,9 @@ def parse_args():
     p.add_argument("--action-max", type=float, default=0.3,
                    help="README dq^max: rad of joint delta per unit tanh action")
     # world model (README; the '?' values below are sweepable, not pinned in README)
+    p.add_argument("--no-compile", action="store_true",
+                   help="disable torch.compile(wm.predict) (the CEM-rollout speedup); use if compile "
+                        "is flaky on this box. CUDA only; compile is on by default there.")
     p.add_argument("--history-size", type=int, default=3, help="H_bwd")
     p.add_argument("--h-fwd-start", type=int, default=1)
     p.add_argument("--h-fwd-max", type=int, default=1,
