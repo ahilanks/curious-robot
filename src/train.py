@@ -402,14 +402,18 @@ def score_obs_mse(wm, gpx, gprop, spx, sprop, sact, device, H):
 
 
 @torch.no_grad()
-def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, min_std, horizon, device):
-    """CEM-MPC in LATENT space (the --cem controller): optimize an H-step action SEQUENCE to minimize
-    the TERMINAL latent goal-matching cost C(zhat_H) = ||zhat_H - z_goal||^2, rolling the actions
-    AUTOREGRESSIVELY through the (fixed) world model from the current latent history. Solved by the
-    Cross-Entropy Method: sample sequences -> keep the elites -> refit the per-step Gaussian. MPC: only
-    the FIRST action is returned/executed, re-planned every decision step (longer H = more lookahead but
-    more WM rollout bias, since this WM is 1-step trained). No learned policy and NO reach reward (the
-    reward stays MSE-only) -- goal-reaching is PURE planning. Returns a_t (n_envs, a_dim) in [-1,1]."""
+def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, device):
+    """CEM planner in LATENT space -- a faithful port of LeWM's stable_worldmodel.solver.CEMSolver
+    (+ JEPA.rollout/criterion). Per replan: sample H-step action SEQUENCES from a per-step Gaussian,
+    FORCE candidate 0 = the current mean (LeWM's candidates[:,0]=mean), roll each AUTOREGRESSIVELY
+    through the fixed world model, score by the TERMINAL latent cost ||zhat_H - z_goal||^2 SUMMED over
+    latent dims (= LeWM's F.mse_loss(...).sum), keep the `elite` lowest-cost sequences, and refit
+    mean=elite.mean, std=elite.std. EXACTLY as LeWM: init std = var_scale, NO min-std floor, and NO
+    action clamp inside the optimization (the candidate distribution is unbounded; the executed action
+    is clamped by the caller). Returns the FULL planned sequence (n_envs, H, a_dim): the caller executes
+    all H open-loop (LeWM receding_horizon == horizon) and re-plans when the buffer empties. The rollout
+    is seeded from the last `Hb` REAL latents+actions (this codebase's choice; LeWM-cube uses
+    history_len=1). No learned policy and NO reach reward -- goal-reaching is PURE planning."""
     Hb, n, D = hist_z.shape                                           # Hb = WM backward context (history_size)
     a_dim = hist_a.shape[-1]
     T = max(int(horizon), 1)
@@ -417,7 +421,7 @@ def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, min_std, hor
     a0 = hist_a.transpose(0, 1).unsqueeze(1).expand(n, K, Hb, a_dim).reshape(n * K, Hb, a_dim)  # action history
     zg = z_goal.unsqueeze(1).expand(n, K, D).reshape(n * K, D)
     mu = torch.zeros(n, T, a_dim, device=device)
-    std = torch.full((n, T, a_dim), init_std, device=device)
+    std = torch.full((n, T, a_dim), init_std, device=device)         # LeWM: var = var_scale, used as the std
     # bf16 autocast on the rollout: the WM forwards run on tensor cores (~2-3x), and bf16 keeps
     # fp32 exponent range so an inference rollout is numerically safe. mu/std/topk stay fp32
     # (autocast leaves reductions in fp32). No-op off-CUDA.
@@ -425,19 +429,20 @@ def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, min_std, hor
            if device.type == "cuda" else contextlib.nullcontext())
     with amp:
         for _ in range(iters):
-            seq = (mu.unsqueeze(1) + std.unsqueeze(1) * torch.randn(n, K, T, a_dim, device=device)).clamp(-1.0, 1.0)
+            seq = mu.unsqueeze(1) + std.unsqueeze(1) * torch.randn(n, K, T, a_dim, device=device)
+            seq[:, 0] = mu                                            # LeWM: force candidate 0 = current mean
             sf = seq.reshape(n * K, T, a_dim)
             z_seq, a_seq = z0, a0                                         # (n*K, Hb, .) growing rollout buffers
             for h in range(T):                                           # autoregressive WM rollout
                 a_seq = torch.cat([a_seq, sf[:, h:h + 1]], dim=1)        # apply candidate action a_{t+h}
                 znext = wm.predict(z_seq[:, -Hb:], wm.action_encoder(a_seq[:, -Hb:]))[:, -1:]
                 z_seq = torch.cat([z_seq, znext], dim=1)                 # append predicted z_{t+h+1}
-            cost = (z_seq[:, -1] - zg).pow(2).mean(-1).reshape(n, K)     # terminal latent goal-matching cost
+            cost = (z_seq[:, -1] - zg).pow(2).sum(-1).reshape(n, K)      # terminal ||.||^2 (LeWM: SUM over dims)
             idx = cost.topk(elite, largest=False, dim=1).indices
             el = torch.gather(seq, 1, idx[:, :, None, None].expand(n, elite, T, a_dim))
             mu = el.mean(1)
-            std = el.std(1).clamp_min(min_std)
-    return mu[:, 0].clamp(-1.0, 1.0)                                 # MPC: execute only the first planned action
+            std = el.std(1)                                              # LeWM: NO min-std floor
+    return mu                                                            # full H-step plan (open-loop receding horizon)
 
 
 @torch.no_grad()
@@ -860,8 +865,9 @@ def main(args):
     #     (action_max feeds VecEnv below; the rest gate the deterministic objective downstream) ---
     if args.cem:
         args.goal_explore = True             # --cem reuses the archive + goal sampling infra; SAC is skipped
-        print(f"[cem] latent CEM-MPC controller ON: samples={args.cem_samples} iters={args.cem_iters} "
-              f"elites={args.cem_elites} init_std={args.cem_init_std} (reward=MSE only, SAC OFF)", flush=True)
+        print(f"[cem] LeWM CEM controller ON: samples={args.cem_samples} iters={args.cem_iters} "
+              f"elites={args.cem_elites} init_std={args.cem_init_std} horizon={args.cem_horizon} "
+              f"(open-loop receding, reward=MSE only, SAC OFF)", flush=True)
     if args.goal_explore:
         if args.env_backend == "hardware":
             raise SystemExit("[goal-explore] refusing on hardware: dropping dq_max -> action_max=1.0 "
@@ -1040,6 +1046,12 @@ def main(args):
     z = encode_obs(wm, obs["image"], obs["proprio"], device)        # (n_envs, z_dim)
     hist_z = z.unsqueeze(0).repeat(H, 1, 1)
     hist_a = torch.zeros(H, args.n_envs, a_dim, device=device)
+    # --- CEM open-loop receding-horizon plan buffer (LeWM WorldModelPolicy): a (n_envs, H, a_dim) plan
+    #     per env, consumed one block-action per decision; cem_ptr starts "exhausted" so step 0 plans,
+    #     and an env re-plans when its buffer empties / it just reset / its goal refreshed this step. ---
+    cem_H = max(args.cem_horizon, 1)
+    cem_buf = torch.zeros(args.n_envs, cem_H, a_dim, device=device)
+    cem_ptr = np.full(args.n_envs, cem_H, np.int64)
     knn_buf = torch.zeros(0, z_dim, device=device)    # recent-latent ring buffer for the k-NN coverage reward (--lambda-knn)
     is_start = np.ones(args.n_envs, bool)
     ep_len = np.zeros(args.n_envs, np.int64)
@@ -1213,10 +1225,24 @@ def main(args):
         with torch.no_grad():
             if args.warmup_random and step < args.start_steps:
                 a = torch.rand(args.n_envs, a_dim, device=device) * 2 - 1
-            elif args.cem:                   # CEM-MPC: plan toward the goal latent z* via the WM
-                a = cem_plan(wm, hist_z, hist_a, zstar_env, args.cem_samples, args.cem_iters,
-                             args.cem_elites, args.cem_init_std, args.cem_min_std,
-                             args.cem_horizon, device)
+            elif args.cem:                   # CEM open-loop receding horizon (LeWM WorldModelPolicy):
+                # plan H block-actions toward goal latent z* via the WM, buffer them, execute one per
+                # decision, and re-plan an env only when its buffer empties / it just reset / goals
+                # refreshed this step (LeWM clears the plan deque on terminated / _needs_flush).
+                need = cem_ptr >= cem_H
+                need |= is_start                                 # a just-reset env: stale plan + fresh goal
+                if step % args.goal_update_every == 0:           # goals just refreshed for ALL envs
+                    need[:] = True
+                if need.any():
+                    ridx = np.where(need)[0]
+                    rt = torch.as_tensor(ridx, device=device)
+                    cem_buf[rt] = cem_plan(wm, hist_z[:, rt], hist_a[:, rt], zstar_env[rt],
+                                           args.cem_samples, args.cem_iters, args.cem_elites,
+                                           args.cem_init_std, args.cem_horizon, device)
+                    cem_ptr[ridx] = 0
+                a = cem_buf[torch.arange(args.n_envs, device=device),
+                            torch.as_tensor(cem_ptr, device=device)].clamp(-1.0, 1.0)  # safety: bound to trained range
+                cem_ptr += 1
             elif args.goal_explore:
                 a = actor(z, zstar_env)      # deterministic goal-conditioned action a=tanh(mu(z,z*))
             elif stochastic_act:
@@ -1815,18 +1841,20 @@ def parse_args():
                    help="latent CEM-MPC controller: each step, optimize the block action to minimize "
                         "||zhat_{t+1} - z*|| (z* = goal latent from the archive) via WM rollout. No learned "
                         "policy, no reach reward (reward stays MSE-only); SAC off. Implies --goal-explore.")
-    # CEM solver defaults follow the LeWM paper (300 samples / 10 iters / 30 elites / init var 1.0;
-    # PushT uses 30 iters). The first --cem run used 64/3/8/0.5 -- ~15-45x weaker -> drastically
-    # under-optimized in the 5x30=150-d action-sequence space.
+    # CEM solver defaults match LeWM's cube config (stable_worldmodel solver/cem.yaml + cube.yaml:
+    # 300 samples / 30 iters / 30 elites / var_scale=1.0; horizon=receding_horizon=5 -> open-loop).
     p.add_argument("--cem-samples", type=int, default=300, help="CEM action samples per iter (per env); LeWM=300")
-    p.add_argument("--cem-iters", type=int, default=10, help="CEM refit iterations; LeWM=10 (30 for PushT)")
-    p.add_argument("--cem-elites", type=int, default=30, help="CEM elite count (top-k lowest cost); LeWM=30")
-    p.add_argument("--cem-init-std", type=float, default=1.0, help="CEM initial action std; LeWM init var=1.0")
-    p.add_argument("--cem-min-std", type=float, default=0.1, help="CEM elite-refit std floor")
+    p.add_argument("--cem-iters", type=int, default=30, help="CEM refit iterations (LeWM cem.yaml n_steps=30)")
+    p.add_argument("--cem-elites", type=int, default=30, help="CEM elite count (top-k lowest cost); LeWM topk=30")
+    p.add_argument("--cem-init-std", type=float, default=1.0, help="CEM initial action std; LeWM var_scale=1.0")
+    p.add_argument("--cem-min-std", type=float, default=0.1,
+                   help="DEPRECATED / ignored: LeWM uses no elite-refit std floor (kept for launch-arg compat).")
     p.add_argument("--cem-horizon", type=int, default=5,
-                   help="CEM planning horizon H (block-decisions): minimize terminal ||zhat_H - z*||^2 "
-                        "via autoregressive WM rollout, execute the first action (MPC). Longer = more "
-                        "lookahead but more rollout bias (this WM is 1-step trained).")
+                   help="CEM planning horizon H (block-decisions): minimize terminal ||zhat_H - z*||^2 via "
+                        "autoregressive WM rollout. Executed OPEN-LOOP, LeWM-style (receding_horizon == H): "
+                        "plan H, execute all H, re-plan when the buffer empties / env resets / goals refresh. "
+                        "Set H=1 for replan-every-step. Longer H = more lookahead but more rollout bias "
+                        "(this WM is 1-step trained).")
     p.add_argument("--gamma", type=float, default=0.9)
     p.add_argument("--tau", type=float, default=0.005, help="Polyak rate (SAC-style target critic)")
     p.add_argument("--actor-lr", type=float, default=3e-4)
