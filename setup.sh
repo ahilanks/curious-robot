@@ -115,6 +115,140 @@ ensure_claude_cli() {
     export PATH="$HOME/.local/bin:$PATH"
 }
 
+ensure_pushover_hook() {
+    # Pushover phone/laptop notifications for Claude Code (done responding / needs input).
+    # Credentials come from .env (PUSHOVER_TOKEN / PUSHOVER_USER, loaded above). The hook
+    # is always wired; notifications stay off until those two vars are set.
+    local cdir="${HOME}/.claude"
+    mkdir -p "${cdir}/hooks"
+
+    if ! have_cmd jq; then
+        echo "Installing jq (needed by the notification hook)"
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update && apt-get install -y jq || true
+    fi
+
+    cat > "${cdir}/hooks/pushover-notify.sh" <<'NOTIFY_EOF'
+#!/usr/bin/env bash
+# Claude Code -> Pushover notification hook.
+# Usage:  pushover-notify.sh stop | notification   (hook JSON on stdin)
+EVENT="${1:-stop}"
+INPUT="$(cat)"
+
+if [ -z "${PUSHOVER_TOKEN:-}" ] || [ -z "${PUSHOVER_USER:-}" ]; then
+  [ -f "$HOME/.claude/pushover.env" ] && . "$HOME/.claude/pushover.env"
+fi
+if [ -z "${PUSHOVER_TOKEN:-}" ] || [ -z "${PUSHOVER_USER:-}" ]; then
+  exit 0
+fi
+
+host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)"
+cwd="$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)"
+[ -z "$cwd" ] && cwd="$PWD"
+project="$(basename "$cwd" 2>/dev/null || echo session)"
+
+sid="$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)"
+[ -z "$sid" ] && sid="default"
+STATE_DIR="$HOME/.claude/.notif-state"
+marker="$STATE_DIR/$(printf '%s' "$sid" | tr -c 'A-Za-z0-9._-' '_').notified"
+
+tp="$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)"
+if [ -z "$tp" ] || [ ! -f "$tp" ]; then
+  [ "$sid" != "default" ] && tp="$(find "$HOME/.claude/projects" -type f -name "${sid}.jsonl" 2>/dev/null | head -1)"
+fi
+
+JQ_ACTION='
+  def short($s): if ($s|length) > 160 then ($s[0:159] + "…") else $s end;
+  def detail:
+    .name as $n | (.input // {}) as $i |
+    if   $n=="Bash" then "Run: " + ($i.command // $i.description // "command")
+    elif ($n=="Edit" or $n=="MultiEdit") then "Edit " + ($i.file_path // "")
+    elif $n=="Write" then "Write " + ($i.file_path // "")
+    elif $n=="Read" then "Read " + ($i.file_path // "")
+    elif $n=="NotebookEdit" then "Edit " + ($i.notebook_path // "")
+    elif $n=="WebFetch" then "Fetch " + ($i.url // "")
+    elif $n=="WebSearch" then "Search: " + ($i.query // "")
+    elif $n=="Grep" then "Grep: " + ($i.pattern // "")
+    elif $n=="Glob" then "Glob: " + ($i.pattern // "")
+    elif $n=="Task" then "Task: " + ($i.description // "")
+    elif $n=="AskUserQuestion" then "Question: " + ((try $i.questions[0].question catch "") // "")
+    else $n + ": " + (([$i[]? | select(type=="string")][0]) // "") end;
+  select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") | short(detail)
+'
+
+if [ "$EVENT" = "notification" ]; then
+  msg="$(printf '%s' "$INPUT" | jq -r '.message // empty' 2>/dev/null | tr '\n' ' ' | cut -c1-200)"
+  case "$msg" in
+    *[Ww]aiting*|*[Ii]dle*) exit 0 ;;
+  esac
+  [ -f "$marker" ] && exit 0
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  : > "$marker"
+  action=""
+  [ -n "$tp" ] && [ -f "$tp" ] && action="$(jq -r "$JQ_ACTION" "$tp" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -1)"
+  if [ -n "$action" ]; then
+    msg="$action"
+  else
+    msg="$(printf '%s' "$msg" | sed 's/^Claude //')"
+    [ -z "$msg" ] && msg="needs your input"
+  fi
+  title="⏳ ${project}@${host}"
+  priority=1
+else
+  rm -f "$marker" 2>/dev/null
+  find "$STATE_DIR" -type f -mtime +7 -delete 2>/dev/null
+  msg=""
+  if [ -n "$tp" ] && [ -f "$tp" ]; then
+    msg="$(jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | (.text | gsub("\n";" "))' "$tp" 2>/dev/null | sed 's/`//g; s/#\{1,6\} //g; s/  */ /g' | grep -v '^[[:space:]]*$' | tail -1 | cut -c1-200)"
+  fi
+  [ -z "$msg" ] && msg="finished responding"
+  title="✅ ${project}@${host}"
+  priority=0
+fi
+
+msg="${msg//"$cwd"\//}"
+msg="${msg//"$HOME"/~}"
+
+curl -sf --max-time 10 \
+  --form-string "token=${PUSHOVER_TOKEN}" \
+  --form-string "user=${PUSHOVER_USER}" \
+  --form-string "title=${title}" \
+  --form-string "message=${msg}" \
+  --form-string "priority=${priority}" \
+  https://api.pushover.net/1/messages.json >/dev/null 2>&1
+exit 0
+NOTIFY_EOF
+    chmod +x "${cdir}/hooks/pushover-notify.sh"
+
+    if [[ -n "${PUSHOVER_TOKEN:-}" && -n "${PUSHOVER_USER:-}" ]]; then
+        touch "${cdir}/pushover.env"; chmod 600 "${cdir}/pushover.env"
+        cat > "${cdir}/pushover.env" <<ENV_EOF
+PUSHOVER_TOKEN=${PUSHOVER_TOKEN}
+PUSHOVER_USER=${PUSHOVER_USER}
+export PUSHOVER_TOKEN PUSHOVER_USER
+ENV_EOF
+        chmod 600 "${cdir}/pushover.env"
+        echo "  Pushover credentials -> ~/.claude/pushover.env"
+    else
+        echo "  PUSHOVER_TOKEN/PUSHOVER_USER not in .env -- hook installed, notifications off"
+    fi
+
+    local settings="${cdir}/settings.json"
+    [[ -f "$settings" ]] || echo '{}' > "$settings"
+    if have_cmd jq; then
+        local tmp; tmp="$(mktemp)"
+        if jq '.hooks.Stop = [{"hooks":[{"type":"command","command":"bash \"$HOME/.claude/hooks/pushover-notify.sh\" stop","async":true}]}]
+               | .hooks.Notification = [{"hooks":[{"type":"command","command":"bash \"$HOME/.claude/hooks/pushover-notify.sh\" notification","async":true}]}]' \
+               "$settings" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$settings"
+            echo "  Claude Code Stop/Notification hooks -> Pushover"
+        else
+            rm -f "$tmp"
+            echo "  WARNING: could not update $settings (left as-is)"
+        fi
+    fi
+}
+
 ensure_mujoco_python() {
     if python3 -c "import mujoco" >/dev/null 2>&1; then return; fi
     echo "Installing MuJoCo Python package"
@@ -180,6 +314,7 @@ ensure_gh_cli
 ensure_bwrap
 ensure_hf_cli
 ensure_claude_cli
+ensure_pushover_hook
 
 echo ""
 echo "=== Auth Check ==="
