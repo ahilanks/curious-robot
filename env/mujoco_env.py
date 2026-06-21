@@ -83,6 +83,7 @@ class MujocoSO101Env:
         respawn_z_padding: float = 0.001,
         table_drop_threshold: float = -0.10,
         seed: int = 0,
+        fixed_objects: bool = False,             # place objects deterministically (same layout EVERY env & reset)
     ):
         self.model = mujoco.MjModel.from_xml_path(str(scene_path))
         self.data = mujoco.MjData(self.model)
@@ -152,6 +153,11 @@ class MujocoSO101Env:
         self._wrist_renderer = mujoco.Renderer(self.model, height=wrist_resolution, width=wrist_resolution)
         self._overhead_renderer = mujoco.Renderer(self.model, height=overhead_resolution, width=overhead_resolution)
         self.rng = np.random.default_rng(seed)
+        # Fixed-object mode: draw the object layout from a CONSTANT seed so every env (regardless of
+        # its own `seed`) and every reset gets the IDENTICAL scene -- collapses visual variance to just
+        # the arm, so the encoder/WM has a far easier (LeWM-cube-like) target. See randomise_all_objects.
+        self.fixed_objects = bool(fixed_objects)
+        self._fixed_obj_seed = 12345
         self._prev_ctrl = np.zeros(self.n_dof, dtype=np.float64)
         self._prev_qvel = np.zeros(self.n_dof, dtype=np.float32)
         self._prev_obj_xpos = np.zeros((n_objects, 3), dtype=np.float64)
@@ -228,20 +234,38 @@ class MujocoSO101Env:
         self.data.qvel[vel_addr:vel_addr + 6] = 0.0
 
     def randomise_all_objects(self) -> None:
-        for i in range(self.n_objects):
-            v = self._object_qvel_addrs[i]
-            self.data.qvel[v:v + 6] = 0.0
-        placed: list[int] = []
-        for i in range(self.n_objects):
-            self._place_object_safely(i, placed)
-            placed.append(i)
+        # fixed_objects: place from a CONSTANT-seed generator so the layout (positions, sizes, colors,
+        # orientations, and the deterministic collision-retry path) is byte-identical across every env
+        # and every reset. Restore the per-env rng afterwards so arm noise etc. stays per-env.
+        saved_rng = None
+        if self.fixed_objects:
+            saved_rng, self.rng = self.rng, np.random.default_rng(self._fixed_obj_seed)
+        try:
+            for i in range(self.n_objects):
+                v = self._object_qvel_addrs[i]
+                self.data.qvel[v:v + 6] = 0.0
+            placed: list[int] = []
+            for i in range(self.n_objects):
+                self._place_object_safely(i, placed)
+                placed.append(i)
+        finally:
+            if saved_rng is not None:
+                self.rng = saved_rng
 
     # --- Lifecycle ------------------------------------------------------------
 
     def reset(self) -> dict[str, np.ndarray]:
         mujoco.mj_resetData(self.model, self.data)
-        self.data.qpos[:self.n_dof] = self.rng.normal(0.0, 0.02, size=self.n_dof)
-        self.randomise_all_objects()
+        if self.fixed_objects:
+            # Place objects against a FIXED (zero) arm pose so the layout can't vary with the per-env
+            # arm jitter; re-add the small arm-start noise AFTER placement (blocks stay identical, arm
+            # keeps per-env diversity).
+            self.data.qpos[:self.n_dof] = 0.0
+            self.randomise_all_objects()
+            self.data.qpos[:self.n_dof] = self.rng.normal(0.0, 0.02, size=self.n_dof)
+        else:
+            self.data.qpos[:self.n_dof] = self.rng.normal(0.0, 0.02, size=self.n_dof)
+            self.randomise_all_objects()
         self._prev_ctrl = self.data.qpos[:self.n_dof].copy().astype(np.float64)
         self.data.ctrl[:] = self._prev_ctrl
         mujoco.mj_forward(self.model, self.data)

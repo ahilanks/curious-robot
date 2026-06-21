@@ -402,7 +402,7 @@ def score_obs_mse(wm, gpx, gprop, spx, sprop, sact, device, H):
 
 
 @torch.no_grad()
-def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, device):
+def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, device, diag=None):
     """CEM planner in LATENT space -- a faithful port of LeWM's stable_worldmodel.solver.CEMSolver
     (+ JEPA.rollout/criterion). Per replan: sample H-step action SEQUENCES from a per-step Gaussian,
     FORCE candidate 0 = the current mean (LeWM's candidates[:,0]=mean), roll each AUTOREGRESSIVELY
@@ -427,17 +427,39 @@ def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, dev
     # (autocast leaves reductions in fp32). No-op off-CUDA.
     amp = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
            if device.type == "cuda" else contextlib.nullcontext())
+    predict = getattr(wm, "predict_eager", wm.predict)   # EAGER: torch.compile + bf16 autocast -> NaN rollout
     with amp:
-        for _ in range(iters):
+        for it in range(iters):
             seq = mu.unsqueeze(1) + std.unsqueeze(1) * torch.randn(n, K, T, a_dim, device=device)
             seq[:, 0] = mu                                            # LeWM: force candidate 0 = current mean
             sf = seq.reshape(n * K, T, a_dim)
             z_seq, a_seq = z0, a0                                         # (n*K, Hb, .) growing rollout buffers
             for h in range(T):                                           # autoregressive WM rollout
                 a_seq = torch.cat([a_seq, sf[:, h:h + 1]], dim=1)        # apply candidate action a_{t+h}
-                znext = wm.predict(z_seq[:, -Hb:], wm.action_encoder(a_seq[:, -Hb:]))[:, -1:]
+                znext = predict(z_seq[:, -Hb:], wm.action_encoder(a_seq[:, -Hb:]))[:, -1:]
                 z_seq = torch.cat([z_seq, znext], dim=1)                 # append predicted z_{t+h+1}
             cost = (z_seq[:, -1] - zg).pow(2).sum(-1).reshape(n, K)      # terminal ||.||^2 (LeWM: SUM over dims)
+            if diag is not None and it == 0:
+                # action-sensitivity probe on the FIRST (widest, std=init_std) candidate batch:
+                #   cost_cv       = spread of terminal cost across candidates (~0 => CEM has no signal to optimize)
+                #   z_term_spread = RMS spread of the predicted terminal latent across candidates, i.e. how far
+                #                   different ACTIONS move the endpoint (~0 => WM rollout ignores the action)
+                #   reach_gap     = current ||z - z*||; if z_term_spread << reach_gap the goal is unreachable
+                #                   no matter the action (the WM can't move the latent far enough).
+                with torch.no_grad():
+                    c = cost.float()
+                    fin = torch.isfinite(c)                              # wide candidates can DIVERGE (inf/nan)
+                    diag["finite_frac"] = float(fin.float().mean())      # frac of candidates the WM rolled out finitely
+                    cm = torch.where(fin, c, torch.full_like(c, float("nan")))
+                    mean = cm.nanmean(1)
+                    std = (cm - mean[:, None]).pow(2).nanmean(1).sqrt()
+                    diag["cost_cv"] = float((std / (mean.abs() + 1e-9)).nanmean())
+                    zt = z_seq[:, -1].float().reshape(n, K, D)
+                    zt = torch.where(torch.isfinite(zt), zt, torch.full_like(zt, float("nan")))
+                    zvar = (zt - zt.nanmean(1, keepdim=True)).pow(2).nanmean(1).clamp_min(0)   # (n, D)
+                    diag["z_term_spread"] = float(zvar.sum(-1).sqrt().nanmean())
+                    z_now = z0.reshape(n, K, Hb, D)[:, 0, -1]
+                    diag["reach_gap"] = float((z_now - z_goal).pow(2).sum(-1).clamp_min(0).sqrt().mean())
             idx = cost.topk(elite, largest=False, dim=1).indices
             el = torch.gather(seq, 1, idx[:, :, None, None].expand(n, elite, T, a_dim))
             mu = el.mean(1)
@@ -895,6 +917,11 @@ def main(args):
                       action_max=args.action_max, encode_cam=args.wm_cam,
                       safety_delta=args.safety_delta, seed=args.seed,
                       threads=args.env_threads)
+    if args.env_backend != "hardware":     # sim only: identical deterministic object layout across envs
+        env_kwargs["fixed_objects"] = args.fixed_objects
+        if args.fixed_objects:
+            print("[env] fixed-objects ON: identical deterministic scene for every env & reset "
+                  "(variance = arm only)", flush=True)
     if args.env_backend == "subproc":      # GPU EGL render only in the CUDA-free subproc workers
         env_kwargs["render_backend"] = args.render_backend
         print(f"[render] subproc workers render via {args.render_backend.upper()} "
@@ -913,16 +940,35 @@ def main(args):
         except Exception as ex:
             print(f"[wm] grad checkpoint not enabled: {ex}", flush=True)
     wm.eval()                                  # train() only inside wm_update
+    if args.freeze_encoder:
+        # Stop-gradient on the obs->z encoder (StateEncoder): the latent SPACE becomes STATIONARY
+        # (no more SIGReg inflation / encoder drift), so CEM plans against a FIXED geometry --
+        # LeWM-style frozen WM. The predictor/action_encoder/pred_proj keep training to sharpen
+        # rollouts IN that fixed latent. Done BEFORE wm_opt so the optimizer excludes these params;
+        # the encoder is also kept in eval() during wm_update (dropout off -> deterministic z).
+        for p in wm.encoder.parameters():
+            p.requires_grad_(False)
+        wm.encoder.eval()
+        nfz = sum(p.numel() for p in wm.encoder.parameters()) / 1e6
+        if not (args.init_ckpt or args.resume_name):
+            print("[freeze] WARNING: --freeze-encoder without --resume-name/--init-ckpt freezes a "
+                  "RANDOM encoder (the latent never learns) -- resume from a checkpoint.", flush=True)
+        print(f"[freeze] encoder frozen (stop-grad): {nfz:.2f}M params; latent STATIONARY. "
+              f"Predictor + action_encoder still train.", flush=True)
+    wm.predict_eager = wm.predict          # uncompiled ref -- the CEM bf16 rollout MUST use this:
+                                           # torch.compile + bf16 autocast miscompiles wm.predict to NaN
+                                           # (verified 2026-06-21), which silently makes CEM a no-op
+                                           # (all candidate costs NaN -> topk arbitrary -> random plan).
     if device.type == "cuda" and not args.no_compile:
-        # wm.predict is the CEM inner loop (called 10x5 times/decision); compile fuses the kernels
-        # and cuts launch overhead. dynamic=True tolerates the changing batch/H shapes (CEM 2400 vs
-        # wm_update 128, H_fwd curriculum); suppress_errors falls back to eager on any graph break
-        # so a long run never dies on a compile issue.
+        # compile only helps wm_update's fp32 rollout here (CEM is compute- not launch-bound, ~1.0x);
+        # the CEM rollout stays EAGER (predict_eager) because compile+bf16 -> NaN. dynamic=True tolerates
+        # the changing batch/H shapes; suppress_errors falls back to eager on any graph break.
         try:
             import torch._dynamo as _dynamo      # NB: `import torch._dynamo` would bind `torch` local to main()
             _dynamo.config.suppress_errors = True
             wm.predict = torch.compile(wm.predict, dynamic=True)
-            print("[wm] torch.compile(wm.predict) ON (dynamic; dynamo errors -> eager fallback)", flush=True)
+            print("[wm] torch.compile(wm.predict) ON for training; CEM rollout uses EAGER predict "
+                  "(compile+bf16 autocast miscompiles to NaN)", flush=True)
         except Exception as ex:
             print(f"[wm] torch.compile disabled ({ex})", flush=True)
     sigreg = SIGReg(knots=17, num_proj=1024).to(device)
@@ -1052,6 +1098,7 @@ def main(args):
     cem_H = max(args.cem_horizon, 1)
     cem_buf = torch.zeros(args.n_envs, cem_H, a_dim, device=device)
     cem_ptr = np.full(args.n_envs, cem_H, np.int64)
+    cem_diag = {}                                     # latest CEM action-sensitivity probe (cem/cost_cv, z_term_spread, reach_gap)
     knn_buf = torch.zeros(0, z_dim, device=device)    # recent-latent ring buffer for the k-NN coverage reward (--lambda-knn)
     is_start = np.ones(args.n_envs, bool)
     ep_len = np.zeros(args.n_envs, np.int64)
@@ -1064,7 +1111,7 @@ def main(args):
     zstar_env = torch.zeros(args.n_envs, z_dim, device=device)
     has_goal = np.zeros(args.n_envs, bool)
     goal_evictions = 0
-    goal_recent = ({k: deque(maxlen=400) for k in ("dist", "reach")}
+    goal_recent = ({k: deque(maxlen=400) for k in ("dist", "reach", "qdist", "qsucc")}
                    if args.goal_explore else None)
 
     def reach_eps_now(step):
@@ -1139,6 +1186,8 @@ def main(args):
             batch = buf.sample_wm(args.wm_batch_size, H + h_fwd)
             if batch is not None:
                 wm.train()
+                if args.freeze_encoder:
+                    wm.encoder.eval()          # keep the frozen encoder deterministic (dropout off)
                 last_wm = wm_update(wm, sigreg, wm_opt, batch, H, h_fwd,
                                     args.gamma_wm, args.sigreg_weight, device)
                 wm.eval()
@@ -1216,6 +1265,15 @@ def main(args):
                     gdist = (z - zstar_env).norm(dim=-1).cpu().numpy()       # ||z_t - z*|| per env
                     goal_recent["dist"].append(float(gdist[has_goal].mean()))
                     goal_recent["reach"].append(float((gdist[has_goal] < reach_eps_now(step)).mean()))
+                    # LeWM-reacher-style PHYSICAL success: a goal is reached when EVERY joint is within
+                    # eps radians of the goal's stored qpos (cf. ReacherQPosMatchTask: |q-q*|<0.05 all
+                    # joints). Joint-space companion to the latent reach_rate above, which sits on a
+                    # SIGReg-drifting z-scale (~22 for random pairs) and rarely fires. proprio is raw
+                    # [qpos, qvel, u]; qpos = first n_dof, same units in obs and the goal archive.
+                    qd = np.abs(obs["proprio"][:, :n_dof] - goal_prop_env[:, :n_dof])     # (n_envs, n_dof) |dq| rad
+                    goal_recent["qdist"].append(float(qd[has_goal].mean()))               # mean per-joint err (rad)
+                    goal_recent["qsucc"].append(
+                        float(np.all(qd[has_goal] < args.goal_success_qpos_eps, axis=1).mean()))
 
         # --- act: SAC stochastic sample during sim training (the entropy-driven exploration
         #     that un-parks the policy and decorrelates the parallel envs), the DETERMINISTIC
@@ -1238,7 +1296,7 @@ def main(args):
                     rt = torch.as_tensor(ridx, device=device)
                     cem_buf[rt] = cem_plan(wm, hist_z[:, rt], hist_a[:, rt], zstar_env[rt],
                                            args.cem_samples, args.cem_iters, args.cem_elites,
-                                           args.cem_init_std, args.cem_horizon, device)
+                                           args.cem_init_std, args.cem_horizon, device, diag=cem_diag)
                     cem_ptr[ridx] = 0
                 a = cem_buf[torch.arange(args.n_envs, device=device),
                             torch.as_tensor(cem_ptr, device=device)].clamp(-1.0, 1.0)  # safety: bound to trained range
@@ -1476,6 +1534,13 @@ def main(args):
                  "explore/pose_step": np.mean(recent["pose_step"]),     # joint travel/decision; ~0 = parked
                  "buffer/transitions": buf.total, "perf/steps_per_sec": sps,
                  "wm/h_fwd": h_fwd}
+            if args.cem and cem_diag:        # CEM action-sensitivity probe (computed in cem_plan, iter 0)
+                d["cem/cost_cv"] = cem_diag.get("cost_cv", float("nan"))             # ~0 => no optimization signal
+                d["cem/z_term_spread"] = cem_diag.get("z_term_spread", float("nan")) # how far actions move the endpoint
+                d["cem/reach_gap"] = cem_diag.get("reach_gap", float("nan"))         # current ||z - z*||
+                d["cem/finite_frac"] = cem_diag.get("finite_frac", float("nan"))     # frac of CEM candidates rolled out finite
+                _rg = cem_diag.get("reach_gap", 0.0)
+                d["cem/move_vs_gap"] = (cem_diag["z_term_spread"] / _rg) if _rg > 1e-9 else float("nan")
             if args.goal_explore:
                 d["goal/archive_size"] = archive.n
                 d["goal/archive_mse_mean"] = archive.mean_score()
@@ -1485,6 +1550,12 @@ def main(args):
                 if goal_recent["reach"]:
                     d["goal/reach_rate"] = float(np.mean(goal_recent["reach"]))
                 d["goal/reach_eps"] = float(reach_eps_now(step))    # live (annealed) reach threshold
+                # LeWM-reacher-style physical (joint-space) success, alongside the latent reach above
+                if goal_recent["qsucc"]:
+                    d["goal/success_rate_qpos"] = float(np.mean(goal_recent["qsucc"]))
+                if goal_recent["qdist"]:
+                    d["goal/qpos_dist"] = float(np.mean(goal_recent["qdist"]))   # mean per-joint |dq| (rad)
+                d["goal/success_qpos_eps"] = float(args.goal_success_qpos_eps)
             if recent_qpos:    # how much of joint space the recent window covers (parked -> ~0)
                 qarr = np.stack(recent_qpos)                            # (T, n_envs, n_dof)
                 d["explore/pose_spread"] = float(qarr.std(0).mean())    # mean temporal std over joints/envs
@@ -1534,6 +1605,8 @@ def main(args):
                 print(f"[step {step}] cur_contrib={cur_m:.3f} "
                       f"dist_goal={d.get('goal/dist_to_goal', float('nan')):.2f} "
                       f"reach={d.get('goal/reach_rate', 0.0):.2f} "
+                      f"qsucc={d.get('goal/success_rate_qpos', 0.0):.2f} "
+                      f"qdist={d.get('goal/qpos_dist', float('nan')):.2f} "
                       f"archive={archive.n} evict={goal_evictions} "
                       f"crit_loss={d.get('sac/critic_loss', float('nan')):.2f} "
                       f"contacts/s={d['interact/contacts_per_step']:.2f} "
@@ -1614,6 +1687,11 @@ def parse_args():
                         "inproc: envs in this process (sequential or --env-threads); "
                         "hardware: one physical SO-ARM101 via env/hardware_env.py (forces n_envs=1)")
     p.add_argument("--frame-skip", type=int, default=6)
+    p.add_argument("--fixed-objects", action="store_true",
+                   help="place all scene objects at an IDENTICAL deterministic layout for every env and "
+                        "every reset (constant-seed positions/sizes/colors/orientations, placed against a "
+                        "fixed arm pose). Collapses scene variance to just the arm -> a much easier "
+                        "(LeWM-cube-like) target for the encoder/WM. Sim only.")
     p.add_argument("--render-backend", choices=("egl", "osmesa"), default="egl",
                    help="offscreen render backend for the CUDA-free subproc env workers. 'egl' (default) = "
                         "GPU offscreen render, ~0.3ms vs osmesa's ~35ms per 224^2 frame (~100x; overhead-cam "
@@ -1666,6 +1744,13 @@ def parse_args():
                    help="disable torch.compile(wm.predict) (the CEM-rollout speedup); use if compile "
                         "is flaky on this box. CUDA only; compile is on by default there.")
     p.add_argument("--history-size", type=int, default=3, help="H_bwd")
+    p.add_argument("--freeze-encoder", action="store_true",
+                   help="stop-gradient on the obs->z encoder (StateEncoder): freeze the latent SPACE so "
+                        "CEM plans against a STATIONARY geometry (LeWM-style frozen WM; stops the SIGReg "
+                        "latent-scale drift that makes ||z-z*|| meaningless). Predictor + action_encoder keep "
+                        "training to sharpen rollouts in that fixed latent. Intended WITH --resume-name/"
+                        "--init-ckpt (else it freezes a random encoder). Excluded from the WM optimizer and "
+                        "kept in eval() so the encoder is fully deterministic.")
     p.add_argument("--h-fwd-start", type=int, default=1)
     p.add_argument("--h-fwd-max", type=int, default=1,
                    help="max forward rollout horizon; ==start (1) pins the WM to 1-step-ahead "
@@ -1830,6 +1915,12 @@ def parse_args():
                         "NOTE: reach_rate is a DIAGNOSTIC only -- it does not affect collection or planning.")
     p.add_argument("--goal-reach-eps-anneal-frac", type=float, default=0.5,
                    help="fraction of --total-steps over which --goal-reach-eps-start anneals to --goal-reach-eps.")
+    p.add_argument("--goal-success-qpos-eps", type=float, default=0.05,
+                   help="LeWM-reacher-style PHYSICAL success threshold (radians): a goal counts as reached "
+                        "when EVERY joint is within this many rad of the goal's stored qpos "
+                        "(logged as goal/success_rate_qpos + goal/qpos_dist). LeWM's reacher uses 0.05. "
+                        "Joint-space analogue of the latent goal/reach_rate; DIAGNOSTIC only (does not "
+                        "affect planning/collection).")
     p.add_argument("--td3-target-noise", type=float, default=0.0,
                    help="optional TD3 target-policy smoothing: std of clipped noise added to the TARGET action in "
                         "the critic update only (not a collection action). 0 = pure deterministic (DDPG).")

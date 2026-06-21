@@ -51,6 +51,7 @@ class VectorMujocoEnv:
         safety_delta: float = 9.0,
         seed: int = 0,
         threads: int = 0,                # 0 = sequential
+        fixed_objects: bool = False,
     ):
         self.n_envs = n_envs
         self.envs = [
@@ -63,6 +64,7 @@ class VectorMujocoEnv:
                 action_max=action_max,
                 safety_delta=safety_delta,
                 seed=seed + i,
+                fixed_objects=fixed_objects,
             )
             for i in range(n_envs)
         ]
@@ -288,14 +290,16 @@ class SubprocVectorMujocoEnv:
                  wrist_resolution: int = 224, overhead_resolution: int = 256,
                  encode_cam: str = "wrist", render_backend: str = "egl",
                  frame_skip: int = 6, action_max: float = 0.3,
-                 safety_delta: float = 9.0, seed: int = 0, threads: int = 0):
+                 safety_delta: float = 9.0, seed: int = 0, threads: int = 0,
+                 fixed_objects: bool = False):
         self.n_envs = n_envs                           # `threads` taken for API parity
         self.wrist_resolution = wrist_resolution
         self.overhead_resolution = overhead_resolution
         base = dict(scene_path=str(scene_path), wrist_resolution=wrist_resolution,
                     overhead_resolution=overhead_resolution, encode_cam=encode_cam,
                     frame_skip=frame_skip,
-                    action_max=action_max, safety_delta=safety_delta)
+                    action_max=action_max, safety_delta=safety_delta,
+                    fixed_objects=fixed_objects)
         ctx = mp.get_context("spawn")                  # fresh procs => no inherited CUDA
         with _render_worker_spawn_env(render_backend):
             self._workers = [_EnvWorker(ctx, dict(base, seed=seed + i))
