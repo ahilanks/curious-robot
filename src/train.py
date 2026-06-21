@@ -552,7 +552,15 @@ def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device):
         mbl = sum((gamma_wm ** k)
                   * (emb[:, H_bwd - 1 + k].mean(0, keepdim=True) - emb[:, H_bwd - 1 + k]).pow(2).mean()
                   for k in range(1, h + 1)) / wsum
-    sig = sigreg(emb.transpose(0, 1))                      # (T,B,D)
+    # SIGReg over the FULL rollout window pooled into ONE sample axis: (B,T,D) -> (1, B*T, D).
+    # B*T (>=512 at the default 128 batch) > D=256, so the isotropy test spans the whole latent
+    # space each step; the old per-timestep (T,B,D) view fed it B=128<256 samples, leaving >=128
+    # latent directions unconstrained every update. The Epps-Pulley statistic already scales by n
+    # (the *proj.size(-2) in SIGReg), which makes it sample-count-invariant under the isotropic
+    # null -- so pooling needs NO beta retune (matches the pre-pool magnitude when z is healthy)
+    # and, because the *n factor tracks the (systematic) non-Gaussianity of a collapsed z, it
+    # pushes ~T x harder precisely when rank is low. No /T: that would just weaken SIGReg ~T-fold.
+    sig = sigreg(emb.reshape(1, B * T, -1))
     loss = pred_loss + beta * sig
     opt.zero_grad(); loss.backward()
     torch.nn.utils.clip_grad_norm_([p for p in wm.parameters() if p.requires_grad], 1.0)
