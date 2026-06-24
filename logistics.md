@@ -756,3 +756,17 @@ Closes the `--cem` goal-explore line (Go-Explore: a CEM controller plans H=5 lat
 **Fix direction (untested): representation/data, NOT planner, goals, camera, or sigreg.** Either smooth the action regime / train the encoder on smoother (less novelty-biased) trajectories, or add an explicit slowness / temporal-contrastive term to FORCE the locality the data isn't providing.
 
 **Instrumented (`src/train.py`, this commit):** new `encoder/step_jump` = windowed mean `‖z_t − z_{t+1}‖` and `encoder/step_jump_frac_rand` = step_jump / √(2·z_dim) — watch latent temporal locality directly. ~1.0 = no locality (current); LeWM cube was ~0.09.
+
+## 2026-06-24 — slowness term & action_max schedule TESTED → neither fixes planning
+
+Implemented `--lambda-slow` (penalize mean-sq per-step latent jump `‖z_t−z_{t+1}‖²` on real consecutive encoded frames in `wm_update`; SIGReg anchors against the dz→0 collapse) + an action_max schedule (`--action-max-start-frac`/`--action-max-warmup-steps`, ramp effective amplitude small→full) + `--sigreg-pertimestep`.
+
+**Calibration:** SIGReg DOMINATES the WM loss — `wm/sigreg`≈26 → β·sig≈2.35 vs pred_loss≈0.50 (≈5:1). λ must compete with that; λ=0.3 was ~8× too weak (null result).
+
+**Locality sweep (h_fwd_max=1, settle ~3k; corr = step_jump/(√(2D)·z_std); baseline 0.85, LeWM 0.09):** λ=3→0.67 (rank .25), 5→0.65 (.21), 10→0.52 (.185), 20→0.34 (.15). Monotonic; rank declines gracefully (SIGReg holds the floor, no hard collapse); pred_loss improves 0.50→0.11. So the term reliably bends the *locality metric*.
+
+**action_max SCHEDULE = FAILS.** Ramping amplitude 0.1→1.0, step_jump tracks amplitude in REAL TIME (4→17.5 lockstep; corr 0.50@amp0.64 → 0.82@amp1.0 = baseline), no lock-in. Locality ≈ a real-time function of per-step physical change, not a learnable-then-frozen property.
+
+**Goal-reaching payoff sweep (h_fwd_max=5, 12k steps, λ∈{0,10,20}) → NO λ FIXES PLANNING.** `reach_rate`~0 and normalized `dist_to_goal` flat ~21 for ALL λ. Worse, the slowness term SHRINKS CEM steerability: `cem/z_term_spread` fell from 0.48 (λ=0) to 0.17 (λ=20) of the latent diameter (normalized), while goals sit ~0.93 of the diameter away ⇒ the more-local latent is *LESS* reachable.
+
+**KEY INSIGHT:** the slowness PENALTY achieves locality by shrinking ALL latent motion uniformly — including the action-controllable component — so the latent becomes local but UNSTEERABLE. LeWM's locality is DATA-driven (smooth purposeful expert trajectories): consecutive frames are close yet different actions still lead to meaningfully different places, so locality AND steerability coexist. ⇒ the fix is DATA-side (smoother purposeful online behavior / less novelty-biased buffer), NOT a loss penalty. (SIGReg batch composition also RULED OUT: per-timestep vs pooled = 0.85≈0.85.) NEXT: data/behavior levers — action-rate *smoothness* (not amplitude), and code-level encoder diffs vs LeWM.
