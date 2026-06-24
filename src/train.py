@@ -561,7 +561,7 @@ def rnd_novelty_reward(rnd_pred, rnd_target, img84, prop):
     return (rnd_pred(img84, prop) - rnd_target(img84, prop)).pow(2).mean(-1)
 
 
-def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device):
+def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device, pertimestep=False, lambda_slow=0.0):
     """One AdamW step on L_wm = discounted plain-MSE autoregressive rollout + beta*SIGReg
     (LeWM-style: mean squared error per step over batch+feature dims, no symlog)."""
     px, prop, ac = batch
@@ -604,8 +604,11 @@ def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device):
     # null -- so pooling needs NO beta retune (matches the pre-pool magnitude when z is healthy)
     # and, because the *n factor tracks the (systematic) non-Gaussianity of a collapsed z, it
     # pushes ~T x harder precisely when rank is low. No /T: that would just weaken SIGReg ~T-fold.
-    sig = sigreg(emb.reshape(1, B * T, -1))
-    loss = pred_loss + beta * sig
+    sig = (sigreg(emb.transpose(0, 1))                  # LeWM per-timestep (T,B,D): isotropize each step's
+           if pertimestep else                          # cross-trajectory batch; never pools consecutive frames
+           sigreg(emb.reshape(1, B * T, -1)))           # default: pool the rollout window (B*T>D for the rank test)
+    dz = (emb[:, 1:] - emb[:, :-1]).pow(2).mean()       # slowness: mean sq per-step latent jump (real frames)
+    loss = pred_loss + beta * sig + lambda_slow * dz    # SIGReg anchors against the dz->0 collapse
     opt.zero_grad(); loss.backward()
     torch.nn.utils.clip_grad_norm_([p for p in wm.parameters() if p.requires_grad], 1.0)
     opt.step()
@@ -1289,7 +1292,9 @@ def main(args):
                 if args.freeze_encoder:
                     wm.encoder.eval()          # keep the frozen encoder deterministic (dropout off)
                 last_wm = wm_update(wm, sigreg, wm_opt, batch, H, h_fwd,
-                                    args.gamma_wm, args.sigreg_weight, device)
+                                    args.gamma_wm, args.sigreg_weight, device,
+                                    pertimestep=args.sigreg_pertimestep,
+                                    lambda_slow=args.lambda_slow)
                 wm.eval()
                 pred_hist.append(last_wm[0]); updates_at_stage += 1; did_wm = True
             # curriculum: bump H_fwd when pred loss flatlines over the last window
@@ -1401,6 +1406,9 @@ def main(args):
                 a = actor(z)                 # deterministic mean (deployment / eval)
             if args.explore_noise > 0:       # optional extra collection noise (sim pretrain only)
                 a = (a + args.explore_noise * torch.randn_like(a)).clamp(-1.0, 1.0)
+        if args.action_max_warmup_steps > 0 and step < args.action_max_warmup_steps:
+            frac = args.action_max_start_frac + (1.0 - args.action_max_start_frac) * (step / args.action_max_warmup_steps)
+            a = a * frac                     # action_max schedule: ramp effective amplitude start_frac -> 1.0
         hist_a = torch.cat([hist_a[1:], a.unsqueeze(0)], 0)
         a_np = a.detach().cpu().numpy()
         a_env = a_np.reshape(args.n_envs, args.action_block, n_dof)
@@ -1875,6 +1883,19 @@ def parse_args():
     p.add_argument("--sigreg-weight", type=float, default=0.3,
                    help="beta: SIGReg (isotropic-Gaussian) weight, pinned at 0.3")
     p.add_argument("--wm-batch-size", type=int, default=128)
+    p.add_argument("--lambda-slow", type=float, default=0.0,
+                   help="slowness/temporal-coherence weight: penalize mean sq per-step latent jump "
+                        "||z_t - z_{t+1}||^2 on real consecutive frames. Forces temporal locality "
+                        "(SIGReg anchors against the dz->0 collapse). 0 = off.")
+    p.add_argument("--action-max-start-frac", type=float, default=1.0,
+                   help="action_max schedule: initial fraction of action amplitude (scales the normalized "
+                        "action). Ramps linearly to 1.0 over --action-max-warmup-steps. 1.0 = off.")
+    p.add_argument("--action-max-warmup-steps", type=int, default=0,
+                   help="steps to ramp effective action amplitude from --action-max-start-frac to 1.0. 0 = off.")
+    p.add_argument("--sigreg-pertimestep", action="store_true",
+                   help="apply SIGReg per-timestep (T,B,D) like LeWM (isotropize each step's cross-trajectory "
+                        "batch) instead of pooling the rollout window into (1,B*T,D). Pooling drags consecutive "
+                        "frames into the same isotropy test -> pushes them apart -> kills temporal locality.")
     p.add_argument("--wm-lr", type=float, default=5e-5)
     p.add_argument("--wm-update-every", type=int, default=4)
     p.add_argument("--wm-grad-steps", type=int, default=1,
