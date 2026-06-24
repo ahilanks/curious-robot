@@ -732,3 +732,27 @@ rollout-probe fallback (probe_v1 gone from HF) → not comparable to safe15's pr
 `encoder/eff_rank` above is the apples-to-apples metric. **Next** (if pursued): a 100k run at kp=499 to
 see whether eff_rank/pred close on safe15, or accept the healthy-regime result as sufficient for the
 α-re-add goal. Read via `wandb.Api().run(".../curious-robot/6bl63r0y")`.
+
+## 2026-06-24 — THE FINAL CULPRIT: CEM goal-reaching fails because the encoder latent has NO temporal locality (it's the DATA, not the planner / sigreg / camera)
+
+Closes the `--cem` goal-explore line (Go-Explore: a CEM controller plans H=5 latent steps to minimize `‖ẑ_H − z*‖²` toward Go-Explore archive goals `z*`). Across ~150 W&B runs + a focused 06-23/24 sweep, **goal-reaching never works**: normalized `goal/dist_to_goal` pins flat at **~20** (≈0.9× the √(2·256)≈22.6 random-pair latent ceiling) and `goal/reach_rate ≈ 0`, regardless of camera, WM accuracy, or goal source.
+
+**Ruled out — one experiment each, none moved dist off ~20:**
+- **camera**: wrist ≈ overhead (`cem_wmbs256_iters15_wristcam` vs `_wmcuriosity`).
+- **WM accuracy**: `h_fwd_max` 1→5 + `wm_lr` 3e-4 drove `wm/pred_loss` 0.20→0.05 (near-perfect multi-step WM) → no change.
+- **goal SELECTION**: `--goal-select near` (nearest archive goal by latent dist) and `--goal-select future` (achieved obs K steps ahead in the env's own episode) both stayed ~20.
+- **the PLANNER**: NOT it — verified IDENTICAL from source to the LeWM reference (swm `solver/cem.py:CEMSolver` + `wm/lewm/lewm.py:get_cost`): same Gaussian sampling, force-candidate-0=mean, terminal `‖ẑ_H−z*‖²` summed over dims, top-k elites, refit mean/std, no min-std floor.
+
+**ROOT CAUSE (measured, `scratchpad/probe_geom.py` on trained ckpts): the latent has no temporal locality.** Encode the archive's source `o_t` and outcome `o_{t+1}` (1 decision-step apart): **1-step jump `‖z_t − z_{t+1}‖ ≈ 21` normalized ≈ the random-pair distance, on BOTH wrist (21.3) and overhead (21.8).** One env step decorrelates the latent almost completely → no goal is ever "near" → CEM has no navigable gradient (5-step reachable spread `z_term_spread` ~13 < goal ~20). The archive goals ARE real states the arm visited — but it visited them via jerky exploration, so even a 1-step-ago state sits ~random-pair away. **Seen-ness ≠ navigable structure.**
+
+**NOT instability, NOT sigreg/isotropy.** The latent is healthy (z_std ~1.0, RankMe ~90-100/256, stable low pred_loss). And the regularizer is exonerated by direct comparison: reproduced the official LeWM eval and measured **ITS** cube latent — 1-step jump **1.7 (ratio 0.09)**, growing SMOOTHLY with the gap (1.7 → 6.4 → 10.2 → 14.1 at k=1,5,10,25). LeWM uses the SAME predict-next-embedding + SIGReg objective and is EQUALLY isotropic (random-pair √(2·192)=19.6, z_std 1.0) — yet temporally local. So isotropy never precluded locality.
+
+**The differentiator is the DATA (same objective, opposite outcome):**
+- **LeWM**: OFFLINE on smooth **expert** trajectories (cube_single_expert, 2M steps) — small physical change/step → smooth latent path → local.
+- **Ours**: ONLINE **curiosity** exploration with `action_max=1.0` (full-radian joint deltas) + a reward that actively SEEKS unpredictable states → large, jerky, novelty-biased moves/step → the encoder faithfully maps that to ~orthogonal latents.
+
+**LeWM reproduction (the comparison anchor; isolated in `/workspace/le-wm`):** official `lucas-maes/le-wm` cloned + run on cube (3D robot-arm) → **74% success (50 ep)**; smoke 80% (5 ep). In the paper's "competitive 3D control" range (DINO-WM has a slight edge on cube per Fig 6 — exact figure is a plot, not text). Needed ~7 unpinned-dep fixes: `transformers==4.49` (ckpt uses pre-v5 HF ViT key naming), `datasets≥3.6` + `hdf5plugin` (pixels are plugin-compressed), the modern `load_dataset` / `checkpoints/<task>/<run>/{weights.pt,config.json}` loader convention, manual dataset fetch from `quentinll/lewm-cube` staged via `/dev/shm` to fit the 150 GB `/workspace` quota, and a 1-line `eval.py` loader patch.
+
+**Fix direction (untested): representation/data, NOT planner, goals, camera, or sigreg.** Either smooth the action regime / train the encoder on smoother (less novelty-biased) trajectories, or add an explicit slowness / temporal-contrastive term to FORCE the locality the data isn't providing.
+
+**Instrumented (`src/train.py`, this commit):** new `encoder/step_jump` = windowed mean `‖z_t − z_{t+1}‖` and `encoder/step_jump_frac_rand` = step_jump / √(2·z_dim) — watch latent temporal locality directly. ~1.0 = no locality (current); LeWM cube was ~0.09.

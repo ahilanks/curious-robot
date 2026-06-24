@@ -278,6 +278,31 @@ class ReplayBuffer:
             return None
         return int(np.random.choice(same))
 
+    def sample_future_goal(self, env_idx, k):
+        """Controller goal (--goal-select future): per env, an obs it ACHIEVED `k` forward steps
+        after a recent point in its OWN current episode -- reachable by forward dynamics and on the
+        agent's manifold (HER 'future' applied to action selection, mirroring LeWM goal_offset).
+        Returns (px[L,...], prop[L,...], valid[L]); valid=False where the episode is too short yet."""
+        L = len(env_idx)
+        px = np.zeros((L, *self.pixels.shape[2:]), np.uint8)
+        pr = np.zeros((L, self.proprio.shape[2]), np.float32)
+        valid = np.zeros(L, bool)
+        if not self.goal_explore:
+            return px, pr, valid
+        for slot in range(L):
+            e = int(env_idx[slot]); n = int(self.count[e])
+            if n < 3:
+                continue
+            order = ((np.arange(self.C) + int(self.head[e])) % self.C) if n == self.C else np.arange(n)
+            same = order[self.ep_id[e, order] == self.ep_id[e, order[-1]]]   # current episode, oldest..newest
+            if len(same) < 3:
+                continue
+            kk = min(int(k), len(same) - 1)                                  # clamp to what the episode holds
+            ap = np.random.randint(0, len(same) - kk)                        # anchor with kk forward room
+            gi = int(same[ap + kk])                                          # achieved obs kk steps later
+            px[slot] = self.pixels[e, gi]; pr[slot] = self.proprio[e, gi]; valid[slot] = True
+        return px, pr, valid
+
     def sample_sac(self, batch, per_alpha, per_beta, her_frac=0.0):
         vp = self._valid_pairs()
         if vp is None or len(vp[0]) < batch:
@@ -319,9 +344,16 @@ class ReplayBuffer:
         """Overwrite priorities of sampled transitions (used by --per-priority td)."""
         self.prio[e, i] = np.maximum(np.asarray(prio, np.float64), 1e-6)
 
-    def sample_wm(self, batch, T):
-        """Sample (px, proprio, action) windows of length T contiguous within one
-        env (no episode-start crossing, no ring-seam crossing)."""
+    def sample_wm(self, batch, T, mode="uniform", per_alpha=0.6):
+        """Sample (px, proprio, action) windows of length T contiguous within one env
+        (no episode-start crossing, no ring-seam crossing). `mode` selects how each window's
+        START is drawn (its predicted/target frame sits at s+T-1):
+          'uniform'   -- flat over valid starts (default; original behaviour).
+          'curiosity' -- P ~ prio[target]^per_alpha: high one-step-MSE windows oversampled
+                         (the surprise signal SAC's PER uses -> trains the WM where it is
+                         worst, i.e. the goal regions).
+          'recency'   -- P decays exponentially with how long ago the window was collected
+                         (half-life = 25% of the env's fill), favouring fresh data."""
         starts = []
         for e in range(self.n_envs):
             n = int(self.count[e])
@@ -331,8 +363,20 @@ class ReplayBuffer:
                 lo, hi, head = 0, n - T, -1            # linear region, no wrap
             else:
                 lo, hi, head = 0, self.C - T, int(self.head[e])
-            for _ in range(8 * batch // max(self.n_envs, 1) + 4):
-                s = np.random.randint(lo, hi + 1)
+            ndraw = 8 * batch // max(self.n_envs, 1) + 4
+            if mode == "uniform":
+                cands = np.random.randint(lo, hi + 1, size=ndraw)
+            else:
+                pos = np.arange(lo, hi + 1)
+                tgt = pos + T - 1                                  # predicted (surprising) frame slot
+                if mode == "curiosity":
+                    w = np.power(self.prio[e, tgt], per_alpha) + 1e-6
+                else:                                              # recency
+                    rank = (int(self.head[e]) - 1 - tgt) % self.C  # 0 = newest filled slot
+                    w = np.power(0.5, rank / max(n * 0.25, 1.0))
+                cands = np.random.choice(pos, size=ndraw, p=w / w.sum())
+            for s in cands:
+                s = int(s)
                 if head >= 0 and s < head <= s + T - 1:   # straddles the time seam
                     continue
                 if self.is_start[e, s + 1:s + T].any():    # crosses an episode reset
@@ -707,21 +751,20 @@ def sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
 
 @torch.no_grad()
 def collapse_metrics(z):
-    """Encoder-collapse diagnostics on a batch of latents z (B, D), computed on CPU
-    (linalg has gaps on MPS): mean per-dim std (->0 collapsed), participation-ratio
-    effective rank of the feature covariance (large/<=min(B,D) when healthy, ->1
-    collapsed), and mean |off-diagonal feature correlation| (->1 collapsed)."""
+    """Encoder diagnostics on a batch of latents z (B, D), computed on CPU (linalg has gaps
+    on MPS). Returns (z_std, rankme):
+      z_std  -- mean per-dim std = latent scale (->0 collapsed).
+      rankme -- RankMe effective rank (Garrido et al. 2023, the SSL standard, same
+                Balestriero/LeCun lineage as LeJEPA/LeWM): exp(Shannon entropy of the
+                L1-normalized singular values of z, UNCENTERED), in [1, min(B,D)]; logged
+                as a fraction of z_dim. Finite-sample biased (at B~=D even isotropic z reads
+                ~0.8*D), so the probe must hold B >> D samples (see --probe-size)."""
     z = z.detach().float().cpu()
-    B, D = z.shape
     std = z.std(0)
-    zc = z - z.mean(0, keepdim=True)
-    lam = torch.linalg.svdvals(zc) ** 2                       # covariance eigenvalues
-    eff_rank = (lam.sum() ** 2 / (lam.pow(2).sum() + 1e-12)).item()
-    denom = std.clamp_min(1e-6)
-    corr = (zc.t() @ zc) / (B * denom[:, None] * denom[None, :])
-    off = corr.abs().sum() - corr.diagonal().abs().sum()
-    feat_corr = (off / (D * (D - 1) + 1e-9)).item()
-    return float(std.mean()), float(eff_rank), float(feat_corr)
+    sv = torch.linalg.svdvals(z)                              # RankMe: UNCENTERED singular values
+    p = sv / (sv.sum() + 1e-12) + 1e-7                        # L1-normalized + eps (Garrido 2023)
+    rankme = torch.exp(-(p * p.log()).sum()).item()
+    return float(std.mean()), float(rankme)
 
 
 # ----------------------------------------------------------------- checkpointing
@@ -1041,15 +1084,26 @@ def main(args):
                        n_comp=len(REWARD_COMPONENTS) if args.multihead_q else 0,
                        goal_explore=args.goal_explore)
     print(f"[buffer] {args.n_envs} x {cap_per_env} = {args.n_envs * cap_per_env} transitions", flush=True)
-    archive = (GoalArchive(args.goal_archive_size, env.wrist_resolution, prop_dim, a_dim)
-               if args.goal_explore else None)
-    if archive is not None and (args.init_ckpt or args.resume_name):   # reload archive on goal-explore resume
+    # goal archive(s): ONE global pool shared by all envs (default), or one PER ENV
+    # (--per-env-archive) so each env explores/targets only the high-MSE states IT visited.
+    archives = ([GoalArchive(args.goal_archive_size, env.wrist_resolution, prop_dim, a_dim)
+                 for _ in range(args.n_envs if args.per_env_archive else 1)]
+                if args.goal_explore else None)
+    arch_for = (lambda e: archives[e % len(archives)]) if archives else (lambda e: None)
+    if archives is not None:
+        print(f"[goal-explore] {'PER-ENV' if args.per_env_archive else 'GLOBAL'} archive: "
+              f"{len(archives)} buffer(s) x K={args.goal_archive_size}", flush=True)
+    if archives is not None and (args.init_ckpt or args.resume_name):   # reload archive(s) on resume
         try:
             _ap = resolve_ckpt(args.init_ckpt, args.resume_name or args.name, args.resume_step, args.hf_repo)
             _ack = torch.load(_ap, map_location="cpu", weights_only=False)
             if "goal_archive" in _ack:
-                archive.load_state_dict(_ack["goal_archive"])
-                print(f"[resume] goal archive loaded: {archive.n} goals", flush=True)
+                _sd = _ack["goal_archive"]
+                _sd = _sd if isinstance(_sd, list) else [_sd]      # back-compat: old single-pool checkpoint
+                for _a, _s in zip(archives, _sd):
+                    _a.load_state_dict(_s)
+                print(f"[resume] goal archive loaded: {sum(a.n for a in archives)} goals "
+                      f"across {len(archives)} buffer(s)", flush=True)
         except Exception as _ex:
             print(f"[resume] goal archive not loaded ({_ex}); starting empty", flush=True)
 
@@ -1119,7 +1173,7 @@ def main(args):
     zstar_env = torch.zeros(args.n_envs, z_dim, device=device)
     has_goal = np.zeros(args.n_envs, bool)
     goal_evictions = 0
-    goal_recent = ({k: deque(maxlen=400) for k in ("dist", "reach", "qdist", "qsucc")}
+    goal_recent = ({k: deque(maxlen=400) for k in ("dist", "reach", "dist_env")}
                    if args.goal_explore else None)
 
     def reach_eps_now(step):
@@ -1135,15 +1189,42 @@ def main(args):
     def refresh_goals(env_idx):
         """Draw a fresh goal obs o* from the archive for each env in env_idx (sets goal_px_env /
         has_goal). z* is RE-ENCODED from o* every step in the main loop (drift-immune), not here.
-        No-op until the archive fills."""
-        if archive is None or archive.n == 0:
+        No-op until the archive fills.
+        --goal-select 'mse' (default): P(k)~softmax(score/temp) = highest-WM-MSE (farthest/novel).
+        'near': P(k)~softmax(-||z_e - z_k||/temp) over archive latents re-encoded HERE (no_grad) =
+        goals NEAREST the env's current latent z (reachable within the CEM horizon)."""
+        if archives is None:
             return
+        if args.goal_select == "future":                 # reachable on-manifold goal from the env's own buffer
+            ei = np.asarray([int(e) for e in env_idx])
+            gpx, gprop, gvalid = buf.sample_future_goal(ei, args.goal_future_k)
+            for slot in range(len(ei)):
+                if gvalid[slot]:
+                    e = int(ei[slot])
+                    goal_px_env[e] = gpx[slot]
+                    goal_prop_env[e] = gprop[slot]
+                    has_goal[e] = True
+            return
+        near = args.goal_select == "near"
+        zk_cache = {}                                    # archive latents per distinct archive (global -> encode once)
         for e in env_idx:
-            k = archive.sample(args.goal_temp)
-            if k is None:
+            a = arch_for(e)
+            if a.n == 0:
                 continue
-            goal_px_env[e] = archive.gpx[k]
-            goal_prop_env[e] = archive.gprop[k]
+            if near:
+                with torch.no_grad():
+                    key = id(a)
+                    if key not in zk_cache:
+                        zk_cache[key] = encode_obs(wm, a.gpx[:a.n], a.gprop[:a.n], device)   # (n, D)
+                    dist = (z[e].unsqueeze(0) - zk_cache[key]).norm(dim=-1)                   # ||z_e - z_k||
+                    p = torch.softmax(-dist / max(args.goal_temp, 1e-6), 0).cpu().numpy()
+                k = int(np.random.choice(a.n, p=p))
+            else:
+                k = a.sample(args.goal_temp)
+                if k is None:
+                    continue
+            goal_px_env[e] = a.gpx[k]
+            goal_prop_env[e] = a.gprop[k]
             has_goal[e] = True
 
     h_fwd = resume_h_fwd if resume_h_fwd is not None else args.h_fwd_start   # curriculum horizon (resumed if warm-started)
@@ -1154,6 +1235,7 @@ def main(args):
     tau_max_arr = np.asarray(env.tau_max, np.float32)
     prev_qpos_dec = None                                      # last decision's final joint pose (for pose_step travel)
     recent_qpos = deque(maxlen=200)                           # rolling final-pose history -> pose_spread / pose_range
+    step_jump_recent = deque(maxlen=400)                      # per-step ||z_t - z_{t+1}|| -> latent temporal locality
     recent = {k: deque(maxlen=400) for k in
               ("r_cur", "r_safe", "cur_contrib", "contacts", "table_contacts",
                "motion", "ret", "frac_block", "frac_table",
@@ -1172,12 +1254,19 @@ def main(args):
     if args.probe_size > 0:                         # prefer the canonical uniform-pose probe cached on HF
         loaded = (load_probe_hf(args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"), args.probe_id)
                   if not args.no_hf else None)
-        if loaded is not None:
+        # use the cached HF probe ONLY if it holds >= probe_size obs; an undersized probe (e.g. the
+        # 256-obs probe_v1, == z_dim) would re-introduce the finite-sample rank bias the larger
+        # probe_size is meant to remove, so fall through to the warmup-rollout probe instead.
+        if loaded is not None and len(loaded[0]) >= args.probe_size:
             probe_px, probe_prop = loaded[0][:args.probe_size], loaded[1][:args.probe_size]
             if args.no_torque_obs:               # probe obs must match the scrubbed training obs
                 probe_prop = probe_prop.copy()
                 probe_prop[..., 2 * n_dof:3 * n_dof] = 0.0
             print(f"[probe] loaded {len(probe_px)} uniform-pose obs from HF ({args.probe_id})", flush=True)
+        elif loaded is not None:
+            print(f"[probe] HF probe '{args.probe_id}' has only {len(loaded[0])} obs < probe_size="
+                  f"{args.probe_size}; using warmup-rollout probe instead (rank needs >> z_dim samples)",
+                  flush=True)
         else:
             print(f"[probe] HF probe '{args.probe_id}' unavailable; falling back to warmup-rollout probe",
                   flush=True)
@@ -1191,23 +1280,26 @@ def main(args):
         nonlocal last_wm, last_sac, last_rnd, last_zb, last_qh, updates_at_stage, rnd_upd
         # --- world-model co-training: autoregressive MSE rollout + beta*SIGReg ---
         if step >= args.start_steps and step % args.wm_update_every == 0:
-            batch = buf.sample_wm(args.wm_batch_size, H + h_fwd)
-            if batch is not None:
+            did_wm = False
+            for _ in range(args.wm_grad_steps):           # >1 = more WM grad steps per opportunity
+                batch = buf.sample_wm(args.wm_batch_size, H + h_fwd, args.wm_sample, args.per_alpha)
+                if batch is None:
+                    break
                 wm.train()
                 if args.freeze_encoder:
                     wm.encoder.eval()          # keep the frozen encoder deterministic (dropout off)
                 last_wm = wm_update(wm, sigreg, wm_opt, batch, H, h_fwd,
                                     args.gamma_wm, args.sigreg_weight, device)
                 wm.eval()
-                pred_hist.append(last_wm[0]); updates_at_stage += 1
-                # curriculum: bump H_fwd when pred loss flatlines over the last window
-                if (h_fwd < args.h_fwd_max and len(pred_hist) == pred_hist.maxlen
-                        and updates_at_stage >= pred_hist.maxlen):
-                    arr = np.asarray(pred_hist); half = len(arr) // 2
-                    older, newer = arr[:half].mean(), arr[half:].mean()
-                    if abs((older - newer) / max(abs(older), 1e-9)) < args.flatline_tol:
-                        h_fwd += 1; updates_at_stage = 0; pred_hist.clear()
-                        print(f"[curriculum] step={step} H_fwd -> {h_fwd}", flush=True)
+                pred_hist.append(last_wm[0]); updates_at_stage += 1; did_wm = True
+            # curriculum: bump H_fwd when pred loss flatlines over the last window
+            if (did_wm and h_fwd < args.h_fwd_max and len(pred_hist) == pred_hist.maxlen
+                    and updates_at_stage >= pred_hist.maxlen):
+                arr = np.asarray(pred_hist); half = len(arr) // 2
+                older, newer = arr[:half].mean(), arr[half:].mean()
+                if abs((older - newer) / max(abs(older), 1e-9)) < args.flatline_tol:
+                    h_fwd += 1; updates_at_stage = 0; pred_hist.clear()
+                    print(f"[curriculum] step={step} H_fwd -> {h_fwd}", flush=True)
         # --- SAC updates (PER; encoder is frozen w.r.t. SAC, z encoded under no_grad) ---
         res = (None if args.cem else                      # --cem: no learned policy, WM-only training
                sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
@@ -1273,15 +1365,7 @@ def main(args):
                     gdist = (z - zstar_env).norm(dim=-1).cpu().numpy()       # ||z_t - z*|| per env
                     goal_recent["dist"].append(float(gdist[has_goal].mean()))
                     goal_recent["reach"].append(float((gdist[has_goal] < reach_eps_now(step)).mean()))
-                    # LeWM-reacher-style PHYSICAL success: a goal is reached when EVERY joint is within
-                    # eps radians of the goal's stored qpos (cf. ReacherQPosMatchTask: |q-q*|<0.05 all
-                    # joints). Joint-space companion to the latent reach_rate above, which sits on a
-                    # SIGReg-drifting z-scale (~22 for random pairs) and rarely fires. proprio is raw
-                    # [qpos, qvel, u]; qpos = first n_dof, same units in obs and the goal archive.
-                    qd = np.abs(obs["proprio"][:, :n_dof] - goal_prop_env[:, :n_dof])     # (n_envs, n_dof) |dq| rad
-                    goal_recent["qdist"].append(float(qd[has_goal].mean()))               # mean per-joint err (rad)
-                    goal_recent["qsucc"].append(
-                        float(np.all(qd[has_goal] < args.goal_success_qpos_eps, axis=1).mean()))
+                    goal_recent["dist_env"].append(np.where(has_goal, gdist, np.nan))  # per-env series; NaN where self-goal (excluded)
 
         # --- act: SAC stochastic sample during sim training (the entropy-driven exploration
         #     that un-parks the policy and decorrelates the parallel envs), the DETERMINISTIC
@@ -1399,22 +1483,30 @@ def main(args):
                 print(f"[probe] froze {len(probe_px)} obs for encoder/eff_rank_probe", flush=True)
 
         z_next = encode_obs(wm, obs["image"], obs["proprio"], device)
+        step_jump_recent.append(float((z - z_next).norm(dim=-1).mean()))          # latent temporal locality probe
         r_cur = curiosity_reward(wm, hist_z, hist_a, z_next).cpu().numpy()        # (n_envs,) >= 0
         cur_term = args.lambda_cur * np.log1p(r_cur)         # lambda_cur * symlog(r_cur)  (r_cur>=0)
 
         # --- goal archive: insert this transition (goal = surprising OUTCOME o_{t+1}) scored by
         #     its TRUE one-step MSE r_cur; periodically re-measure every goal with the current WM
         #     and evict mastered ones. obs is still o_{t+1} here (done envs reset further below). ---
-        if archive is not None:
+        if archives is not None:
             # ref = same-construction re-measure of THIS transition (eviction baseline); score = true r_cur
             ref = score_obs_mse(wm, obs["image"], obs["proprio"], cur_px, cur_prop, a_np, device, H)
-            archive.insert_batch(gpx=obs["image"], gprop=obs["proprio"],
-                                 spx=cur_px, sprop=cur_prop, sact=a_np, score=r_cur, ref=ref)
-            if step > 0 and step % args.goal_rescore_every == 0 and archive.n > 0:
-                goal_evictions += archive.rescore_and_evict(
-                    lambda gpx, gprop, spx, sprop, sact:
-                        score_obs_mse(wm, gpx, gprop, spx, sprop, sact, device, H),
-                    args.goal_drop_frac)
+            if args.per_env_archive:                        # route env e's transition to ITS buffer
+                for e in range(args.n_envs):
+                    archives[e].insert_batch(gpx=obs["image"][e:e + 1], gprop=obs["proprio"][e:e + 1],
+                                             spx=cur_px[e:e + 1], sprop=cur_prop[e:e + 1],
+                                             sact=a_np[e:e + 1], score=r_cur[e:e + 1], ref=ref[e:e + 1])
+            else:                                           # global pool: all envs' transitions in one batch
+                archives[0].insert_batch(gpx=obs["image"], gprop=obs["proprio"],
+                                         spx=cur_px, sprop=cur_prop, sact=a_np, score=r_cur, ref=ref)
+            if step > 0 and step % args.goal_rescore_every == 0:
+                _scorer = (lambda gpx, gprop, spx, sprop, sact:
+                           score_obs_mse(wm, gpx, gprop, spx, sprop, sact, device, H))
+                for a in archives:
+                    if a.n > 0:
+                        goal_evictions += a.rescore_and_evict(_scorer, args.goal_drop_frac)
         r_rate = -(args.w_action_rate * rate + args.w_action_rate2 * rate2)       # smoothness penalties (0 unless flagged)
         r_energy = -args.w_energy * energy
         safe_term = args.lambda_safe * r_safe
@@ -1519,10 +1611,6 @@ def main(args):
             safe_m, cur_m = np.mean(recent["r_safe"]), np.mean(recent["cur_contrib"])
             d = {"reward/r_cur": np.mean(recent["r_cur"]),
                  "reward/r_safe": safe_m,
-                 "reward/r_rnd": np.mean(recent["r_rnd"]),            # raw RND novelty error
-                 "reward/rnd_contrib": np.mean(recent["rnd_contrib"]),  # lambda_rnd * symlog(rnd_reward_scale*r_rnd)
-                 "reward/r_knn": np.mean(recent["r_knn"]),            # raw kNN coverage reward
-                 "reward/knn_contrib": np.mean(recent["knn_contrib"]),  # lambda_knn * r_knn
                  "reward/cur_contrib": cur_m,                 # lambda_cur * symlog(r_cur)
                  "reward/safe_cur_ratio": abs(safe_m) / max(abs(cur_m), 1e-6),
                  "reward/total": np.mean(recent["ret"]),
@@ -1537,11 +1625,19 @@ def main(args):
                  "smooth/qd_mean": np.mean(recent["qd_mean"]),
                  "smooth/tau_sat_frac": np.mean(recent["tau_sat"]),
                  "smooth/qd_reversal_frac": np.mean(recent["qd_rev"]),
-                 "reward/r_rate": np.mean(recent["r_rate"]),
-                 "reward/r_energy": np.mean(recent["r_energy"]),
                  "explore/pose_step": np.mean(recent["pose_step"]),     # joint travel/decision; ~0 = parked
-                 "buffer/transitions": buf.total, "perf/steps_per_sec": sps,
-                 "wm/h_fwd": h_fwd}
+                 "buffer/transitions": buf.total, "perf/steps_per_sec": sps}
+            # reward-component breakdowns only when that term is enabled (all off in CEM -> omitted)
+            if args.lambda_rnd:
+                d["reward/r_rnd"] = np.mean(recent["r_rnd"]); d["reward/rnd_contrib"] = np.mean(recent["rnd_contrib"])
+            if args.lambda_knn:
+                d["reward/r_knn"] = np.mean(recent["r_knn"]); d["reward/knn_contrib"] = np.mean(recent["knn_contrib"])
+            if args.w_action_rate:
+                d["reward/r_rate"] = np.mean(recent["r_rate"])
+            if args.w_energy:
+                d["reward/r_energy"] = np.mean(recent["r_energy"])
+            if args.h_fwd_max > 1:           # WM-rollout curriculum stage (constant 1 when curriculum off)
+                d["wm/h_fwd"] = h_fwd
             if args.cem and cem_diag:        # CEM action-sensitivity probe (computed in cem_plan, iter 0)
                 d["cem/cost_cv"] = cem_diag.get("cost_cv", float("nan"))             # ~0 => no optimization signal
                 d["cem/z_term_spread"] = cem_diag.get("z_term_spread", float("nan")) # how far actions move the endpoint
@@ -1550,24 +1646,31 @@ def main(args):
                 _rg = cem_diag.get("reach_gap", 0.0)
                 d["cem/move_vs_gap"] = (cem_diag["z_term_spread"] / _rg) if _rg > 1e-9 else float("nan")
             if args.goal_explore:
-                d["goal/archive_size"] = archive.n
-                d["goal/archive_mse_mean"] = archive.mean_score()
+                d["goal/archive_size"] = sum(a.n for a in archives)        # total across buffer(s)
+                _ms = [a.mean_score() for a in archives if a.n]
+                d["goal/archive_mse_mean"] = float(np.mean(_ms)) if _ms else 0.0
                 d["goal/evictions"] = goal_evictions
                 if goal_recent["dist"]:
                     d["goal/dist_to_goal"] = float(np.mean(goal_recent["dist"]))
+                if goal_recent["dist_env"]:                      # per-env ||z - z*|| (trailing-window mean, comparable to goal/dist_to_goal)
+                    de = np.stack(goal_recent["dist_env"])       # (T, n_envs); NaN on steps an env had no real goal
+                    cnt = np.sum(np.isfinite(de), axis=0)        # real-goal samples per env in the window (avoids nanmean empty-slice warning)
+                    sm = np.nansum(de, axis=0)
+                    for i in range(args.n_envs):
+                        if cnt[i] > 0:
+                            d[f"goal/dist_env/{i:02d}"] = float(sm[i] / cnt[i])
                 if goal_recent["reach"]:
                     d["goal/reach_rate"] = float(np.mean(goal_recent["reach"]))
-                d["goal/reach_eps"] = float(reach_eps_now(step))    # live (annealed) reach threshold
-                # LeWM-reacher-style physical (joint-space) success, alongside the latent reach above
-                if goal_recent["qsucc"]:
-                    d["goal/success_rate_qpos"] = float(np.mean(goal_recent["qsucc"]))
-                if goal_recent["qdist"]:
-                    d["goal/qpos_dist"] = float(np.mean(goal_recent["qdist"]))   # mean per-joint |dq| (rad)
-                d["goal/success_qpos_eps"] = float(args.goal_success_qpos_eps)
+                if args.goal_reach_eps_start > 0:                   # only varies when annealing is on
+                    d["goal/reach_eps"] = float(reach_eps_now(step))
             if recent_qpos:    # how much of joint space the recent window covers (parked -> ~0)
                 qarr = np.stack(recent_qpos)                            # (T, n_envs, n_dof)
                 d["explore/pose_spread"] = float(qarr.std(0).mean())    # mean temporal std over joints/envs
                 d["explore/pose_range"] = float((qarr.max(0) - qarr.min(0)).mean())  # mean per-joint sweep
+            if step_jump_recent:    # latent TEMPORAL LOCALITY: mean ||z_t - z_{t+1}|| and its fraction of the
+                sj = float(np.mean(step_jump_recent))               # random-pair distance sqrt(2*z_dim)*z_std (z_std~1 post-warmup).
+                d["encoder/step_jump"] = sj                         # frac ~1.0 = NO locality (LeWM cube was ~0.09); small = local.
+                d["encoder/step_jump_frac_rand"] = sj / (2 * z_dim) ** 0.5
             for key in ("mse_block", "mse_table", "mse_none"):   # curiosity MSE by contact type
                 if recent_mse[key]:
                     d[f"wm/{key}"] = float(np.mean(recent_mse[key]))
@@ -1582,14 +1685,13 @@ def main(args):
             safe_v = float(np.var(np.asarray(recent["r_safe"], np.float64) * args.lambda_safe))
             d.update({"reward/var_cur": cur_v, "reward/var_safe": safe_v,
                       "reward/var_cur_frac": cur_v / max(cur_v + safe_v, 1e-12)})
-            if last_zb is not None:
-                z_std, eff_rank, feat_corr = collapse_metrics(last_zb)
-                d.update({"encoder/z_std": z_std, "encoder/eff_rank": eff_rank,
-                          "encoder/feat_corr": feat_corr})
-            if probe_px is not None:                          # encoder health on a FIXED diverse probe set
-                p_std, p_eff, p_corr = collapse_metrics(encode_obs(wm, probe_px, probe_prop, device))
-                d.update({"encoder/eff_rank_probe": p_eff, "encoder/z_std_probe": p_std,
-                          "encoder/feat_corr_probe": p_corr})
+            if probe_px is not None and step % args.probe_every == 0:   # encoder health on a FIXED probe set
+                with torch.no_grad():        # 2048-obs inference encode: MUST NOT build a graph (encode_obs
+                                             # lacks @no_grad) and runs only every --probe-every steps -- rank
+                                             # moves slowly, and encoding the full probe every log step (with
+                                             # grad) cost ~half the SPS.
+                    p_std, p_rankme = collapse_metrics(encode_obs(wm, probe_px, probe_prop, device))
+                d.update({"encoder/rank_frac_probe": p_rankme / z_dim, "encoder/z_std_probe": p_std})
             if last_wm is not None:
                 d.update({"wm/pred_loss": last_wm[0], "wm/sigreg": last_wm[1],
                           "wm/identity_baseline": last_wm[2], "wm/mean_baseline": last_wm[3],
@@ -1613,9 +1715,7 @@ def main(args):
                 print(f"[step {step}] cur_contrib={cur_m:.3f} "
                       f"dist_goal={d.get('goal/dist_to_goal', float('nan')):.2f} "
                       f"reach={d.get('goal/reach_rate', 0.0):.2f} "
-                      f"qsucc={d.get('goal/success_rate_qpos', 0.0):.2f} "
-                      f"qdist={d.get('goal/qpos_dist', float('nan')):.2f} "
-                      f"archive={archive.n} evict={goal_evictions} "
+                      f"archive={sum(a.n for a in archives)} evict={goal_evictions} "
                       f"crit_loss={d.get('sac/critic_loss', float('nan')):.2f} "
                       f"contacts/s={d['interact/contacts_per_step']:.2f} "
                       f"mse[blk/tbl/none]={d.get('wm/mse_block', float('nan')):.2f}/"
@@ -1638,8 +1738,8 @@ def main(args):
             state = {"step": step, "wm": wm.state_dict(), "actor": actor.state_dict(),
                      "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
                      "h_fwd": h_fwd, "args": vars(args)}
-            if archive is not None:
-                state["goal_archive"] = archive.state_dict()
+            if archives is not None:
+                state["goal_archive"] = [a.state_dict() for a in archives]
             save_and_upload(state, out_dir, step,
                             args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
                             run_name, not args.no_hf, args.keep_local_ckpts)
@@ -1667,8 +1767,8 @@ def main(args):
         state = {"step": args.total_steps, "wm": wm.state_dict(), "actor": actor.state_dict(),
                  "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
                  "h_fwd": h_fwd, "args": vars(args)}
-        if archive is not None:
-            state["goal_archive"] = archive.state_dict()
+        if archives is not None:
+            state["goal_archive"] = [a.state_dict() for a in archives]
         save_and_upload(state, out_dir, args.total_steps,
                         args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
                         run_name, not args.no_hf, args.keep_local_ckpts)
@@ -1737,9 +1837,17 @@ def parse_args():
     p.add_argument("--video-steps", type=int, default=60,
                    help="frames per train-video clip (window of decision steps before each save)")
     p.add_argument("--video-fps", type=int, default=20)
-    p.add_argument("--probe-size", type=int, default=256,
-                   help="size of the fixed probe set for encoder/eff_rank_probe (isolates encoder health "
-                        "from behavioral diversity); 0 disables")
+    p.add_argument("--probe-size", type=int, default=2048,
+                   help="size of the fixed probe set for encoder/rank_frac_probe (RankMe) "
+                        "(isolates encoder health from behavioral diversity); 0 disables. Must be >> z_dim "
+                        "(256): at probe_size~=z_dim even a perfectly isotropic encoder reads ~0.5*D (PR) / "
+                        "~0.8*D (RankMe) from finite-sample bias, so 256 (the old default) under-reported "
+                        "rank ~2x. 2048 puts the RankMe ceiling at ~99% of D.")
+    p.add_argument("--probe-every", type=int, default=500,
+                   help="recompute the probe rank metrics every N decision steps (must be a multiple of "
+                        "--log-every). Decoupled from logging because encoding the full --probe-size set "
+                        "through the ViT is costly; rank evolves slowly so 500 is plenty. Lower for finer "
+                        "resolution at some SPS cost.")
     p.add_argument("--probe-id", default="probe_v1",
                    help="HF probe artifact id (probe/<id>.npz): canonical uniform-pose probe; "
                         "falls back to a warmup-rollout probe if unavailable")
@@ -1769,6 +1877,15 @@ def parse_args():
     p.add_argument("--wm-batch-size", type=int, default=128)
     p.add_argument("--wm-lr", type=float, default=5e-5)
     p.add_argument("--wm-update-every", type=int, default=4)
+    p.add_argument("--wm-grad-steps", type=int, default=1,
+                   help="WM gradient steps taken per update opportunity (each on a fresh batch). >1 raises "
+                        "the replay ratio without changing --wm-update-every. Effective WM updates/decision "
+                        "= wm_grad_steps / wm_update_every.")
+    p.add_argument("--wm-sample", choices=("uniform", "curiosity", "recency"), default="uniform",
+                   help="how the WM batch is drawn from the replay buffer. 'uniform' (default): flat. "
+                        "'curiosity': P ~ one-step-MSE^per_alpha (oversample the high-MSE states that "
+                        "BECOME goals -> train the WM where it is worst). 'recency': favor freshly-collected "
+                        "windows (exp half-life = 25%% of the buffer).")
     p.add_argument("--wm-dropout", type=float, default=0.1)
     p.add_argument("--wm-grad-checkpoint", action="store_true",
                    help="enable ViT gradient checkpointing in the WM update (default off; trades ~10-15ms "
@@ -1893,6 +2010,10 @@ def parse_args():
                         "and the dq_max action scaling (action_max=1.0), and disables --multihead-q. Sim only.")
     p.add_argument("--goal-archive-size", type=int, default=64,
                    help="K: max goals kept in the archive (top-K by capture-time r_cur).")
+    p.add_argument("--per-env-archive", action="store_true",
+                   help="give EACH env its own goal archive (K each) instead of one global pool shared by "
+                        "all envs. Each env then explores + targets only the high-MSE states IT visited -> "
+                        "goals nearer the env's own trajectory (typically more reachable).")
     p.add_argument("--goal-update-every", type=int, default=0,
                    help="THE decisive knob: resample each env's goal every N decision steps (and on reset). "
                         "Want it slower than policy convergence, faster than full WM mastery. 0 -> one goal per "
@@ -1906,6 +2027,17 @@ def parse_args():
                         "its capture score (the WM has learned it).")
     p.add_argument("--goal-temp", type=float, default=1.0,
                    help="softmax temperature for goal sampling P(k) ~ exp(score_k/temp) (NOT argmax).")
+    p.add_argument("--goal-select", choices=("mse", "near", "future"), default="mse",
+                   help="goal source. 'mse' (default) = archive P(k)~softmax(score/temp), highest-WM-MSE "
+                        "(most novel -> FARTHEST in latent). 'near' = archive P(k)~softmax(-||z_e-z_k||/temp), "
+                        "NEAREST the env's current latent. 'future' = NOT the archive: the obs the agent "
+                        "ACHIEVED --goal-future-k forward steps after a recent point in its OWN current "
+                        "episode (HER 'future' for the controller) -- reachable by forward dynamics and "
+                        "on-manifold, mirroring LeWM's goal_offset_steps. 'future' is the decisive test of "
+                        "whether CEM can close a genuinely reachable goal.")
+    p.add_argument("--goal-future-k", type=int, default=10,
+                   help="--goal-select future: forward step offset of the achieved goal (~a few CEM "
+                        "horizons; reachable within a handful of replans).")
     p.add_argument("--her-frac", type=float, default=0.5,
                    help="fraction of SAC transitions whose goal is HER-relabeled to an achieved future obs from "
                         "the same episode (densifies the reach reward).")
