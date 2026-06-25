@@ -987,7 +987,8 @@ def main(args):
     H = args.history_size
 
     wm = WorldModel(n_dof=n_dof, action_block=args.action_block,
-                    history_size=H, dropout=args.wm_dropout).to(device)
+                    history_size=H, dropout=args.wm_dropout,
+                    use_proprio=not args.no_proprio).to(device)
     if args.wm_grad_checkpoint:  # off by default: ViT-tiny encode activations are sub-GB vs 80GB free,
         try:                     # so recompute-on-backward is pure slowdown here (the H_fwd rollout is in latent space)
             wm.encoder.vit.gradient_checkpointing_enable()
@@ -1249,6 +1250,7 @@ def main(args):
     t0 = time.time()
     last_wm = last_sac = last_rnd = None
     last_zb = last_qh = None
+    smooth_walk = torch.zeros(args.n_envs, n_dof, device=device)   # OU state for --collect-smooth (persists across decisions)
     video_on = imageio is not None and args.video_every > 0
     wrist_buf = deque(maxlen=args.video_steps)      # train-video clips (per-env frames, tiled)
     over_buf = deque(maxlen=args.video_steps)
@@ -1282,9 +1284,15 @@ def main(args):
         minus the single in-flight transition (added after wait) -- negligible off-policy."""
         nonlocal last_wm, last_sac, last_rnd, last_zb, last_qh, updates_at_stage, rnd_upd
         # --- world-model co-training: autoregressive MSE rollout + beta*SIGReg ---
-        if step >= args.start_steps and step % args.wm_update_every == 0:
+        if args.consolidate_every > 0:                    # multi-epoch consolidation regime (LeWM-like)
+            do_wm = step % args.consolidate_every == 0
+            n_grad = args.consolidate_epochs * max(1, buf.total // args.wm_batch_size)  # ~epochs over the frozen buffer
+        else:                                             # default online schedule
+            do_wm = step % args.wm_update_every == 0
+            n_grad = args.wm_grad_steps
+        if step >= args.start_steps and do_wm:
             did_wm = False
-            for _ in range(args.wm_grad_steps):           # >1 = more WM grad steps per opportunity
+            for _ in range(n_grad):                       # consolidation: ~epochs*buffer/batch grad steps in one burst
                 batch = buf.sample_wm(args.wm_batch_size, H + h_fwd, args.wm_sample, args.per_alpha)
                 if batch is None:
                     break
@@ -1306,7 +1314,7 @@ def main(args):
                     h_fwd += 1; updates_at_stage = 0; pred_hist.clear()
                     print(f"[curriculum] step={step} H_fwd -> {h_fwd}", flush=True)
         # --- SAC updates (PER; encoder is frozen w.r.t. SAC, z encoded under no_grad) ---
-        res = (None if args.cem else                      # --cem: no learned policy, WM-only training
+        res = (None if (args.cem or args.collect_smooth) else  # --cem / --collect-smooth: WM-only training (no SAC)
                sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
                           args, step, device))
         if res is not None:
@@ -1378,7 +1386,14 @@ def main(args):
         #     --warmup-random still opts in a uniform warmup; --explore-noise adds extra
         #     collection noise on top (sim only). ---
         with torch.no_grad():
-            if args.warmup_random and step < args.start_steps:
+            if args.collect_smooth:          # scripted SMOOTH collector: sub-action-level OU walk,
+                subs = []                    # persisted across decisions -> smooth within AND across blocks
+                for _ in range(args.action_block):
+                    smooth_walk.mul_(args.smooth_beta).add_((1.0 - args.smooth_beta) * torch.randn_like(smooth_walk))
+                    smooth_walk.clamp_(-1.0, 1.0)
+                    subs.append(smooth_walk.clone())
+                a = torch.stack(subs, dim=1).reshape(args.n_envs, -1)   # (n_envs, action_block*n_dof) = a_dim
+            elif args.warmup_random and step < args.start_steps:
                 a = torch.rand(args.n_envs, a_dim, device=device) * 2 - 1
             elif args.cem:                   # CEM open-loop receding horizon (LeWM WorldModelPolicy):
                 # plan H block-actions toward goal latent z* via the WM, buffer them, execute one per
@@ -1406,9 +1421,13 @@ def main(args):
                 a = actor(z)                 # deterministic mean (deployment / eval)
             if args.explore_noise > 0:       # optional extra collection noise (sim pretrain only)
                 a = (a + args.explore_noise * torch.randn_like(a)).clamp(-1.0, 1.0)
-        if args.action_max_warmup_steps > 0 and step < args.action_max_warmup_steps:
-            frac = args.action_max_start_frac + (1.0 - args.action_max_start_frac) * (step / args.action_max_warmup_steps)
-            a = a * frac                     # action_max schedule: ramp effective amplitude start_frac -> 1.0
+        if args.action_max_warmup_steps > 0:
+            if step < args.action_max_warmup_steps:
+                frac = args.action_max_start_frac + (args.action_max_end_frac - args.action_max_start_frac) \
+                       * (step / args.action_max_warmup_steps)
+            else:
+                frac = args.action_max_end_frac          # hold the (possibly <1.0) ceiling after warmup
+            a = a * frac                     # action_max schedule: ramp start_frac -> end_frac over warmup, then hold
         hist_a = torch.cat([hist_a[1:], a.unsqueeze(0)], 0)
         a_np = a.detach().cpu().numpy()
         a_env = a_np.reshape(args.n_envs, args.action_block, n_dof)
@@ -1850,7 +1869,7 @@ def parse_args():
                         "(isolates encoder health from behavioral diversity); 0 disables. Must be >> z_dim "
                         "(256): at probe_size~=z_dim even a perfectly isotropic encoder reads ~0.5*D (PR) / "
                         "~0.8*D (RankMe) from finite-sample bias, so 256 (the old default) under-reported "
-                        "rank ~2x. 2048 puts the RankMe ceiling at ~99% of D.")
+                        "rank ~2x. 2048 puts the RankMe ceiling at ~99%% of D.")
     p.add_argument("--probe-every", type=int, default=500,
                    help="recompute the probe rank metrics every N decision steps (must be a multiple of "
                         "--log-every). Decoupled from logging because encoding the full --probe-size set "
@@ -1868,6 +1887,11 @@ def parse_args():
                    help="disable torch.compile(wm.predict) (the CEM-rollout speedup); use if compile "
                         "is flaky on this box. CUDA only; compile is on by default there.")
     p.add_argument("--history-size", type=int, default=3, help="H_bwd")
+    p.add_argument("--no-proprio", action="store_true",
+                   help="LeWM-faithful PIXELS-ONLY state: drop the proprio branch from the encoder so "
+                        "z = MLP(ViT_cls) alone (D = vis_dim = 192 = LeWM embed_dim, vs the 256-d "
+                        "image+proprio fusion). Proprio is still collected (safety/goals/RND) but NOT fed "
+                        "to the WM encoder. Pair with --sigreg-pertimestep for the exact LeWM objective.")
     p.add_argument("--freeze-encoder", action="store_true",
                    help="stop-gradient on the obs->z encoder (StateEncoder): freeze the latent SPACE so "
                         "CEM plans against a STATIONARY geometry (LeWM-style frozen WM; stops the SIGReg "
@@ -1880,18 +1904,36 @@ def parse_args():
                    help="max forward rollout horizon; ==start (1) pins the WM to 1-step-ahead "
                         "prediction and disables the H_fwd curriculum")
     p.add_argument("--gamma-wm", type=float, default=0.95)
-    p.add_argument("--sigreg-weight", type=float, default=0.3,
-                   help="beta: SIGReg (isotropic-Gaussian) weight, pinned at 0.3")
+    p.add_argument("--sigreg-weight", type=float, default=0.09,
+                   help="beta: SIGReg (isotropic-Gaussian) weight, pinned at 0.09 (LeWM's "
+                        "lewm.yaml value; the old 0.3 made beta*sig dominate the WM loss ~5:1 "
+                        "over pred_loss)")
     p.add_argument("--wm-batch-size", type=int, default=128)
+    p.add_argument("--consolidate-every", type=int, default=0,
+                   help="multi-epoch CONSOLIDATION (LeWM-regime test): every N collection steps, pause "
+                        "stepping and train the WM for --consolidate-epochs full passes over the FROZEN "
+                        "buffer (replaces the per-step wm_update_every/wm_grad_steps schedule). Pushes our "
+                        "online single-pass regime toward LeWM's 100-epoch offline training -> lets pred_loss "
+                        "carve a smooth manifold before SIGReg scatters it. 0 = off (normal online schedule).")
+    p.add_argument("--consolidate-epochs", type=int, default=2,
+                   help="epochs over the buffer per consolidation burst (--consolidate-every). "
+                        "burst grad steps = epochs * (buffer_transitions // wm_batch_size).")
     p.add_argument("--lambda-slow", type=float, default=0.0,
                    help="slowness/temporal-coherence weight: penalize mean sq per-step latent jump "
                         "||z_t - z_{t+1}||^2 on real consecutive frames. Forces temporal locality "
                         "(SIGReg anchors against the dz->0 collapse). 0 = off.")
     p.add_argument("--action-max-start-frac", type=float, default=1.0,
                    help="action_max schedule: initial fraction of action amplitude (scales the normalized "
-                        "action). Ramps linearly to 1.0 over --action-max-warmup-steps. 1.0 = off.")
+                        "action). Ramps linearly to --action-max-end-frac over --action-max-warmup-steps. "
+                        "1.0 = off (when end-frac is also 1.0).")
+    p.add_argument("--action-max-end-frac", type=float, default=1.0,
+                   help="action_max schedule: FINAL fraction reached at --action-max-warmup-steps and HELD "
+                        "for the rest of the run. <1.0 caps the effective action amplitude permanently (a "
+                        "'stricter ending' / lower terminal action_max); 1.0 = ramp to full amplitude (default, "
+                        "= old behavior).")
     p.add_argument("--action-max-warmup-steps", type=int, default=0,
-                   help="steps to ramp effective action amplitude from --action-max-start-frac to 1.0. 0 = off.")
+                   help="steps to ramp effective action amplitude from --action-max-start-frac to "
+                        "--action-max-end-frac, then hold end-frac. 0 = off (no schedule).")
     p.add_argument("--sigreg-pertimestep", action="store_true",
                    help="apply SIGReg per-timestep (T,B,D) like LeWM (isotropize each step's cross-trajectory "
                         "batch) instead of pooling the rollout window into (1,B*T,D). Pooling drags consecutive "
@@ -2012,6 +2054,16 @@ def parse_args():
                         "to [-1,1]); eval/hardware act with the deterministic mean. Mostly redundant now that "
                         "sim training samples ~pi (2026-06-14); kept as an extra sim-pretrain knob. Not for "
                         "hardware.")
+    p.add_argument("--collect-smooth", action="store_true",
+                   help="SCRIPTED SMOOTH COLLECTOR (data-hypothesis test): replace the policy/CEM with a "
+                        "sub-action-level OU correlated random walk (a_k = beta*a_{k-1} + (1-beta)*N(0,1), "
+                        "clamped, persisted across decisions so block boundaries stay smooth). Generates "
+                        "GUARANTEED-smooth joint trajectories with NO curiosity/CEM in the loop -> isolates "
+                        "'smooth data -> local latent?'. Trains WM-only (skips sac_update, like --cem), so the "
+                        "encoder is shaped purely by the JEPA+SIGReg loss on smooth data (mirrors LeWM).")
+    p.add_argument("--smooth-beta", type=float, default=0.9,
+                   help="OU smoothness for --collect-smooth: higher = smoother (slower walk). 0.9 ~ LeWM-ish "
+                        "per-step action delta; tune via smooth/action_rate (LeWM ref ~0.09).")
     # actor-critic (README). SAC: stochastic train + entropy alpha, deterministic-mean deploy (2026-06-14).
     p.add_argument("--alpha", type=float, default=0.2,
                    help="fixed SAC entropy temperature: actor maximizes Q + alpha*H (re-added 2026-06-14). "
