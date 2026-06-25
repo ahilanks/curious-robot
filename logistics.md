@@ -770,3 +770,97 @@ Implemented `--lambda-slow` (penalize mean-sq per-step latent jump `‖z_t−z_{
 **Goal-reaching payoff sweep (h_fwd_max=5, 12k steps, λ∈{0,10,20}) → NO λ FIXES PLANNING.** `reach_rate`~0 and normalized `dist_to_goal` flat ~21 for ALL λ. Worse, the slowness term SHRINKS CEM steerability: `cem/z_term_spread` fell from 0.48 (λ=0) to 0.17 (λ=20) of the latent diameter (normalized), while goals sit ~0.93 of the diameter away ⇒ the more-local latent is *LESS* reachable.
 
 **KEY INSIGHT:** the slowness PENALTY achieves locality by shrinking ALL latent motion uniformly — including the action-controllable component — so the latent becomes local but UNSTEERABLE. LeWM's locality is DATA-driven (smooth purposeful expert trajectories): consecutive frames are close yet different actions still lead to meaningfully different places, so locality AND steerability coexist. ⇒ the fix is DATA-side (smoother purposeful online behavior / less novelty-biased buffer), NOT a loss penalty. (SIGReg batch composition also RULED OUT: per-timestep vs pooled = 0.85≈0.85.) NEXT: data/behavior levers — action-rate *smoothness* (not amplitude), and code-level encoder diffs vs LeWM.
+
+## 2026-06-24 — the encoder DIFF found: proprio-concat (256-d) was a real culprit, not just the data. Pixels-only LeWM-faithful encoder → TRANSIENT locality + nonzero reach, then rank-collapses
+
+Chased the one architectural divergence from LeWM. Confirmed first that buffer + inter-frame actions + encoding cadence already match LeWM (`history_size=3`; action_encoder gets the whole inter-frame action block flattened — ours `n_dof*action_block=5`, LeWM `frameskip*action_dim=5`; LeWM eval configs literally say `action_block: 5 # frameskip`). **The ONLY divergence left: our state is `z = MLP(ViT_cls) ‖ MLP(proprio)` fused to 256-d, while LeWM is pixels-only `z = projector(ViT_cls)` at embed_dim=192** (`lewm/jepa.py:38` also uses the CLS token — NOT a patch-token field; SIGReg is per-timestep `(T,B,D)`, `lewm/train.py:40`).
+
+**New flags (this commit):** `--no-proprio` (pixels-only encoder, `StateEncoder.use_proprio=False` → `z_dim=192`; proprio still collected for safety/goals but not fed to the WM), `--action-max-end-frac` (curriculum now ramps start→end then HOLDS end, vs always→1.0). Also **β pinned default 0.3→0.09** (LeWM's `lewm.yaml`; the old 0.3 made β·sig dominate pred_loss ~5:1).
+
+**Stricter action-max cap on WRIST cam FAILS (same as all amplitude knobs).** `cem_wrist_a0005_e02` (W&B `36ef0rnj`; start_frac 0.005→end 0.2 over 4k, β=0.09): `step_jump` tracked the capped amplitude in real time (3.7→18.4), z_std-corrected `corr*` pinned ~1.0 the whole run, `dist_goal` pinned ~21 (D=256 ceiling 22.6), `reach`≡0. The amplitude-corrected metric never moved → closes the action-amplitude-schedule lever for good.
+
+**Pixels-only (no-proprio) is CATEGORICALLY different — first run in the investigation to show real locality + nonzero reach.** `cem_lewm_noprop_wrist` (W&B `g068v7m6`; wrist, `--no-proprio --sigreg-pertimestep`, β=0.09, h_fwd_max=1, no curriculum; D=192 so `frac_rand` is apples-to-apples with LeWM's 0.09 cube anchor, and `corr*=frac_rand/z_std`):
+
+| step | frac_rand | corr* | rank_frac | dist_goal | reach |
+|---|---|---|---|---|---|
+| 1000 | 0.072 | 0.43 | 0.049 | 3.6 | 0.18 |
+| **2000** | **0.117** | **0.17** | 0.039 | **7.0** | **0.28** ← peak |
+| 3000 | 0.368 | 0.50 | 0.050 | 11.5 | 0.05 |
+| 4500 | 0.378 | 0.51 | 0.059 | 14.2 | 0.01 ← end |
+
+vs **every 256-d run** which pinned `corr*≈1.0 / reach=0 / dist_goal≈20` and NEVER budged. So **the proprio-concat / 256-d latent WAS hurting** — pixels-only is roughly halfway to LeWM and produced a real (transient) `reach=0.28`, `corr*` bottoming at 0.17, `dist_goal` never pinning at ceiling.
+
+**BUT it doesn't sustain — the tell is RANK.** `rank_frac` sat at **~0.04–0.06 (≈8–11 of 192 dims) the entire run** (256-d runs ran ~0.25 ≈ 64 dims). The early locality rode on a *small/collapsed* latent (low z_std → all states trivially close → goals reachable). As SIGReg expanded z_std 0.17→0.76 *without* rank recovering, the ~10-D manifold stretched, `step_jump` tripled (2.3→7.5), and `reach` collapsed to ~0.01. The win was a **low-rank transient**, not a stable manifold.
+
+**KEY INSIGHT (refines the prior "it's the data" conclusion → it's BOTH):** proprio was **propping rank UP with junk dims that don't aid navigability** (the smooth proprio block satisfied prediction while vision stayed scrambled). Remove it and the pure-visual encoder **collapses to ~10 dims** in this online-exploration regime. Neither setup is right: proprio = high rank / no locality; pixels-only = low rank / transient locality. The new target is no longer data-vs-architecture — it's **why the pixels-only latent rank-collapses, and how to hold its rank so the step-2000 locality sustains.**
+
+**NEXT (running):** `cem_lewm_noprop_pooled` — no-proprio + the **pooled** SIGReg (drop `--sigreg-pertimestep`; default `B·T=512 > D=192` vs per-timestep's B=128<192). Tests whether under-sampled isotropy let rank collapse. (Caveat: the 2026-06-24 slowness entry already found per-timestep≈pooled for *locality* at D=256 — but this asks a different question, RANK in the low-rank 192-d regime.) If pooling doesn't hold rank, the lever moves to an explicit rank/variance floor or the data/behavior side.
+
+## 2026-06-25 — SIGReg pipeline bug found (LayerNorm vs BatchNorm projector) + fixed → best transient ever, but EXACT-LeWM architecture STILL fails ⇒ it's the DATA, decisively
+
+Audited SIGReg from first principles. The statistic + kwargs (`knots=17, num_proj=1024`) and the per-timestep call matched LeWM, but **the `emb` SIGReg regularizes was produced with the wrong norm.** LeWM's `emb = projector(ViT_cls)` where projector = `MLP(hidden=2048, norm_fn=BatchNorm1d)` (`lewm.yaml`); my `visual_head`/`pred_proj` used `lewm.module.MLP`'s **default `norm_fn=LayerNorm`** (per-SAMPLE, no cross-batch anti-collapse) instead of BatchNorm1d (per-DIM cross-batch whitening = the SSL anti-collapse mechanism). Fixed in the pixels-only path (`use_proprio=False`): projector + pred_proj now `BatchNorm1d`, hidden 2048, matching LeWM exactly.
+
+**Effect of the BatchNorm fix** (`cem_lewm_bn_wrist`, W&B `gwy0u3bl`; vs the LayerNorm twins `g068v7m6`/`2zzk70mo`):
+
+| metric | LayerNorm no-proprio | **BatchNorm no-proprio** |
+|---|---|---|
+| best early reach (step 1000) | 0.18–0.28 | **0.44** (frac_rand 0.040, < LeWM's 0.09!) |
+| rank_frac (sustained) | pinned ~0.05 (~10 dims) | **~0.10–0.11 (~20 dims, ~2.3×)** |
+| end-state corr* / reach / dist_goal | 0.5 / 0.01 / ~16–20 | 0.46 / **0.00** / ~19 |
+
+So BatchNorm **was a real bug** — it doubled the rank and produced the strongest transient of the whole investigation. But **the end-state is the same failure.** Decisive evidence in the `z_std` column: it climbs 0.14→1.05 (SIGReg achieving its unit-variance isotropy target) and **locality/reach die in exact lockstep with that climb.** SIGReg succeeding *is* what kills locality.
+
+**VERDICT — it's the DATA, now proven by exhaustion.** Every architectural knob is now *exactly* LeWM — pixels-only 192-d, **BatchNorm projector**, β=0.09, per-timestep SIGReg, 1-step training, action_block=5=frameskip — and it STILL fails the moment SIGReg drives z_std→1. The SIGReg-vs-locality tension is irreducible *for our data*: LeWM's smooth expert demos keep consecutive frames near-identical so isotropy + locality coexist; our jerky online-curiosity frames get shoved apart when isotropized. The only difference left between us and LeWM is the **data smoothness**.
+
+**NEXT (running):** test the data hypothesis directly. SAC-curiosity collection (CEM has no smoothness lever — actor is off) with the BatchNorm pixels-only encoder + **action-rate smoothness penalty `--w-action-rate 3`** (calibrated: dither −4.3 vs cur +10, smooth −0.3) + **low action-max cap (0.15)** → does genuinely smoother/gentler collected data give a *sustained* local latent (corr* staying low even as z_std→1, vs the always-decays pattern)? If yes, the fix is confirmed data-side and CEM goal-reaching gets re-enabled on the smooth latent.
+
+## 2026-06-25 — DATA HYPOTHESIS REFUTED (it's the SIGReg isotropy, not the data) → then multi-epoch consolidation: epochs FIX rank but OVERFIT on small data ⇒ the real gap is data DIVERSITY
+
+**The data hypothesis is dead, killed by its own clean controls.** Built `--collect-smooth` (scripted sub-action OU walk, persisted across decisions; WM-only training, mirrors LeWM's offline-WM-on-data) to remove the curiosity/CEM confound. Also discovered the earlier locality tests were ALL under CEM (goal-explore, SAC off) — the buffer came from a *failing planner*, a chicken-and-egg confound the user flagged. Ran the controls (all no-proprio BatchNorm 192-d, per-timestep SIGReg β=0.09, WM-only):
+
+| run | data | encoder input | end corr* |
+|---|---|---|---|
+| `ooymluqd` curiosity baseline | jerky (rate~1.0) | wrist (jerky) | ~0.50 |
+| `xff36yyd` smooth-collector | **smooth** (rate 0.04) | wrist (still jerky — egocentric viewpoint swings) | ~0.49 |
+| `pvjmnyle` smooth + OVERHEAD | smooth (rate 0.04) | **overhead (smooth)** | ~0.41 |
+
+All fail identically. The smoking gun (`pvjmnyle` step 2000): `step_jump=19.7`, `frac_rand=1.006` — consecutive latents a FULL random-pair apart **on near-identical overhead frames** (smooth joints, fixed cam, arm barely moved). **SIGReg satisfies its z_std→1 isotropy target by SCATTERING consecutive frames across the Gaussian — and that scattering is what kills locality, independent of data smoothness OR camera.** Baseline also closes the CEM-confound worry: native curiosity data fails the same as CEM data. The session-long "it's the data" thread is FALSIFIED.
+
+**Then tested the last LeWM difference — SCALE / multi-epoch.** Built `--consolidate-every N` / `--consolidate-epochs E`: every N steps, pause stepping and train E passes over the frozen buffer (pushes our online single-pass regime toward LeWM's 100-epoch offline). First run `rl63c6zt` (every 2 steps, 2 epochs, smooth-overhead) — BUT buffer capped at **1000** (`clip(buffer_frac·total_steps)` floored, total_steps=2000). Result at step 1500 (~500 epochs):
+
+- **pred/persist CRASHED 0.89 → 0.021** (WM predicts ~50× better than persistence — pred_loss WON), and **rank_frac UN-COLLAPSED 0.026 → 0.294** (~56 dims, best ever, toward LeWM's ~0.5). **So epochs FIX the rank collapse that haunted every prior run.**
+- **BUT it OVERFIT and went ANTI-LOCAL:** `frac_rand=1.765` (`corr*=2.57`) — consecutive frames now FARTHER than random pairs. ~500 epochs on 1000 transitions = memorize the buffer, scatter frames maximally.
+
+**KEY REFRAME — "scale" = DATA DIVERSITY, not epochs.** The lever (epochs) is powerful — it crushes pred_loss and fixes rank — but with too little data it memorizes and destroys locality. LeWM's real edge is 2M *diverse* frames so 100 epochs generalizes. Epochs/data ratio matters: this run saw each frame ~500–1000× vs LeWM's 100×.
+
+**NEXT (running):** `consol_bigbuf_smooth_overhead` — `--buffer-frac 3.0` (cap 12k, 12×), `--consolidate-every 30 --consolidate-epochs 1` → ~100 passes (LeWM ratio, not 1000). Does a bigger buffer + LeWM-matched epochs hit the sweet spot — high rank AND low corr* (local) — or still overfit (data still too small vs 2M)?
+
+## 2026-06-25 — FIRST REAL PROGRESS: big-buffer + LeWM-ratio epochs breaks the corr*~0.5 wall (no overfit) → it's DATA SCALE. Now testing the CEM payoff on that latent.
+
+`consol_bigbuf_smooth_overhead` (W&B `rxehmdd5`; smooth-overhead data, `--buffer-frac 3.0` cap **12000**, `--consolidate-every 30 --consolidate-epochs 1` = **~100 passes** = LeWM ratio, not the 1000 that overfit). First run where ALL FOUR metrics are good simultaneously:
+
+| step | frac_rand | corr* | rank_frac | pred/persist |
+|---|---|---|---|---|
+| 1500 | 0.334 | 0.424 | 0.131 | 0.320 |
+| 2000 | **0.246** | 0.301 | 0.196 | 0.162 |
+| 3000 | 0.277 | 0.306 | 0.189 | 0.088 |
+| 3500 | 0.278 | 0.330 | **0.347** | **0.066** |
+
+- **corr* ~0.30** — best non-collapsed locality of the whole investigation (every prior run ~0.5); **~halfway from the failure wall to LeWM's 0.09.**
+- **rank_frac 0.13→0.35** (~67 dims) — highest ever, toward LeWM ~0.5. Epochs fix the collapse for real.
+- **pred/persist 0.066** — strong, and **healthy generalization** (NOT the 0.021 memorization of the small-buffer run).
+- **frac_rand stable ~0.27 — NO anti-local overfit** (small buffer blew to 1.76). The 12× data did its job.
+
+So the **recipe is directionally right**: smooth-overhead data + big buffer + LeWM-ratio epochs → high-rank, well-predicting, meaningfully-more-local latent, no overfit. **BUT it plateaus at frac_rand ~0.27, not 0.09:** frac_rand bottomed at step 2000 and flattened while rank kept rising ⇒ more epochs stopped helping locality ⇒ **DATA-LIMITED.** 12k diverse frames gets ~halfway; closing to 0.09 needs more raw data (toward LeWM's 2M). Next data-scale lever (option a, deferred): cap 30–50k + longer collection.
+
+**PAYOFF TEST (running) — option (b), test CEM on this latent before chasing 0.09.** `cem_on_bigbuf_latent` (W&B `cpybzd8p`): `--cem --resume-name consol_bigbuf_smooth_overhead --freeze-encoder --no-proprio --wm-cam overhead`. Loads the corr*~0.30 latent (ckpt_4000), FREEZES the encoder (latent stationary, the good geometry preserved), predictor keeps training to adapt to CEM's full-range action candidates (smooth collector only trained it on small OU actions). THE QUESTION: does a corr*~0.30 latent finally give **nonzero reach** / dist_goal below the 19.6 random-pair ceiling — i.e. does the halfway locality gain already buy goal-reaching? EVERY prior CEM run on a corr*~0.5 latent had reach=0 / dist~20. Even reach 0.05–0.2 = first sustained nonzero reach = breakthrough. Early signal healthy: contacts/s=0.70 at step 50 (arm interacting), resume + freeze confirmed.
+
+**PAYOFF RESULT (`cpybzd8p`, finished):** the locality gain TRANSFERS to planning but isn't yet enough for reach.
+
+| | prior CEM (corr*~0.5) | this run (corr*~0.30, frozen) |
+|---|---|---|
+| dist_goal | pinned ~20 (19.6 ceiling) | **~15.5** (first sub-ceiling EVER) |
+| reach | 0.00 | **0.00** |
+| pred/persist (CEM actions) | — | 0.7-0.8 (predictor adapted, beats persistence) |
+
+Frozen latent stayed GOOD + stationary the whole run (frac_rand ~0.29, rank 0.239, z_std 0.872 constant). **Two clean conclusions:** (1) the locality gain is REAL and transfers — dist_goal dropped from the ~20 ceiling to ~15.5, first CEM run ever below the random-pair ceiling. (2) The predictor confound resolved (pred/persist fell to ~0.7, so it's NOT a predictor-action-mismatch artifact). ⇒ **"halfway-local" (frac_rand 0.29) is not local enough for reach:** CEM closes goals to ~15.5 but can't get within the eps=2.0 reach threshold (per-step latent jump ~5.7 is too coarse). dist_goal scales with locality, so closing the rest of the gap (frac_rand 0.27 → ~0.09) should buy reach. **NEXT = option (a) data scale:** `consol_bigbuf50k_smooth_overhead` — cap 50000 (max, ~4x), ~100-epoch ratio, then re-run this exact CEM test on the result to see if reach finally clears 0.

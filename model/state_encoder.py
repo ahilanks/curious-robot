@@ -39,23 +39,33 @@ def build_vit_tiny(image_size: int = 224, patch_size: int = 14) -> ViTModel:
 
 class StateEncoder(nn.Module):
     def __init__(self, n_dof: int = 6, vis_dim: int = 192, prop_dim: int = 64,
-                 image_size: int = 224, patch_size: int = 14):
+                 image_size: int = 224, patch_size: int = 14, use_proprio: bool = True):
         super().__init__()
+        self.use_proprio = use_proprio
         self.vit = build_vit_tiny(image_size, patch_size)
         cls_dim = self.vit.config.hidden_size  # 192
-        self.visual_head = MLP(cls_dim, 4 * cls_dim, vis_dim)   # MLP(ViT_cls) -> 192
-        self.proprio = ProprioEncoder(n_dof, out_dim=prop_dim)  # MLP(symlog(.)) -> 64
-        self.out_dim = vis_dim + prop_dim                       # 256
-        # Joint fusion MLP over the concatenated visual+proprio features (README's outer MLP).
-        # No final LayerNorm on the fused output: a per-sample LN forces every z onto a
-        # fixed-radius sphere, which fights SIGReg's isotropic-Gaussian regularizer (LeWM
-        # keeps only BatchNorm inside the projector MLP and no output normalization).
-        self.fuse = MLP(self.out_dim, 4 * self.out_dim, self.out_dim)
+        if use_proprio:
+            self.visual_head = MLP(cls_dim, 4 * cls_dim, vis_dim)   # MLP(ViT_cls) -> 192
+            self.proprio = ProprioEncoder(n_dof, out_dim=prop_dim)  # MLP(symlog(.)) -> 64
+            self.out_dim = vis_dim + prop_dim                       # 256
+            # Joint fusion MLP over the concatenated visual+proprio features (README's outer MLP).
+            self.fuse = MLP(self.out_dim, 4 * self.out_dim, self.out_dim)
+        else:
+            # LeWM-faithful PIXELS-ONLY state: z = projector(ViT_cls), replicating lewm.jepa.JEPA.encode
+            # with LeWM's EXACT projector (lewm.yaml): MLP(hidden=2048, norm_fn=BatchNorm1d). The
+            # BatchNorm1d does per-dim whitening ACROSS the batch -- the SSL anti-collapse mechanism
+            # SIGReg's isotropy target relies on. (The MLP default norm_fn is LayerNorm = per-SAMPLE,
+            # which gives no cross-batch anti-collapse -- NOT what LeWM uses.) D = vis_dim = 192.
+            self.visual_head = MLP(cls_dim, 2048, vis_dim, norm_fn=nn.BatchNorm1d)
+            self.out_dim = vis_dim                                  # 192
 
     def forward(self, image_norm: torch.Tensor, proprio: torch.Tensor) -> torch.Tensor:
-        """image_norm: (B,3,H,W) normalized; proprio: (B,3*n_dof) -> z: (B, 256)."""
+        """image_norm: (B,3,H,W) normalized; proprio: (B,3*n_dof) -> z: (B, out_dim).
+        proprio is ignored when use_proprio=False (kept in the signature so call sites are uniform)."""
         cls = self.vit(image_norm, interpolate_pos_encoding=True).last_hidden_state[:, 0]
         v = self.visual_head(cls)
+        if not self.use_proprio:
+            return v                                               # pixels-only (192-d), proprio dropped
         p = self.proprio(proprio)
         return self.fuse(torch.cat([v, p], dim=-1))
 
@@ -78,14 +88,21 @@ class WorldModel(JEPA):
         dropout: float = 0.1,
         image_size: int = 224,
         patch_size: int = 14,
+        use_proprio: bool = True,
     ):
-        encoder = StateEncoder(n_dof, vis_dim, prop_dim, image_size, patch_size)
+        if not use_proprio:
+            z_dim = vis_dim          # LeWM-faithful pixels-only: D = 192 (= LeWM embed_dim)
+        encoder = StateEncoder(n_dof, vis_dim, prop_dim, image_size, patch_size,
+                               use_proprio=use_proprio)
         predictor = ARPredictor(
             num_frames=history_size, input_dim=z_dim, hidden_dim=z_dim, output_dim=z_dim,
             depth=depth, heads=heads, dim_head=dim_head, mlp_dim=mlp_dim, dropout=dropout,
         )
         action_encoder = Embedder(input_dim=n_dof * action_block, emb_dim=z_dim)
-        pred_proj = MLP(z_dim, 2048, z_dim)
+        # LeWM applies BatchNorm1d in BOTH projector and pred_proj (lewm.yaml). Match it in the
+        # pixels-only path; the proprio path keeps the MLP-default LayerNorm (unchanged baseline).
+        pred_proj = (MLP(z_dim, 2048, z_dim, norm_fn=nn.BatchNorm1d) if not use_proprio
+                     else MLP(z_dim, 2048, z_dim))
         super().__init__(encoder=encoder, predictor=predictor,
                          action_encoder=action_encoder, pred_proj=pred_proj)
         self.z_dim = z_dim
