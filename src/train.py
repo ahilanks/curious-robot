@@ -303,6 +303,30 @@ class ReplayBuffer:
             px[slot] = self.pixels[e, gi]; pr[slot] = self.proprio[e, gi]; valid[slot] = True
         return px, pr, valid
 
+    def sample_recent_goal(self, env_idx, k):
+        """Controller goal (--goal-select recent): per env, the obs the agent visited EXACTLY `k`
+        decisions ago in its CURRENT episode -- a CONTROLLED-small-distance, definitely-on-manifold
+        goal whose latent reach_gap ~ k*step_jump. Sweeping k maps the planner's reachable radius
+        (the threshold between the reach=1 at gap~0 and reach=0 at gap~8 regimes). Returns (px,prop,valid)."""
+        L = len(env_idx)
+        px = np.zeros((L, *self.pixels.shape[2:]), np.uint8)
+        pr = np.zeros((L, self.proprio.shape[2]), np.float32)
+        valid = np.zeros(L, bool)
+        if not self.goal_explore:
+            return px, pr, valid
+        kk = max(int(k), 1)
+        for slot in range(L):
+            e = int(env_idx[slot]); n = int(self.count[e])
+            if n < kk + 2:
+                continue
+            order = ((np.arange(self.C) + int(self.head[e])) % self.C) if n == self.C else np.arange(n)
+            same = order[self.ep_id[e, order] == self.ep_id[e, order[-1]]]   # current episode, oldest..newest
+            if len(same) < kk + 1:
+                continue
+            gi = int(same[-1 - kk])                                          # the state kk decisions BEFORE now
+            px[slot] = self.pixels[e, gi]; pr[slot] = self.proprio[e, gi]; valid[slot] = True
+        return px, pr, valid
+
     def sample_sac(self, batch, per_alpha, per_beta, her_frac=0.0):
         vp = self._valid_pairs()
         if vp is None or len(vp[0]) < batch:
@@ -446,7 +470,8 @@ def score_obs_mse(wm, gpx, gprop, spx, sprop, sact, device, H):
 
 
 @torch.no_grad()
-def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, device, diag=None):
+def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, device, diag=None, gamma=0.0,
+             min_std=0.0, mppi_temp=0.0):
     """CEM planner in LATENT space -- a faithful port of LeWM's stable_worldmodel.solver.CEMSolver
     (+ JEPA.rollout/criterion). Per replan: sample H-step action SEQUENCES from a per-step Gaussian,
     FORCE candidate 0 = the current mean (LeWM's candidates[:,0]=mean), roll each AUTOREGRESSIVELY
@@ -478,11 +503,19 @@ def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, dev
             seq[:, 0] = mu                                            # LeWM: force candidate 0 = current mean
             sf = seq.reshape(n * K, T, a_dim)
             z_seq, a_seq = z0, a0                                         # (n*K, Hb, .) growing rollout buffers
+            step_costs = []                                              # per-rollout-step ||z_{t+h+1} - z*||^2
             for h in range(T):                                           # autoregressive WM rollout
                 a_seq = torch.cat([a_seq, sf[:, h:h + 1]], dim=1)        # apply candidate action a_{t+h}
                 znext = predict(z_seq[:, -Hb:], wm.action_encoder(a_seq[:, -Hb:]))[:, -1:]
                 z_seq = torch.cat([z_seq, znext], dim=1)                 # append predicted z_{t+h+1}
-            cost = (z_seq[:, -1] - zg).pow(2).sum(-1).reshape(n, K)      # terminal ||.||^2 (LeWM: SUM over dims)
+                step_costs.append((znext[:, -1] - zg).pow(2).sum(-1))    # (n*K,) running cost at step h+1
+            # cost = discounted running sum sum_h gamma^(T-1-h) ||z_h - z*||^2 (terminal weight 1).
+            # gamma=0 -> terminal-only, BYTE-IDENTICAL to the LeWM objective; gamma in (0,1] shapes the
+            # path so CEM gets gradient toward the goal even when the H-step endpoint is out of reach.
+            if gamma > 0:
+                cost = sum((gamma ** (T - 1 - h)) * step_costs[h] for h in range(T)).reshape(n, K)
+            else:
+                cost = step_costs[-1].reshape(n, K)                      # terminal ||.||^2 (LeWM: SUM over dims)
             if diag is not None and it == 0:
                 # action-sensitivity probe on the FIRST (widest, std=init_std) candidate batch:
                 #   cost_cv       = spread of terminal cost across candidates (~0 => CEM has no signal to optimize)
@@ -504,10 +537,41 @@ def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, dev
                     diag["z_term_spread"] = float(zvar.sum(-1).sqrt().nanmean())
                     z_now = z0.reshape(n, K, Hb, D)[:, 0, -1]
                     diag["reach_gap"] = float((z_now - z_goal).pow(2).sum(-1).clamp_min(0).sqrt().mean())
-            idx = cost.topk(elite, largest=False, dim=1).indices
-            el = torch.gather(seq, 1, idx[:, :, None, None].expand(n, elite, T, a_dim))
-            mu = el.mean(1)
-            std = el.std(1)                                              # LeWM: NO min-std floor
+            if diag is not None and it == iters - 1:
+                # CONVERGED-plan probe (narrow std): distinguishes 'reachable set too small' from
+                #   'planner can't aim'. min_cand_to_goal = best candidate endpoint distance to the goal
+                #   after CEM has refit -- if this stays ~reach_gap, no plan can get closer (size/WM-limited);
+                #   if it drops well below reach_gap yet realized dist stays high, the limit is open-loop /
+                #   direction (the WM thinks it reaches but execution doesn't). endpoint_disp = how far the
+                #   mean converged endpoint sits from z_now (is the plan even committing to move?).
+                with torch.no_grad():
+                    ztf = z_seq[:, -1].float().reshape(n, K, D)
+                    finite = torch.isfinite(ztf).all(-1)                            # (n, K)
+                    d2g = (ztf - z_goal.unsqueeze(1)).pow(2).sum(-1).clamp_min(0).sqrt()  # (n, K)
+                    d2g = torch.where(finite, d2g, torch.full_like(d2g, float("inf")))
+                    diag["min_cand_to_goal"] = float(d2g.min(1).values.mean())
+                    ztm = torch.where(finite.unsqueeze(-1), ztf, torch.full_like(ztf, float("nan"))).nanmean(1)  # (n, D)
+                    z_now2 = z0.reshape(n, K, Hb, D)[:, 0, -1]
+                    diag["endpoint_disp"] = float((ztm - z_now2).pow(2).sum(-1).clamp_min(0).sqrt().nanmean())
+            if mppi_temp > 0:
+                # MPPI / information-theoretic SOFT update: weight ALL candidates by exp(-cost/temp)
+                # instead of CEM's hard top-k elites. Lower temp -> greedier (approaches argmin = max
+                # model exploitation); higher temp -> softer averaging (less exploitation of the model's
+                # optimistic corner). LeWM CEM == hard elites (mppi_temp=0).
+                c = cost.float()
+                c = torch.where(torch.isfinite(c), c, torch.full_like(c, float("inf")))
+                cmin = c.min(1, keepdim=True).values                     # subtract min for numerical stability
+                w = torch.softmax(-(c - cmin) / mppi_temp, dim=1).to(seq.dtype)   # (n, K)
+                mu = (w[:, :, None, None] * seq).sum(1)                   # (n, T, a_dim) weighted mean
+                var = (w[:, :, None, None] * (seq - mu.unsqueeze(1)).pow(2)).sum(1)
+                std = var.clamp_min(0).sqrt()
+            else:
+                idx = cost.topk(elite, largest=False, dim=1).indices
+                el = torch.gather(seq, 1, idx[:, :, None, None].expand(n, elite, T, a_dim))
+                mu = el.mean(1)
+                std = el.std(1)                                          # LeWM: NO min-std floor (unless --cem-min-std)
+            if min_std > 0:
+                std = std.clamp_min(min_std)                             # floor to keep exploration / curb std-collapse
     return mu                                                            # full H-step plan (open-loop receding horizon)
 
 
@@ -1162,6 +1226,9 @@ def main(args):
     #     per env, consumed one block-action per decision; cem_ptr starts "exhausted" so step 0 plans,
     #     and an env re-plans when its buffer empties / it just reset / its goal refreshed this step. ---
     cem_H = max(args.cem_horizon, 1)
+    # replan stride: re-plan every cem_stride decisions (executing only that many of the H-step plan),
+    # decoupling execution from lookahead. 0 -> LeWM open-loop (stride == H). 1 -> true receding-horizon MPC.
+    cem_stride = cem_H if args.cem_replan_every <= 0 else min(args.cem_replan_every, cem_H)
     cem_buf = torch.zeros(args.n_envs, cem_H, a_dim, device=device)
     cem_ptr = np.full(args.n_envs, cem_H, np.int64)
     cem_diag = {}                                     # latest CEM action-sensitivity probe (cem/cost_cv, z_term_spread, reach_gap)
@@ -1177,8 +1244,12 @@ def main(args):
     zstar_env = torch.zeros(args.n_envs, z_dim, device=device)
     has_goal = np.zeros(args.n_envs, bool)
     goal_evictions = 0
-    goal_recent = ({k: deque(maxlen=400) for k in ("dist", "reach", "dist_env")}
+    goal_recent = ({k: deque(maxlen=400) for k in ("dist", "reach", "dist_env", "qpos_dist", "qpos_reach")}
                    if args.goal_explore else None)
+    # reachable-radius curriculum state: the CURRENT goal offset k (mutable). Pure goal-RANGE schedule --
+    # grown by the controller in the main loop; refresh_goals reads curric_k[0]. No loss/arch involvement.
+    curric_k = [args.goal_curric_start if (args.goal_curriculum and args.goal_curric_start > 0)
+                else args.goal_future_k]
 
     def reach_eps_now(step):
         """Annealed reach threshold for the goal/reach_rate DIAGNOSTIC: linearly from
@@ -1199,9 +1270,12 @@ def main(args):
         goals NEAREST the env's current latent z (reachable within the CEM horizon)."""
         if archives is None:
             return
-        if args.goal_select == "future":                 # reachable on-manifold goal from the env's own buffer
+        if args.goal_select in ("future", "recent"):     # controlled-distance goal from the env's own buffer
             ei = np.asarray([int(e) for e in env_idx])
-            gpx, gprop, gvalid = buf.sample_future_goal(ei, args.goal_future_k)
+            if args.goal_select == "recent":             # k decisions AGO (reach_gap ~ k*step_jump, small/controlled)
+                gpx, gprop, gvalid = buf.sample_recent_goal(ei, curric_k[0])    # curriculum-controlled offset
+            else:                                         # k decisions ahead of a random anchor (on-manifold)
+                gpx, gprop, gvalid = buf.sample_future_goal(ei, curric_k[0])
             for slot in range(len(ei)):
                 if gvalid[slot]:
                     e = int(ei[slot])
@@ -1232,6 +1306,9 @@ def main(args):
             has_goal[e] = True
 
     h_fwd = resume_h_fwd if resume_h_fwd is not None else args.h_fwd_start   # curriculum horizon (resumed if warm-started)
+    if args.h_fwd_override > 0:               # force the WM-rollout-training horizon, IGNORING the resumed value
+        h_fwd = args.h_fwd_override           # (resume normally pins h_fwd to the ckpt's 1-step stage)
+        print(f"[h_fwd] OVERRIDE -> training WM on {h_fwd}-step rollouts (was resume/start={resume_h_fwd or args.h_fwd_start})", flush=True)
     pred_hist = deque(maxlen=args.flatline_window)    # for the flatline bump trigger
     updates_at_stage = 0
     rnd_upd = 0                                       # RND predictor update counter (for --rnd-train-every)
@@ -1379,6 +1456,23 @@ def main(args):
                     goal_recent["dist"].append(float(gdist[has_goal].mean()))
                     goal_recent["reach"].append(float((gdist[has_goal] < reach_eps_now(step)).mean()))
                     goal_recent["dist_env"].append(np.where(has_goal, gdist, np.nan))  # per-env series; NaN where self-goal (excluded)
+                    # PHYSICAL (joint-space) success: proprio[..., :n_dof] = raw qpos (radians). A goal counts
+                    # reached when EVERY joint is within --goal-success-qpos-eps of the goal's stored qpos
+                    # (inf-norm). Ground-truth check independent of the latent metric -- DIAGNOSTIC only.
+                    qd = np.abs(cur_prop[:, :n_dof] - goal_prop_env[:, :n_dof]).max(axis=1)   # (n_envs,) max joint err
+                    goal_recent["qpos_dist"].append(float(qd[has_goal].mean()))
+                    goal_recent["qpos_reach"].append(float((qd[has_goal] < args.goal_success_qpos_eps).mean()))
+            # --- reachable-radius CURRICULUM: pure goal-RANGE schedule (NOTHING in the loss/architecture;
+            #     target stays LATENT goal/reach_rate, never qpos). Start goals INSIDE the planner's ~5-unit
+            #     closing radius (small k) and grow k outward (further-back goal = larger reach_gap) once the
+            #     windowed LATENT reach clears the threshold -- extends the reachable radius as the planner earns it.
+            if (args.goal_curriculum and step > 0 and step % args.goal_curric_patience == 0
+                    and curric_k[0] < args.goal_curric_max_k and len(goal_recent["reach"]) >= 50):
+                wr = float(np.mean(goal_recent["reach"]))
+                if wr >= args.goal_curric_thresh:
+                    curric_k[0] += 1
+                    goal_recent["reach"].clear()             # measure the harder (larger-k) stage fresh
+                    print(f"[goal-curriculum] step={step} latent_reach={wr:.2f} -> radius k={curric_k[0]}", flush=True)
 
         # --- act: SAC stochastic sample during sim training (the entropy-driven exploration
         #     that un-parks the policy and decorrelates the parallel envs), the DETERMINISTIC
@@ -1399,7 +1493,7 @@ def main(args):
                 # plan H block-actions toward goal latent z* via the WM, buffer them, execute one per
                 # decision, and re-plan an env only when its buffer empties / it just reset / goals
                 # refreshed this step (LeWM clears the plan deque on terminated / _needs_flush).
-                need = cem_ptr >= cem_H
+                need = cem_ptr >= cem_stride                     # replan stride (== cem_H unless --cem-replan-every)
                 need |= is_start                                 # a just-reset env: stale plan + fresh goal
                 if step % args.goal_update_every == 0:           # goals just refreshed for ALL envs
                     need[:] = True
@@ -1408,7 +1502,9 @@ def main(args):
                     rt = torch.as_tensor(ridx, device=device)
                     cem_buf[rt] = cem_plan(wm, hist_z[:, rt], hist_a[:, rt], zstar_env[rt],
                                            args.cem_samples, args.cem_iters, args.cem_elites,
-                                           args.cem_init_std, args.cem_horizon, device, diag=cem_diag)
+                                           args.cem_init_std, args.cem_horizon, device, diag=cem_diag,
+                                           gamma=args.cem_gamma, min_std=args.cem_min_std,
+                                           mppi_temp=args.cem_mppi_temp)
                     cem_ptr[ridx] = 0
                 a = cem_buf[torch.arange(args.n_envs, device=device),
                             torch.as_tensor(cem_ptr, device=device)].clamp(-1.0, 1.0)  # safety: bound to trained range
@@ -1672,6 +1768,8 @@ def main(args):
                 d["cem/finite_frac"] = cem_diag.get("finite_frac", float("nan"))     # frac of CEM candidates rolled out finite
                 _rg = cem_diag.get("reach_gap", 0.0)
                 d["cem/move_vs_gap"] = (cem_diag["z_term_spread"] / _rg) if _rg > 1e-9 else float("nan")
+                d["cem/min_cand_to_goal"] = cem_diag.get("min_cand_to_goal", float("nan"))  # best CONVERGED candidate->goal dist
+                d["cem/endpoint_disp"] = cem_diag.get("endpoint_disp", float("nan"))        # mean converged endpoint move from z_now
             if args.goal_explore:
                 d["goal/archive_size"] = sum(a.n for a in archives)        # total across buffer(s)
                 _ms = [a.mean_score() for a in archives if a.n]
@@ -1688,6 +1786,11 @@ def main(args):
                             d[f"goal/dist_env/{i:02d}"] = float(sm[i] / cnt[i])
                 if goal_recent["reach"]:
                     d["goal/reach_rate"] = float(np.mean(goal_recent["reach"]))
+                if args.goal_curriculum:
+                    d["goal/curric_k"] = curric_k[0]              # current reachable-radius curriculum offset
+                if goal_recent["qpos_dist"]:                       # joint-space (physical) ground-truth
+                    d["goal/qpos_dist"] = float(np.mean(goal_recent["qpos_dist"]))           # mean max-joint err (rad)
+                    d["goal/success_rate_qpos"] = float(np.mean(goal_recent["qpos_reach"]))  # frac within eps on every joint
                 if args.goal_reach_eps_start > 0:                   # only varies when annealing is on
                     d["goal/reach_eps"] = float(reach_eps_now(step))
             if recent_qpos:    # how much of joint space the recent window covers (parked -> ~0)
@@ -1903,6 +2006,10 @@ def parse_args():
     p.add_argument("--h-fwd-max", type=int, default=1,
                    help="max forward rollout horizon; ==start (1) pins the WM to 1-step-ahead "
                         "prediction and disables the H_fwd curriculum")
+    p.add_argument("--h-fwd-override", type=int, default=0,
+                   help="force the WM-rollout-training horizon to this, IGNORING the value pinned by a resumed "
+                        "checkpoint (resume normally restores the ckpt's h_fwd stage, so --h-fwd-start is ignored on "
+                        "warm-start). Use with --h-fwd-max>=override to train multi-step rollouts on a 1-step ckpt.")
     p.add_argument("--gamma-wm", type=float, default=0.95)
     p.add_argument("--sigreg-weight", type=float, default=0.09,
                    help="beta: SIGReg (isotropic-Gaussian) weight, pinned at 0.09 (LeWM's "
@@ -2100,7 +2207,7 @@ def parse_args():
                         "its capture score (the WM has learned it).")
     p.add_argument("--goal-temp", type=float, default=1.0,
                    help="softmax temperature for goal sampling P(k) ~ exp(score_k/temp) (NOT argmax).")
-    p.add_argument("--goal-select", choices=("mse", "near", "future"), default="mse",
+    p.add_argument("--goal-select", choices=("mse", "near", "future", "recent"), default="mse",
                    help="goal source. 'mse' (default) = archive P(k)~softmax(score/temp), highest-WM-MSE "
                         "(most novel -> FARTHEST in latent). 'near' = archive P(k)~softmax(-||z_e-z_k||/temp), "
                         "NEAREST the env's current latent. 'future' = NOT the archive: the obs the agent "
@@ -2109,8 +2216,19 @@ def parse_args():
                         "on-manifold, mirroring LeWM's goal_offset_steps. 'future' is the decisive test of "
                         "whether CEM can close a genuinely reachable goal.")
     p.add_argument("--goal-future-k", type=int, default=10,
-                   help="--goal-select future: forward step offset of the achieved goal (~a few CEM "
-                        "horizons; reachable within a handful of replans).")
+                   help="--goal-select future/recent: step offset of the goal (future=ahead of a random anchor, "
+                        "recent=decisions AGO). Also the constant offset when the curriculum is OFF.")
+    p.add_argument("--goal-curriculum", action="store_true",
+                   help="reachable-radius curriculum: a pure goal-RANGE schedule (NO loss/architecture change; "
+                        "objective stays latent goal/reach_rate, NEVER qpos). With --goal-select recent, start at "
+                        "--goal-curric-start k and grow k by 1 (goal further back => larger reach_gap) every "
+                        "--goal-curric-patience steps once windowed latent reach_rate >= --goal-curric-thresh, "
+                        "capped at --goal-curric-max-k. Extends the planner's reachable radius as it earns it.")
+    p.add_argument("--goal-curric-start", type=int, default=1, help="curriculum starting goal offset k (inside the closing radius).")
+    p.add_argument("--goal-curric-max-k", type=int, default=20, help="curriculum cap on the goal offset k.")
+    p.add_argument("--goal-curric-thresh", type=float, default=0.25,
+                   help="grow the radius when the windowed LATENT reach_rate reaches this (qpos NOT involved).")
+    p.add_argument("--goal-curric-patience", type=int, default=200, help="min steps between curriculum radius bumps.")
     p.add_argument("--her-frac", type=float, default=0.5,
                    help="fraction of SAC transitions whose goal is HER-relabeled to an achieved future obs from "
                         "the same episode (densifies the reach reward).")
@@ -2151,14 +2269,31 @@ def parse_args():
     p.add_argument("--cem-iters", type=int, default=30, help="CEM refit iterations (LeWM cem.yaml n_steps=30)")
     p.add_argument("--cem-elites", type=int, default=30, help="CEM elite count (top-k lowest cost); LeWM topk=30")
     p.add_argument("--cem-init-std", type=float, default=1.0, help="CEM initial action std; LeWM var_scale=1.0")
-    p.add_argument("--cem-min-std", type=float, default=0.1,
-                   help="DEPRECATED / ignored: LeWM uses no elite-refit std floor (kept for launch-arg compat).")
+    p.add_argument("--cem-min-std", type=float, default=0.0,
+                   help="elite-refit std FLOOR: clamp the per-step action std to at least this after each refit "
+                        "(0 = LeWM-faithful, no floor). >0 curbs the std-collapse that makes 30-iter CEM zoom "
+                        "into the model's single most-optimistic (least-reliable) plan -- i.e. less model exploitation.")
     p.add_argument("--cem-horizon", type=int, default=5,
                    help="CEM planning horizon H (block-decisions): minimize terminal ||zhat_H - z*||^2 via "
                         "autoregressive WM rollout. Executed OPEN-LOOP, LeWM-style (receding_horizon == H): "
                         "plan H, execute all H, re-plan when the buffer empties / env resets / goals refresh. "
                         "Set H=1 for replan-every-step. Longer H = more lookahead but more rollout bias "
                         "(this WM is 1-step trained).")
+    p.add_argument("--cem-replan-every", type=int, default=0,
+                   help="replan STRIDE (decisions): re-plan and execute only this many of the H-step plan before "
+                        "re-planning, decoupling execution from the H-step lookahead. 1 = true receding-horizon MPC "
+                        "(plan H, execute 1, replan -- fresh goal feedback every step). 0 (default) = LeWM open-loop "
+                        "(stride == --cem-horizon: execute all H before replanning). Clamped to [1, cem_horizon].")
+    p.add_argument("--cem-gamma", type=float, default=0.0,
+                   help="running/shaped-cost discount: cost = sum_h gamma^(H-1-h) ||z_h - z*||^2 over the rollout "
+                        "(terminal weight 1). 0 (default) = terminal-only, the exact LeWM objective. >0 rewards "
+                        "INTERMEDIATE progress toward the goal so CEM has a gradient even when the H-step endpoint is "
+                        "out of single-plan reach (raises cost_cv); 0.7-0.9 is a reasonable shaping range.")
+    p.add_argument("--cem-mppi-temp", type=float, default=0.0,
+                   help="MPPI-style SOFT update temperature: if >0, refit the plan as the exp(-cost/temp)-weighted "
+                        "mean over ALL candidates (information-theoretic / path-integral update) instead of CEM's "
+                        "hard top-k elites. Lower temp -> greedier (more model exploitation); higher -> softer. "
+                        "0 (default) = LeWM hard-elite CEM. Tests whether soft selection exploits WM error less.")
     p.add_argument("--gamma", type=float, default=0.9)
     p.add_argument("--tau", type=float, default=0.005, help="Polyak rate (SAC-style target critic)")
     p.add_argument("--actor-lr", type=float, default=3e-4)
