@@ -27,6 +27,28 @@ from lewm.module import ARPredictor, Embedder, MLP
 from model.proprio import ProprioEncoder
 
 
+# Predictor sizing. LeWM (lewm/config/train/model/lewm.yaml) builds the ARPredictor with
+# depth=6, heads=16, dim_head=64, mlp_dim=2048. The defaults below match that. Checkpoints
+# trained before --wm-pred-* existed used the SMALLER predictor (heads=8, dim_head=32,
+# mlp_dim=1024); `pred_dims_from_args` reconstructs THAT from a checkpoint's saved args so old
+# ckpts still load. Only heads/dim_head/mlp_dim/depth change the predictor's weight shapes;
+# z_dim is set by the encoder (192 pixels-only / 256 with proprio), independent of these.
+_PRED_DIMS_OLD = dict(depth=6, heads=8, dim_head=32, mlp_dim=1024)
+
+
+def pred_dims_from_args(a) -> dict:
+    """Resolve predictor dims from a saved args dict (`ck['args']`) or an argparse Namespace.
+    Keys absent from the source fall back to the OLD small predictor — i.e. a checkpoint
+    that predates `--wm-pred-*` rebuilds the exact predictor it was trained with."""
+    get = a.get if isinstance(a, dict) else (lambda k, d=None: getattr(a, k, d))
+    return dict(
+        depth=int(get("wm_pred_depth", _PRED_DIMS_OLD["depth"]) or _PRED_DIMS_OLD["depth"]),
+        heads=int(get("wm_pred_heads", _PRED_DIMS_OLD["heads"]) or _PRED_DIMS_OLD["heads"]),
+        dim_head=int(get("wm_pred_dim_head", _PRED_DIMS_OLD["dim_head"]) or _PRED_DIMS_OLD["dim_head"]),
+        mlp_dim=int(get("wm_pred_mlp_dim", _PRED_DIMS_OLD["mlp_dim"]) or _PRED_DIMS_OLD["mlp_dim"]),
+    )
+
+
 def build_vit_tiny(image_size: int = 224, patch_size: int = 14) -> ViTModel:
     """From-scratch (random-init) ViT-tiny; CLS token is the 192-d visual feature."""
     cfg = ViTConfig(
@@ -81,10 +103,10 @@ class WorldModel(JEPA):
         vis_dim: int = 192,
         prop_dim: int = 64,
         history_size: int = 3,          # H_bwd
-        depth: int = 6,
-        heads: int = 8,
-        dim_head: int = 32,
-        mlp_dim: int = 1024,
+        depth: int = 6,                  # predictor dims default to LeWM (lewm.yaml); pre-2026-06-26
+        heads: int = 16,                 # runs used heads=8/dim_head=32/mlp_dim=1024 (~half the
+        dim_head: int = 64,              # capacity). pred_dims_from_args() rebuilds the old size
+        mlp_dim: int = 2048,             # from a checkpoint's saved args.
         dropout: float = 0.1,
         image_size: int = 224,
         patch_size: int = 14,

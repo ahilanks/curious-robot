@@ -36,7 +36,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from lewm.module import SIGReg                            # noqa: E402
-from model.state_encoder import WorldModel                # noqa: E402
+from model.state_encoder import WorldModel, pred_dims_from_args                # noqa: E402
 from src.train import (Actor, ReplayBuffer, TwinQ, collapse_metrics,   # noqa: E402
                        load_actor_state, resolve_ckpt, sac_update, save_and_upload, wm_update)
 
@@ -145,7 +145,7 @@ def main(args):
 
     # --- models + optimizers, exactly as train.py builds them ---
     wm = WorldModel(n_dof=n_dof, action_block=action_block, history_size=H,
-                    dropout=wm_dropout).to(device)
+                    dropout=wm_dropout, **(pred_dims_from_args(src_args) if src_args else {})).to(device)
     wm.eval()                                  # train() only inside wm_update
     sigreg = SIGReg(knots=17, num_proj=1024).to(device)
     actor = Actor(wm.z_dim, a_dim).to(device)

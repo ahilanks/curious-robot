@@ -35,7 +35,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from lewm.module import SIGReg                       # noqa: E402
-from model.state_encoder import WorldModel           # noqa: E402
+from model.state_encoder import WorldModel, pred_dims_from_args  # noqa: E402
 from src.probe import load_probe_hf                  # noqa: E402
 from src.goal_explore import GoalArchive             # noqa: E402  (--goal-explore goal archive)
 # Env backends are imported lazily in main() so the `hardware` backend does not require mujoco.
@@ -921,7 +921,20 @@ def load_init_ckpt(args, wm, actor, critic, critic_tgt, device):
     not in the checkpoint, so Adam moments restart — lower LRs for bring-up if needed."""
     path = resolve_ckpt(args.init_ckpt, args.resume_name or args.name, args.resume_step, args.hf_repo)
     ck = torch.load(path, map_location=device, weights_only=False)
-    wm.load_state_dict(ck["wm"])
+    # Tolerant WM load: the encoder / pred_proj / action_encoder always match, so a frozen-encoder
+    # resume is unaffected. Only a RESIZED predictor mismatches — e.g. resuming a pre-2026-06-26
+    # small-predictor (8/32/1024) checkpoint into the LeWM-faithful default (16/64/2048). Load every
+    # shape-matching tensor; re-init the rest (the predictor then re-bootstraps). Pass matching
+    # --wm-pred-* to warm-start the old predictor exactly instead.
+    own = wm.state_dict()
+    keep = {k: v for k, v in ck["wm"].items() if k in own and own[k].shape == v.shape}
+    wm.load_state_dict(keep, strict=False)
+    if len(keep) != len(own):
+        mods = sorted({k.split(".")[0] for k in own if k not in keep})
+        print(f"[resume] WM partial load: {len(keep)}/{len(own)} tensors matched; re-initialised "
+              f"{len(own) - len(keep)} (submodules: {mods}) — predictor size changed, it will "
+              f"re-bootstrap. Pass --wm-pred-heads/--wm-pred-dim-head/--wm-pred-mlp-dim to match "
+              f"the checkpoint exactly.", flush=True)
     h_fwd = int(ck.get("h_fwd", args.h_fwd_start))
     if getattr(args, "goal_explore", False):
         # goal-conditioned actor/critic have a WIDER first layer (z_dim + goal_dim). Load them
@@ -1052,7 +1065,8 @@ def main(args):
 
     wm = WorldModel(n_dof=n_dof, action_block=args.action_block,
                     history_size=H, dropout=args.wm_dropout,
-                    use_proprio=not args.no_proprio).to(device)
+                    use_proprio=not args.no_proprio,
+                    **pred_dims_from_args(args)).to(device)
     if args.wm_grad_checkpoint:  # off by default: ViT-tiny encode activations are sub-GB vs 80GB free,
         try:                     # so recompute-on-backward is pure slowdown here (the H_fwd rollout is in latent space)
             wm.encoder.vit.gradient_checkpointing_enable()
@@ -2094,6 +2108,13 @@ def parse_args():
                         "BECOME goals -> train the WM where it is worst). 'recency': favor freshly-collected "
                         "windows (exp half-life = 25%% of the buffer).")
     p.add_argument("--wm-dropout", type=float, default=0.1)
+    # WM predictor sizing — defaults match LeWM (lewm/config/train/model/lewm.yaml). Runs before
+    # 2026-06-26 trained a ~half-size predictor (heads 8 / dim-head 32 / mlp-dim 1024); pass those
+    # values to reproduce/continue an old checkpoint with its predictor warm-started instead of re-init.
+    p.add_argument("--wm-pred-depth", type=int, default=6, help="WM predictor transformer depth (LeWM: 6)")
+    p.add_argument("--wm-pred-heads", type=int, default=16, help="WM predictor attention heads (LeWM: 16; was 8)")
+    p.add_argument("--wm-pred-dim-head", type=int, default=64, help="WM predictor head dim (LeWM: 64; was 32)")
+    p.add_argument("--wm-pred-mlp-dim", type=int, default=2048, help="WM predictor FFN hidden (LeWM: 2048; was 1024)")
     p.add_argument("--wm-grad-checkpoint", action="store_true",
                    help="enable ViT gradient checkpointing in the WM update (default off; trades ~10-15ms "
                         "recompute for memory — only worth it if WM-update activation memory is tight)")

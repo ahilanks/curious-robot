@@ -40,7 +40,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from lewm.module import SIGReg                                    # noqa: E402
-from model.state_encoder import WorldModel                        # noqa: E402
+from model.state_encoder import WorldModel, pred_dims_from_args                        # noqa: E402
 from src.offline_train import load_buffer                         # noqa: E402
 from src.train import (Actor, TwinQ, collapse_metrics, load_actor_state, resolve_ckpt,   # noqa: E402
                        sac_update, wm_update)
@@ -223,7 +223,7 @@ def main(args):
         H=H, h_fwd=h_fwd)
 
     wm = WorldModel(n_dof=6, action_block=action_block, history_size=H,
-                    dropout=float(src_args.get("wm_dropout", 0.1))).to(device)
+                    dropout=float(src_args.get("wm_dropout", 0.1)), **pred_dims_from_args(src_args)).to(device)
     wm.load_state_dict(ck["wm"]); wm.eval()
     sigreg = SIGReg(knots=17, num_proj=1024).to(device)
     actor = Actor(wm.z_dim, a_dim).to(device); load_actor_state(actor, ck["actor"])

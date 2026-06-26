@@ -54,7 +54,7 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from model.state_encoder import WorldModel                       # noqa: E402
+from model.state_encoder import WorldModel, pred_dims_from_args                       # noqa: E402
 from src.train import Actor, curiosity_reward, encode_obs, load_actor_state, resolve_ckpt   # noqa: E402
 from env.hardware_env import JOINT_HIGH, JOINT_LOW               # noqa: E402
 
@@ -83,7 +83,7 @@ class Policy:
         self.action_block = int(ca.get("action_block", 5))
         self.a_dim = 6 * self.action_block
         self.wm = WorldModel(n_dof=6, action_block=self.action_block,
-                             history_size=self.H).to(device)
+                             history_size=self.H, **pred_dims_from_args(ca)).to(device)
         self.wm.load_state_dict(ck["wm"]); self.wm.eval()
         self.actor = Actor(self.wm.z_dim, self.a_dim).to(device)
         load_actor_state(self.actor, ck["actor"]); self.actor.eval()
