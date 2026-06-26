@@ -955,3 +955,22 @@ Goal (set by user): self-collecting, stable, **wrist-cam** latent goal-reaching 
 **EFFICIENCY — consolidation passes are the engine, not raw steps.** `cem_wrist_eff` (consolidate-every 140 vs 70 = half the WM grad cost): 1.6× faster per step (14 vs 9 sps) but the radius STALLED at k=3 (vs frozen k=17 at the same step). The radius bootstrap is gated by *consolidation passes* (predictor sharpening), so halving consolidation cripples it — cheaper-per-step is NOT cheaper-per-radius. (Testing the opposite — consolidate-every 40, MORE bootstrap — in `cem_wrist_moreconsol`.) **Practical efficiency recipe: keep consolidate-every ~70; the WM-improvement IS the lever, don't cut it.**
 
 **THAW VERDICT (banked negative, with mechanism):** interleaved encoder co-adaptation during CEM goal-reaching cannot beat frozen — not because it breaks locality (the β fix solves that) but because the radius bootstrap needs a stationary latent. The only path that could let the representation improve is OFFLINE/separate re-training on diverse data (LeWM-style), not interleaving during reach.
+
+## 2026-06-26 — CAMPAIGN SUMMARY (wrist-cam goal-reaching) + BEST RECIPE
+
+**Goal achieved:** self-collecting (curiosity), stable, **wrist-cam** latent goal-reaching with locality + a well-learned WM (qpos irrelevant). All runs on W&B.
+
+**Headline numbers (wrist cam, frozen curiosity latent `cur_consol_wrist_bn`@3000 + reachable-radius curriculum):**
+- **Max radius:** k=**23** (uncapped curriculum) — beats overhead (k=19); but reach collapses to ~0.05 at that ceiling.
+- **Best OPERATING POINT:** cap the radius at **k≈12** → sustained latent **reach ~0.16** (2–4× the max-radius run). Moderate radius >> max radius for usable goal-reaching.
+- WM learns well throughout (pred_vs_persist 0.05–0.10 on the frozen latent).
+
+**REACH-VS-RADIUS trade-off:** the curriculum grows the radius but reach drops as goals get harder; capping the radius trades range for a much higher sustained success rate. Pick the cap for the use case.
+
+**Resolved sub-questions:**
+- **Camera:** wrist works (k=23 / reach 0.16 capped) despite worse locality (~0.20–0.24 vs overhead 0.13) — the curriculum compensates; locality helps but isn't the gate.
+- **Interleaved encoder:** FROZEN is correct. Thaw during CEM breaks locality via SIGReg isotropy (fixed by `--encoder-thaw-beta`), but even non-destructive thaw stalls the radius because the predictor bootstrap needs a STATIONARY latent. Representation improvement must be OFFLINE, not interleaved.
+- **Efficiency:** consolidate-every **~70** is the sweet spot — cheaper (140) cripples the radius bootstrap, richer (40) saturates (no gain). The WM-improvement (consolidation passes) IS the engine.
+- **From-scratch wrist locality:** fails (frac_rand 0.46) — use the existing curiosity wrist latent.
+
+**BEST RECIPE (wrist goal-reaching):** `--cem --resume-name cur_consol_wrist_bn --resume-step 3000 --freeze-encoder --no-proprio --wm-cam wrist --sigreg-pertimestep --consolidate-every 70 --action-max 0.05 --goal-select recent --goal-update-every 25 --goal-curriculum --goal-curric-start 1 --goal-curric-thresh 0.12 --goal-curric-patience 150 --goal-curric-max-k <12 for high reach | 40 for max range>`. New flags this campaign: `--goal-select recent`, `--goal-curriculum` (+ knobs), `--cem-gamma/replan-every/mppi-temp/min-std`, `--h-fwd-override`, `--encoder-thaw-every/dur/lr/beta`, `cem/min_cand_to_goal`+`endpoint_disp`+qpos diagnostics.
