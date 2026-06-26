@@ -1107,9 +1107,17 @@ def main(args):
     # --encoder-thaw-every interleaves frozen acting with periodic encoder co-adaptation. The optimizer
     # must then include the (initially frozen) encoder params so AdamW can update them during thawed windows;
     # params with grad=None (frozen windows) are skipped automatically, so this is a no-op when frozen.
-    _wm_params = (list(wm.parameters()) if args.encoder_thaw_every > 0
-                  else [p for p in wm.parameters() if p.requires_grad])
-    wm_opt = torch.optim.AdamW(_wm_params, lr=args.wm_lr, weight_decay=1e-3)
+    if args.encoder_thaw_every > 0:
+        # two LR groups: the encoder gets a (typically smaller) thaw LR so co-adaptation NUDGES the latent
+        # rather than lurching it (the lurch is what 50%-duty full-LR thaw did -> locality collapse).
+        _enc = list(wm.encoder.parameters()); _enc_ids = {id(p) for p in _enc}
+        _other = [p for p in wm.parameters() if id(p) not in _enc_ids]
+        _thaw_lr = args.encoder_thaw_lr if args.encoder_thaw_lr > 0 else args.wm_lr
+        wm_opt = torch.optim.AdamW([{"params": _other, "lr": args.wm_lr},
+                                    {"params": _enc, "lr": _thaw_lr}], weight_decay=1e-3)
+    else:
+        wm_opt = torch.optim.AdamW([p for p in wm.parameters() if p.requires_grad],
+                                   lr=args.wm_lr, weight_decay=1e-3)
 
     # RND novelty (only built/trained/used when --lambda-rnd != 0): frozen random target + chasing
     # predictor, over the RAW obs (downsampled wrist image + proprio) -- a STABLE input space,
@@ -1378,15 +1386,21 @@ def main(args):
                 if batch is None:
                     break
                 wm.train()
+                _thawed = args.encoder_thaw_every > 0 and (step % args.encoder_thaw_every) < args.encoder_thaw_dur
                 if args.encoder_thaw_every > 0:        # INTERLEAVED freeze/thaw: co-adapt the encoder in bursts
-                    thawed = (step % args.encoder_thaw_every) < args.encoder_thaw_dur
                     for p in wm.encoder.parameters():
-                        p.requires_grad_(thawed)        # frozen windows -> no grad -> AdamW skips the encoder
-                    wm.encoder.train(thawed)            # dropout on only while thawed
+                        p.requires_grad_(_thawed)       # frozen windows -> no grad -> AdamW skips the encoder
+                    wm.encoder.train(_thawed)           # dropout on only while thawed
                 elif args.freeze_encoder:
                     wm.encoder.eval()          # keep the frozen encoder deterministic (dropout off)
+                # optionally REDUCE SIGReg during thaw windows: the isotropy (unit-variance) pressure is what
+                # scatters consecutive frames when the encoder co-adapts on directed motion -> locality dies.
+                # A lower beta in thaw windows lets the encoder learn prediction-locality without that scattering.
+                # -1 (default) = always use args.sigreg_weight.
+                _beta = (args.encoder_thaw_beta if (_thawed and args.encoder_thaw_beta >= 0)
+                         else args.sigreg_weight)
                 last_wm = wm_update(wm, sigreg, wm_opt, batch, H, h_fwd,
-                                    args.gamma_wm, args.sigreg_weight, device,
+                                    args.gamma_wm, _beta, device,
                                     pertimestep=args.sigreg_pertimestep,
                                     lambda_slow=args.lambda_slow)
                 wm.eval()
@@ -2032,6 +2046,13 @@ def parse_args():
                         "frac_rand: does periodic co-adaptation improve the latent, or does directed motion destroy locality?")
     p.add_argument("--encoder-thaw-dur", type=int, default=100,
                    help="duration (steps) of each thaw window for --encoder-thaw-every.")
+    p.add_argument("--encoder-thaw-lr", type=float, default=0.0,
+                   help="separate (typically smaller) LR for the encoder during thaw windows, so co-adaptation "
+                        "NUDGES the latent instead of lurching it. 0 = use --wm-lr. Try ~1/10 of wm-lr.")
+    p.add_argument("--encoder-thaw-beta", type=float, default=-1.0,
+                   help="SIGReg weight to use DURING thaw windows (the diagnosed cause of thaw breaking locality is "
+                        "SIGReg's isotropy scattering co-adapting frames). -1 = always use --sigreg-weight; set a "
+                        "smaller value (or 0) so the encoder learns prediction-locality without isotropy scattering.")
     p.add_argument("--consolidate-every", type=int, default=0,
                    help="multi-epoch CONSOLIDATION (LeWM-regime test): every N collection steps, pause "
                         "stepping and train the WM for --consolidate-epochs full passes over the FROZEN "
