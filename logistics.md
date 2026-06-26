@@ -16,6 +16,13 @@ learning dynamics?*
   `models`); run IDs are in the Sweeps table (e.g. **safe15 = `4zn95btc`**). Use
   `run.history(keys=[...], samples=N)` or `run.scan_history()` for the full per-step time-series
   (the `runs/<name>/metrics.jsonl` files are *hardware* runs only — sim training lives in W&B).
+- **GitHub — push/fetch with `GH_TOKEN` from `.env`**, NOT the VS Code / `gh` credential
+  helper (it fails in this environment with "Repository not found" / credential-socket
+  errors). `set -a && . ./.env && set +a`, then `git -c credential.helper= push
+  "https://x-access-token:${GH_TOKEN}@github.com/ahilanks/curious-robot.git" <branch>`.
+  Reference `$GH_TOKEN` as a **variable** (never paste the literal value); do **not**
+  `git push -u` a token URL — it writes the token into `.git/config`. Set the upstream to
+  the clean `origin` remote separately (`git branch --set-upstream-to=origin/<branch>`).
 - **Train** — `python src/train.py --name <kw> --n-envs 8 --env-threads 8`. `--name` is
   a short keyword → W&B run name + `runs/<name>/` + HF `<name>/ckpt_*.pt`; every constant
   lives in the W&B config table, not the name. Pod bootstrap: `bash setup.sh`.
