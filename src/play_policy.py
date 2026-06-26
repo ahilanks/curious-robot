@@ -23,7 +23,7 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from model.state_encoder import WorldModel       # noqa: E402
+from model.state_encoder import WorldModel, pred_dims_from_args       # noqa: E402
 from env.mujoco_env import MujocoSO101Env         # noqa: E402
 from src.train import Actor, load_actor_state, record_rollout, resolve_ckpt   # noqa: E402
 
@@ -54,7 +54,7 @@ def main():
     n_dof = 6
 
     wm = WorldModel(n_dof=n_dof, action_block=ca["action_block"],
-                    history_size=ca["history_size"]).to(device)
+                    history_size=ca["history_size"], **pred_dims_from_args(ca)).to(device)
     wm.load_state_dict(ckpt["wm"]); wm.eval()
     actor = Actor(wm.z_dim, n_dof * ca["action_block"]).to(device)
     load_actor_state(actor, ckpt["actor"]); actor.eval()
