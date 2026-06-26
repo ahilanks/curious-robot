@@ -1104,8 +1104,12 @@ def main(args):
 
     actor_opt = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
     critic_opt = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
-    wm_opt = torch.optim.AdamW([p for p in wm.parameters() if p.requires_grad],
-                               lr=args.wm_lr, weight_decay=1e-3)
+    # --encoder-thaw-every interleaves frozen acting with periodic encoder co-adaptation. The optimizer
+    # must then include the (initially frozen) encoder params so AdamW can update them during thawed windows;
+    # params with grad=None (frozen windows) are skipped automatically, so this is a no-op when frozen.
+    _wm_params = (list(wm.parameters()) if args.encoder_thaw_every > 0
+                  else [p for p in wm.parameters() if p.requires_grad])
+    wm_opt = torch.optim.AdamW(_wm_params, lr=args.wm_lr, weight_decay=1e-3)
 
     # RND novelty (only built/trained/used when --lambda-rnd != 0): frozen random target + chasing
     # predictor, over the RAW obs (downsampled wrist image + proprio) -- a STABLE input space,
@@ -1374,7 +1378,12 @@ def main(args):
                 if batch is None:
                     break
                 wm.train()
-                if args.freeze_encoder:
+                if args.encoder_thaw_every > 0:        # INTERLEAVED freeze/thaw: co-adapt the encoder in bursts
+                    thawed = (step % args.encoder_thaw_every) < args.encoder_thaw_dur
+                    for p in wm.encoder.parameters():
+                        p.requires_grad_(thawed)        # frozen windows -> no grad -> AdamW skips the encoder
+                    wm.encoder.train(thawed)            # dropout on only while thawed
+                elif args.freeze_encoder:
                     wm.encoder.eval()          # keep the frozen encoder deterministic (dropout off)
                 last_wm = wm_update(wm, sigreg, wm_opt, batch, H, h_fwd,
                                     args.gamma_wm, args.sigreg_weight, device,
@@ -2016,6 +2025,13 @@ def parse_args():
                         "lewm.yaml value; the old 0.3 made beta*sig dominate the WM loss ~5:1 "
                         "over pred_loss)")
     p.add_argument("--wm-batch-size", type=int, default=128)
+    p.add_argument("--encoder-thaw-every", type=int, default=0,
+                   help="INTERLEAVED freeze/thaw: with --freeze-encoder, periodically UNFREEZE the encoder for "
+                        "--encoder-thaw-dur steps every N steps so the representation co-adapts to directed data "
+                        "(vs the default continuous freeze). 0 = stay continuously frozen. Watch encoder/step_jump_"
+                        "frac_rand: does periodic co-adaptation improve the latent, or does directed motion destroy locality?")
+    p.add_argument("--encoder-thaw-dur", type=int, default=100,
+                   help="duration (steps) of each thaw window for --encoder-thaw-every.")
     p.add_argument("--consolidate-every", type=int, default=0,
                    help="multi-epoch CONSOLIDATION (LeWM-regime test): every N collection steps, pause "
                         "stepping and train the WM for --consolidate-epochs full passes over the FROZEN "
