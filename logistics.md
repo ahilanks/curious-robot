@@ -962,7 +962,7 @@ Goal (set by user): self-collecting, stable, **wrist-cam** latent goal-reaching 
 
 **Headline numbers (wrist cam, frozen curiosity latent `cur_consol_wrist_bn`@3000 + reachable-radius curriculum):**
 - **Max radius:** k=**23** (uncapped curriculum) — beats overhead (k=19); but reach collapses to ~0.05 at that ceiling.
-- **Best OPERATING POINT:** cap the radius at **k≈12** → sustained latent **reach ~0.16** (2–4× the max-radius run). Moderate radius >> max radius for usable goal-reaching.
+- **Best OPERATING POINT:** cap the radius at **k≈12** → sustained latent **reach ~0.20** (CONFIRMED at the cap, n=39; ~6× the max-radius run's 0.034). Moderate radius >> max radius for usable goal-reaching.
 - WM learns well throughout (pred_vs_persist 0.05–0.10 on the frozen latent).
 
 **REACH-VS-RADIUS trade-off:** the curriculum grows the radius but reach drops as goals get harder; capping the radius trades range for a much higher sustained success rate. Pick the cap for the use case.
