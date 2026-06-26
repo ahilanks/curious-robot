@@ -38,7 +38,7 @@ try:
 except ImportError:
     pass
 
-from model.state_encoder import WorldModel                      # noqa: E402
+from model.state_encoder import WorldModel, pred_dims_from_args                      # noqa: E402
 from src.train import Actor, encode_obs, curiosity_reward, load_actor_state, resolve_ckpt   # noqa: E402
 from env.hardware_env import (HardwareSO101Env, _default_bus,   # noqa: E402
                               _default_camera)
@@ -138,7 +138,7 @@ def main():
     ca = ck["args"]
     H, AB = int(ca["history_size"]), int(ca["action_block"])
     a_dim = 6 * AB
-    wm = WorldModel(n_dof=6, action_block=AB, history_size=H).to(device)
+    wm = WorldModel(n_dof=6, action_block=AB, history_size=H, **pred_dims_from_args(ca)).to(device)
     wm.load_state_dict(ck["wm"]); wm.eval()
     actor = Actor(wm.z_dim, a_dim).to(device)
     load_actor_state(actor, ck["actor"]); actor.eval()

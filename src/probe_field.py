@@ -49,7 +49,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import mujoco   # noqa: E402
 from env.mujoco_env import MujocoSO101Env, ARM_BASE_RADIUS, TABLE_TOP_Z   # noqa: E402
-from model.state_encoder import WorldModel   # noqa: E402
+from model.state_encoder import WorldModel, pred_dims_from_args   # noqa: E402
 from src.train import (Actor, TwinQ, REWARD_COMPONENTS, encode_obs, curiosity_reward,   # noqa: E402
                        load_actor_state, resolve_ckpt, collapse_metrics)
 
@@ -72,7 +72,7 @@ def load_models(ckpt_path, device):
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
     a = dict(ck["args"]);  n_dof = 6
     wm = WorldModel(n_dof=n_dof, action_block=a["action_block"],
-                    history_size=a["history_size"]).to(device)
+                    history_size=a["history_size"], **pred_dims_from_args(a)).to(device)
     wm.load_state_dict(ck["wm"]); wm.eval()
     a_dim = n_dof * a["action_block"]
     actor = Actor(wm.z_dim, a_dim).to(device)
