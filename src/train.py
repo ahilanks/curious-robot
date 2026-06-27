@@ -1508,6 +1508,42 @@ def main(args):
                     last_rnd = float(err.mean().item())   # report the UNWEIGHTED predictor MSE (comparable)
         return h_fwd
 
+    cotrain_opt = None
+    def cotrain_encoder_phase(step, h_fwd):
+        """Time-phased CEM-directed encoder co-train (--cotrain-every): PAUSE the curriculum, THAW the
+        encoder, consolidate --cotrain-epochs over the accumulated CEM-DIRECTED buffer (low SIGReg-beta so
+        the isotropy pressure doesn't scatter consecutive directed frames -> the latent becomes local under
+        DIRECTED motion, closing the train/test gap that maximizes the planner fantasy), then RE-FREEZE so
+        the predictor bootstrap resumes on a stationary latent. The OFFLINE cycle the campaign found
+        necessary (interleaved --encoder-thaw stalls the radius; the bootstrap needs a stationary target)."""
+        nonlocal cotrain_opt
+        if buf.total < args.wm_batch_size:
+            return
+        if cotrain_opt is None:                          # lazy: persist Adam moments across phases
+            enc = list(wm.encoder.parameters()); eids = {id(p) for p in enc}
+            other = [p for p in wm.parameters() if id(p) not in eids]
+            clr = args.cotrain_lr if args.cotrain_lr > 0 else args.wm_lr
+            cotrain_opt = torch.optim.AdamW([{"params": other, "lr": args.wm_lr},
+                                             {"params": enc, "lr": clr}], weight_decay=1e-3)
+        for p in wm.encoder.parameters():
+            p.requires_grad_(True)
+        wm.train()
+        cb = args.cotrain_beta if args.cotrain_beta >= 0 else args.sigreg_weight
+        n_grad = args.cotrain_epochs * max(1, buf.total // args.wm_batch_size)
+        done = 0
+        for _ in range(n_grad):
+            batch = buf.sample_wm(args.wm_batch_size, H + h_fwd, args.wm_sample, args.per_alpha)
+            if batch is None:
+                break
+            wm_update(wm, sigreg, cotrain_opt, batch, H, h_fwd, args.gamma_wm, cb, device,
+                      pertimestep=args.sigreg_pertimestep)
+            done += 1
+        for p in wm.encoder.parameters():                # RE-FREEZE: predictor bootstrap needs a stationary latent
+            p.requires_grad_(False)
+        wm.eval()                                        # restore eval (dropout off) for acting-time encoding
+        print(f"[cotrain] step={step} thawed encoder, {done} grad steps over {buf.total} directed "
+              f"transitions (beta={cb}, enc_lr={args.cotrain_lr if args.cotrain_lr > 0 else args.wm_lr})", flush=True)
+
     # graceful stop for data-collection runs: 1st Ctrl-C finishes the in-flight decision and
     # saves; a 2nd Ctrl-C (default handler restored) force-quits.
     _stop = {"flag": False}
@@ -1628,6 +1664,8 @@ def main(args):
         env.step_block_async(a_env)
         if not args.frozen_policy:                # frozen: skip ALL gradient work (data collection only)
             h_fwd = learner_updates(step, h_fwd)
+            if args.cotrain_every > 0 and step > 0 and step % args.cotrain_every == 0:
+                cotrain_encoder_phase(step, h_fwd)   # time-phased CEM-directed encoder co-train (offline cycle)
         obs, sub_infos = env.step_block_wait()
         if args.no_torque_obs:
             scrub_torque_obs(obs, n_dof)
@@ -2127,6 +2165,18 @@ def parse_args():
                    help="SIGReg weight to use DURING thaw windows (the diagnosed cause of thaw breaking locality is "
                         "SIGReg's isotropy scattering co-adapting frames). -1 = always use --sigreg-weight; set a "
                         "smaller value (or 0) so the encoder learns prediction-locality without isotropy scattering.")
+    p.add_argument("--cotrain-every", type=int, default=0,
+                   help="TIME-PHASED CEM-directed encoder co-train (offline cycle, NOT interleaved like "
+                        "--encoder-thaw): every N steps PAUSE the curriculum, THAW the encoder, consolidate "
+                        "--cotrain-epochs over the accumulated directed buffer, then re-freeze so the predictor "
+                        "bootstrap resumes on a stationary latent. Makes the latent local under DIRECTED motion "
+                        "(closes the train/test gap that maximizes the planner fantasy). 0 = off.")
+    p.add_argument("--cotrain-epochs", type=int, default=3, help="epochs over the directed buffer per co-train phase.")
+    p.add_argument("--cotrain-lr", type=float, default=0.0,
+                   help="encoder LR during the co-train phase (0 -> --wm-lr). Lower NUDGES the latent rather than lurching it.")
+    p.add_argument("--cotrain-beta", type=float, default=0.02,
+                   help="SIGReg beta during the co-train phase (low avoids the isotropy scatter that kills locality on "
+                        "directed frames; -1 -> use --sigreg-weight). 0.02 was the campaign's non-destructive value.")
     p.add_argument("--consolidate-every", type=int, default=0,
                    help="multi-epoch CONSOLIDATION (LeWM-regime test): every N collection steps, pause "
                         "stepping and train the WM for --consolidate-epochs full passes over the FROZEN "
