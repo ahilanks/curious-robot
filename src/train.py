@@ -1348,8 +1348,15 @@ def main(args):
                     e = int(e)
                     dist = (z[e].unsqueeze(0) - z_cand).norm(dim=-1)       # (N,) ||z_cand - z_now||
                     under = dist < curric_d[0]
-                    j = int(torch.where(under, mse, torch.full_like(mse, -1e30)).argmax()) \
-                        if bool(under.any()) else int(dist.argmin())       # highest MSE under d, else nearest
+                    n_under = int(under.sum())
+                    if n_under > 0:
+                        # soften: sample one of the TOP --goal-highmse-frac fraction by MSE among the under-d
+                        # set (not always the single hardest-to-predict = least-reachable state). frac->0 = argmax.
+                        k_top = max(1, int(args.goal_highmse_frac * n_under))
+                        top = torch.topk(torch.where(under, mse, torch.full_like(mse, -1e30)), k_top).indices
+                        j = int(top[int(torch.randint(k_top, (1,)).item())])
+                    else:
+                        j = int(dist.argmin())                             # fallback: nearest
                     goal_px_env[e] = gpx[j]
                     goal_prop_env[e] = gprop[j]
                     has_goal[e] = True
@@ -2349,7 +2356,11 @@ def parse_args():
     p.add_argument("--goal-curric-d-max", type=float, default=22.0, help="cap on the distance budget d (~the random-pair latent ceiling).")
     p.add_argument("--goal-cand-n", type=int, default=256,
                    help="--goal-select highmse_under_d: # buffer transitions sampled + re-scored (current-WM MSE) per "
-                        "goal refresh; the highest-MSE candidate within d is pursued.")
+                        "goal refresh; a top-MSE candidate within d is pursued.")
+    p.add_argument("--goal-highmse-frac", type=float, default=0.25,
+                   help="--goal-select highmse_under_d: pursue a goal sampled uniformly from the TOP this-fraction "
+                        "by MSE among the under-d candidates (not always the single max). Softens the high-MSE "
+                        "selection so goals aren't always the least-reachable hardest-to-predict state. ->0 = argmax.")
     p.add_argument("--her-frac", type=float, default=0.5,
                    help="fraction of SAC transitions whose goal is HER-relabeled to an achieved future obs from "
                         "the same episode (densifies the reach reward).")
