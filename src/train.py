@@ -327,6 +327,24 @@ class ReplayBuffer:
             px[slot] = self.pixels[e, gi]; pr[slot] = self.proprio[e, gi]; valid[slot] = True
         return px, pr, valid
 
+    def sample_candidates(self, n):
+        """--goal-select highmse_under_d: up to n WITHIN-episode transitions (source o_t, action a_t,
+        outcome o_{t+1}) as MSE-buffer goal candidates -- re-scored by the CURRENT WM and filtered by
+        latent distance to z_now in refresh_goals. Returns (spx, sprop, sact, gpx, gprop) numpy, or None."""
+        vp = self._valid_pairs()
+        if vp is None:
+            return None
+        e_all, i_all = vp
+        ni_all = (i_all + 1) % self.C
+        same = self.ep_id[e_all, i_all] == self.ep_id[e_all, ni_all]   # real successor (no episode/reset crossing)
+        e_all, i_all, ni_all = e_all[same], i_all[same], ni_all[same]
+        if len(e_all) == 0:
+            return None
+        sel = np.random.choice(len(e_all), size=min(int(n), len(e_all)), replace=False)
+        e, i, ni = e_all[sel], i_all[sel], ni_all[sel]
+        return (self.pixels[e, i], self.proprio[e, i], self.action[e, i],
+                self.pixels[e, ni], self.proprio[e, ni])
+
     def sample_sac(self, batch, per_alpha, per_beta, her_frac=0.0):
         vp = self._valid_pairs()
         if vp is None or len(vp[0]) < batch:
@@ -1276,6 +1294,7 @@ def main(args):
     # grown by the controller in the main loop; refresh_goals reads curric_k[0]. No loss/arch involvement.
     curric_k = [args.goal_curric_start if (args.goal_curriculum and args.goal_curric_start > 0)
                 else args.goal_future_k]
+    curric_d = [float(args.goal_curric_d_start)]    # --goal-select highmse_under_d latent-distance budget (grown like curric_k)
 
     def reach_eps_now(step):
         """Annealed reach threshold for the goal/reach_rate DIAGNOSTIC: linearly from
@@ -1307,6 +1326,39 @@ def main(args):
                     e = int(ei[slot])
                     goal_px_env[e] = gpx[slot]
                     goal_prop_env[e] = gprop[slot]
+                    has_goal[e] = True
+            return
+        if args.goal_select == "highmse_under_d":
+            # MSE-BUFFER curriculum: sample candidate transitions, re-score their CURRENT-WM one-step MSE
+            # (same metric as score_obs_mse / curiosity_reward), and for each env pursue the HIGHEST-MSE
+            # candidate whose goal latent is within the curriculum distance budget curric_d of z_now
+            # (fallback: nearest). Encoder frozen => ||z_cand - z_now|| is a stable reachability metric.
+            cand = buf.sample_candidates(args.goal_cand_n)
+            if cand is None:
+                return
+            spx, sprop, sact, gpx, gprop = cand
+            with torch.no_grad():
+                z_src = encode_obs(wm, spx, sprop, device)                 # (N, D)
+                z_cand = encode_obs(wm, gpx, gprop, device)               # (N, D) goal latents
+                z_ctx = z_src.unsqueeze(1).repeat(1, H, 1)                # (N, H, D)
+                ac = torch.as_tensor(sact, device=device).float().unsqueeze(1).repeat(1, H, 1)
+                pred = wm.predict(z_ctx, wm.action_encoder(ac))[:, -1]     # (N, D) one-step pred
+                mse = (pred - z_cand).pow(2).mean(-1)                      # (N,) current-WM MSE
+                for e in env_idx:
+                    e = int(e)
+                    dist = (z[e].unsqueeze(0) - z_cand).norm(dim=-1)       # (N,) ||z_cand - z_now||
+                    under = dist < curric_d[0]
+                    n_under = int(under.sum())
+                    if n_under > 0:
+                        # soften: sample one of the TOP --goal-highmse-frac fraction by MSE among the under-d
+                        # set (not always the single hardest-to-predict = least-reachable state). frac->0 = argmax.
+                        k_top = max(1, int(args.goal_highmse_frac * n_under))
+                        top = torch.topk(torch.where(under, mse, torch.full_like(mse, -1e30)), k_top).indices
+                        j = int(top[int(torch.randint(k_top, (1,)).item())])
+                    else:
+                        j = int(dist.argmin())                             # fallback: nearest
+                    goal_px_env[e] = gpx[j]
+                    goal_prop_env[e] = gprop[j]
                     has_goal[e] = True
             return
         near = args.goal_select == "near"
@@ -1456,6 +1508,42 @@ def main(args):
                     last_rnd = float(err.mean().item())   # report the UNWEIGHTED predictor MSE (comparable)
         return h_fwd
 
+    cotrain_opt = None
+    def cotrain_encoder_phase(step, h_fwd):
+        """Time-phased CEM-directed encoder co-train (--cotrain-every): PAUSE the curriculum, THAW the
+        encoder, consolidate --cotrain-epochs over the accumulated CEM-DIRECTED buffer (low SIGReg-beta so
+        the isotropy pressure doesn't scatter consecutive directed frames -> the latent becomes local under
+        DIRECTED motion, closing the train/test gap that maximizes the planner fantasy), then RE-FREEZE so
+        the predictor bootstrap resumes on a stationary latent. The OFFLINE cycle the campaign found
+        necessary (interleaved --encoder-thaw stalls the radius; the bootstrap needs a stationary target)."""
+        nonlocal cotrain_opt
+        if buf.total < args.wm_batch_size:
+            return
+        if cotrain_opt is None:                          # lazy: persist Adam moments across phases
+            enc = list(wm.encoder.parameters()); eids = {id(p) for p in enc}
+            other = [p for p in wm.parameters() if id(p) not in eids]
+            clr = args.cotrain_lr if args.cotrain_lr > 0 else args.wm_lr
+            cotrain_opt = torch.optim.AdamW([{"params": other, "lr": args.wm_lr},
+                                             {"params": enc, "lr": clr}], weight_decay=1e-3)
+        for p in wm.encoder.parameters():
+            p.requires_grad_(True)
+        wm.train()
+        cb = args.cotrain_beta if args.cotrain_beta >= 0 else args.sigreg_weight
+        n_grad = args.cotrain_epochs * max(1, buf.total // args.wm_batch_size)
+        done = 0
+        for _ in range(n_grad):
+            batch = buf.sample_wm(args.wm_batch_size, H + h_fwd, args.wm_sample, args.per_alpha)
+            if batch is None:
+                break
+            wm_update(wm, sigreg, cotrain_opt, batch, H, h_fwd, args.gamma_wm, cb, device,
+                      pertimestep=args.sigreg_pertimestep)
+            done += 1
+        for p in wm.encoder.parameters():                # RE-FREEZE: predictor bootstrap needs a stationary latent
+            p.requires_grad_(False)
+        wm.eval()                                        # restore eval (dropout off) for acting-time encoding
+        print(f"[cotrain] step={step} thawed encoder, {done} grad steps over {buf.total} directed "
+              f"transitions (beta={cb}, enc_lr={args.cotrain_lr if args.cotrain_lr > 0 else args.wm_lr})", flush=True)
+
     # graceful stop for data-collection runs: 1st Ctrl-C finishes the in-flight decision and
     # saves; a 2nd Ctrl-C (default handler restored) force-quits.
     _stop = {"flag": False}
@@ -1504,12 +1592,18 @@ def main(args):
             #     closing radius (small k) and grow k outward (further-back goal = larger reach_gap) once the
             #     windowed LATENT reach clears the threshold -- extends the reachable radius as the planner earns it.
             if (args.goal_curriculum and step > 0 and step % args.goal_curric_patience == 0
-                    and curric_k[0] < args.goal_curric_max_k and len(goal_recent["reach"]) >= 50):
+                    and len(goal_recent["reach"]) >= 50):
                 wr = float(np.mean(goal_recent["reach"]))
                 if wr >= args.goal_curric_thresh:
-                    curric_k[0] += 1
-                    goal_recent["reach"].clear()             # measure the harder (larger-k) stage fresh
-                    print(f"[goal-curriculum] step={step} latent_reach={wr:.2f} -> radius k={curric_k[0]}", flush=True)
+                    if args.goal_select == "highmse_under_d":         # grow the latent-DISTANCE budget d
+                        if curric_d[0] < args.goal_curric_d_max:
+                            curric_d[0] = min(curric_d[0] + args.goal_curric_d_step, args.goal_curric_d_max)
+                            goal_recent["reach"].clear()
+                            print(f"[goal-curriculum] step={step} latent_reach={wr:.2f} -> distance d={curric_d[0]:.2f}", flush=True)
+                    elif curric_k[0] < args.goal_curric_max_k:        # grow the decisions-ago radius k (recent/future)
+                        curric_k[0] += 1
+                        goal_recent["reach"].clear()             # measure the harder (larger-k) stage fresh
+                        print(f"[goal-curriculum] step={step} latent_reach={wr:.2f} -> radius k={curric_k[0]}", flush=True)
 
         # --- act: SAC stochastic sample during sim training (the entropy-driven exploration
         #     that un-parks the policy and decorrelates the parallel envs), the DETERMINISTIC
@@ -1570,6 +1664,8 @@ def main(args):
         env.step_block_async(a_env)
         if not args.frozen_policy:                # frozen: skip ALL gradient work (data collection only)
             h_fwd = learner_updates(step, h_fwd)
+            if args.cotrain_every > 0 and step > 0 and step % args.cotrain_every == 0:
+                cotrain_encoder_phase(step, h_fwd)   # time-phased CEM-directed encoder co-train (offline cycle)
         obs, sub_infos = env.step_block_wait()
         if args.no_torque_obs:
             scrub_torque_obs(obs, n_dof)
@@ -1825,6 +1921,8 @@ def main(args):
                     d["goal/reach_rate"] = float(np.mean(goal_recent["reach"]))
                 if args.goal_curriculum:
                     d["goal/curric_k"] = curric_k[0]              # current reachable-radius curriculum offset
+                    if args.goal_select == "highmse_under_d":
+                        d["goal/curric_d"] = curric_d[0]          # current MSE-buffer latent-distance budget
                 if goal_recent["qpos_dist"]:                       # joint-space (physical) ground-truth
                     d["goal/qpos_dist"] = float(np.mean(goal_recent["qpos_dist"]))           # mean max-joint err (rad)
                     d["goal/success_rate_qpos"] = float(np.mean(goal_recent["qpos_reach"]))  # frac within eps on every joint
@@ -2067,6 +2165,18 @@ def parse_args():
                    help="SIGReg weight to use DURING thaw windows (the diagnosed cause of thaw breaking locality is "
                         "SIGReg's isotropy scattering co-adapting frames). -1 = always use --sigreg-weight; set a "
                         "smaller value (or 0) so the encoder learns prediction-locality without isotropy scattering.")
+    p.add_argument("--cotrain-every", type=int, default=0,
+                   help="TIME-PHASED CEM-directed encoder co-train (offline cycle, NOT interleaved like "
+                        "--encoder-thaw): every N steps PAUSE the curriculum, THAW the encoder, consolidate "
+                        "--cotrain-epochs over the accumulated directed buffer, then re-freeze so the predictor "
+                        "bootstrap resumes on a stationary latent. Makes the latent local under DIRECTED motion "
+                        "(closes the train/test gap that maximizes the planner fantasy). 0 = off.")
+    p.add_argument("--cotrain-epochs", type=int, default=3, help="epochs over the directed buffer per co-train phase.")
+    p.add_argument("--cotrain-lr", type=float, default=0.0,
+                   help="encoder LR during the co-train phase (0 -> --wm-lr). Lower NUDGES the latent rather than lurching it.")
+    p.add_argument("--cotrain-beta", type=float, default=0.02,
+                   help="SIGReg beta during the co-train phase (low avoids the isotropy scatter that kills locality on "
+                        "directed frames; -1 -> use --sigreg-weight). 0.02 was the campaign's non-destructive value.")
     p.add_argument("--consolidate-every", type=int, default=0,
                    help="multi-epoch CONSOLIDATION (LeWM-regime test): every N collection steps, pause "
                         "stepping and train the WM for --consolidate-epochs full passes over the FROZEN "
@@ -2265,14 +2375,16 @@ def parse_args():
                         "its capture score (the WM has learned it).")
     p.add_argument("--goal-temp", type=float, default=1.0,
                    help="softmax temperature for goal sampling P(k) ~ exp(score_k/temp) (NOT argmax).")
-    p.add_argument("--goal-select", choices=("mse", "near", "future", "recent"), default="mse",
+    p.add_argument("--goal-select", choices=("mse", "near", "future", "recent", "highmse_under_d"), default="mse",
                    help="goal source. 'mse' (default) = archive P(k)~softmax(score/temp), highest-WM-MSE "
                         "(most novel -> FARTHEST in latent). 'near' = archive P(k)~softmax(-||z_e-z_k||/temp), "
                         "NEAREST the env's current latent. 'future' = NOT the archive: the obs the agent "
                         "ACHIEVED --goal-future-k forward steps after a recent point in its OWN current "
                         "episode (HER 'future' for the controller) -- reachable by forward dynamics and "
                         "on-manifold, mirroring LeWM's goal_offset_steps. 'future' is the decisive test of "
-                        "whether CEM can close a genuinely reachable goal.")
+                        "whether CEM can close a genuinely reachable goal. 'highmse_under_d' = MSE-BUFFER "
+                        "curriculum: among buffer states within latent distance d (--goal-curric-d-*) of "
+                        "z_now, pursue the HIGHEST current-WM-MSE one; grow d as latent reach is earned.")
     p.add_argument("--goal-future-k", type=int, default=10,
                    help="--goal-select future/recent: step offset of the goal (future=ahead of a random anchor, "
                         "recent=decisions AGO). Also the constant offset when the curriculum is OFF.")
@@ -2287,6 +2399,18 @@ def parse_args():
     p.add_argument("--goal-curric-thresh", type=float, default=0.25,
                    help="grow the radius when the windowed LATENT reach_rate reaches this (qpos NOT involved).")
     p.add_argument("--goal-curric-patience", type=int, default=200, help="min steps between curriculum radius bumps.")
+    p.add_argument("--goal-curric-d-start", type=float, default=6.0,
+                   help="--goal-select highmse_under_d: starting latent-distance budget d (admit candidate goals "
+                        "with ||z_cand - z_now|| < d). Grown like the k-curriculum as latent reach is earned.")
+    p.add_argument("--goal-curric-d-step", type=float, default=1.0, help="grow d by this each curriculum advance (highmse_under_d).")
+    p.add_argument("--goal-curric-d-max", type=float, default=22.0, help="cap on the distance budget d (~the random-pair latent ceiling).")
+    p.add_argument("--goal-cand-n", type=int, default=256,
+                   help="--goal-select highmse_under_d: # buffer transitions sampled + re-scored (current-WM MSE) per "
+                        "goal refresh; a top-MSE candidate within d is pursued.")
+    p.add_argument("--goal-highmse-frac", type=float, default=0.25,
+                   help="--goal-select highmse_under_d: pursue a goal sampled uniformly from the TOP this-fraction "
+                        "by MSE among the under-d candidates (not always the single max). Softens the high-MSE "
+                        "selection so goals aren't always the least-reachable hardest-to-predict state. ->0 = argmax.")
     p.add_argument("--her-frac", type=float, default=0.5,
                    help="fraction of SAC transitions whose goal is HER-relabeled to an achieved future obs from "
                         "the same episode (densifies the reach reward).")
