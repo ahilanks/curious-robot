@@ -1295,6 +1295,18 @@ def main(args):
     curric_k = [args.goal_curric_start if (args.goal_curriculum and args.goal_curric_start > 0)
                 else args.goal_future_k]
     curric_d = [float(args.goal_curric_d_start)]    # --goal-select highmse_under_d latent-distance budget (grown like curric_k)
+    # NESTED MSE-DIFFICULTY curriculum (--goal-mse-curric): the CURRENT target MSE percentile (mutable). Within a
+    # fixed d it RISES from --goal-mse-pctl-start (LOW MSE = easy, WM-predictable, reliably reachable) toward
+    # --goal-mse-pctl-max (HIGH MSE = surprising, the objective) by --goal-mse-pctl-step each time windowed reach
+    # clears the threshold; goals are sampled from a --goal-mse-band-wide window around it. d only grows once the
+    # percentile tops out (highest-MSE states mastered at this d), then the percentile resets for the new d.
+    # When --goal-mse-curric is off, selection falls back to the static top-(--goal-highmse-frac) by MSE.
+    curric_pctl = [float(args.goal_mse_pctl_start)]
+    if args.goal_mse_curric:                          # fail fast: a bad schedule would silently deadlock a long run
+        if not (0.0 <= args.goal_mse_pctl_start < args.goal_mse_pctl_max <= 1.0):
+            raise SystemExit("[goal-mse-curric] need 0 <= --goal-mse-pctl-start < --goal-mse-pctl-max <= 1")
+        if not (args.goal_mse_pctl_step > 0 and 0.0 < args.goal_mse_band <= 1.0):
+            raise SystemExit("[goal-mse-curric] need --goal-mse-pctl-step > 0 and 0 < --goal-mse-band <= 1")
 
     def reach_eps_now(step):
         """Annealed reach threshold for the goal/reach_rate DIAGNOSTIC: linearly from
@@ -1350,11 +1362,25 @@ def main(args):
                     under = dist < curric_d[0]
                     n_under = int(under.sum())
                     if n_under > 0:
-                        # soften: sample one of the TOP --goal-highmse-frac fraction by MSE among the under-d
-                        # set (not always the single hardest-to-predict = least-reachable state). frac->0 = argmax.
-                        k_top = max(1, int(args.goal_highmse_frac * n_under))
-                        top = torch.topk(torch.where(under, mse, torch.full_like(mse, -1e30)), k_top).indices
-                        j = int(top[int(torch.randint(k_top, (1,)).item())])
+                        if args.goal_mse_curric:
+                            # NESTED MSE-difficulty curriculum: rank the under-d candidates by MSE ASCENDING
+                            # (easy/low-MSE -> hard/high-MSE) and sample from the percentile band centred on
+                            # curric_pctl. Early (pctl~0) we pursue the LOW-MSE, reliably-reachable states; as
+                            # reach is mastered pctl RISES toward 1 = the HIGH-MSE surprising states (the goal).
+                            ui = torch.nonzero(under, as_tuple=False).squeeze(-1)     # candidate idxs under d
+                            order = ui[torch.argsort(mse[ui])]                        # ascending MSE
+                            m = order.numel()
+                            lo = min(max(curric_pctl[0] - args.goal_mse_band / 2, 0.0), 1.0)
+                            hi = min(max(curric_pctl[0] + args.goal_mse_band / 2, 0.0), 1.0)
+                            a, b = int(lo * (m - 1)), int(hi * (m - 1))
+                            band = order[min(a, b):max(a, b) + 1]
+                            j = int(band[int(torch.randint(band.numel(), (1,)).item())])
+                        else:
+                            # static fallback: sample one of the TOP --goal-highmse-frac by MSE among under-d
+                            # (not always the single hardest = least-reachable). frac->0 = argmax. Clamped to n_under.
+                            k_top = min(n_under, max(1, int(args.goal_highmse_frac * n_under)))
+                            top = torch.topk(torch.where(under, mse, torch.full_like(mse, -1e30)), k_top).indices
+                            j = int(top[int(torch.randint(k_top, (1,)).item())])
                     else:
                         j = int(dist.argmin())                             # fallback: nearest
                     goal_px_env[e] = gpx[j]
@@ -1531,18 +1557,28 @@ def main(args):
         cb = args.cotrain_beta if args.cotrain_beta >= 0 else args.sigreg_weight
         n_grad = args.cotrain_epochs * max(1, buf.total // args.wm_batch_size)
         done = 0
+        cot_hist = deque(maxlen=args.flatline_window)    # --cotrain-flatline: track pred MSE to detect convergence
+        converged = False
         for _ in range(n_grad):
             batch = buf.sample_wm(args.wm_batch_size, H + h_fwd, args.wm_sample, args.per_alpha)
             if batch is None:
                 break
-            wm_update(wm, sigreg, cotrain_opt, batch, H, h_fwd, args.gamma_wm, cb, device,
-                      pertimestep=args.sigreg_pertimestep)
+            cl = wm_update(wm, sigreg, cotrain_opt, batch, H, h_fwd, args.gamma_wm, cb, device,
+                           pertimestep=args.sigreg_pertimestep)
             done += 1
+            if args.cotrain_flatline:                    # FULLY consolidate: stop only once the predictor MSE
+                cot_hist.append(cl[0])                   # flatlines (not a couple of epochs) -- cotrain_epochs is the cap
+                if len(cot_hist) == cot_hist.maxlen:
+                    arr = np.asarray(cot_hist); half = len(arr) // 2
+                    if abs((arr[:half].mean() - arr[half:].mean()) / max(abs(arr[:half].mean()), 1e-9)) < args.flatline_tol:
+                        converged = True
+                        break
         for p in wm.encoder.parameters():                # RE-FREEZE: predictor bootstrap needs a stationary latent
             p.requires_grad_(False)
         wm.eval()                                        # restore eval (dropout off) for acting-time encoding
-        print(f"[cotrain] step={step} thawed encoder, {done} grad steps over {buf.total} directed "
-              f"transitions (beta={cb}, enc_lr={args.cotrain_lr if args.cotrain_lr > 0 else args.wm_lr})", flush=True)
+        print(f"[cotrain] step={step} thawed encoder, {done}/{n_grad} grad steps over {buf.total} directed "
+              f"transitions (beta={cb}, enc_lr={args.cotrain_lr if args.cotrain_lr > 0 else args.wm_lr}"
+              f"{', CONVERGED' if converged else (', capped' if args.cotrain_flatline else '')})", flush=True)
 
     # graceful stop for data-collection runs: 1st Ctrl-C finishes the in-flight decision and
     # saves; a 2nd Ctrl-C (default handler restored) force-quits.
@@ -1595,11 +1631,20 @@ def main(args):
                     and len(goal_recent["reach"]) >= 50):
                 wr = float(np.mean(goal_recent["reach"]))
                 if wr >= args.goal_curric_thresh:
-                    if args.goal_select == "highmse_under_d":         # grow the latent-DISTANCE budget d
-                        if curric_d[0] < args.goal_curric_d_max:
-                            curric_d[0] = min(curric_d[0] + args.goal_curric_d_step, args.goal_curric_d_max)
+                    if args.goal_select == "highmse_under_d":         # nested MSE curriculum, then grow d
+                        if args.goal_mse_curric and curric_pctl[0] < args.goal_mse_pctl_max - 1e-9:
+                            # INNER loop: walk the target MSE percentile UP (low/easy -> high/surprising states)
+                            # within this d before extending the distance budget -- master each difficulty first.
+                            curric_pctl[0] = min(args.goal_mse_pctl_max, curric_pctl[0] + args.goal_mse_pctl_step)
                             goal_recent["reach"].clear()
-                            print(f"[goal-curriculum] step={step} latent_reach={wr:.2f} -> distance d={curric_d[0]:.2f}", flush=True)
+                            print(f"[goal-curriculum] step={step} latent_reach={wr:.2f} -> MSE pctl={curric_pctl[0]:.2f} (d held {curric_d[0]:.2f})", flush=True)
+                        elif curric_d[0] < args.goal_curric_d_max:    # pctl topped out (or off): grow the budget d
+                            curric_d[0] = min(curric_d[0] + args.goal_curric_d_step, args.goal_curric_d_max)
+                            if args.goal_mse_curric:                  # restart the inner MSE curriculum for the new d
+                                curric_pctl[0] = float(args.goal_mse_pctl_start)
+                            goal_recent["reach"].clear()
+                            print(f"[goal-curriculum] step={step} latent_reach={wr:.2f} -> distance d={curric_d[0]:.2f}"
+                                  + (f" (MSE pctl reset {curric_pctl[0]:.2f})" if args.goal_mse_curric else ""), flush=True)
                     elif curric_k[0] < args.goal_curric_max_k:        # grow the decisions-ago radius k (recent/future)
                         curric_k[0] += 1
                         goal_recent["reach"].clear()             # measure the harder (larger-k) stage fresh
@@ -1923,6 +1968,8 @@ def main(args):
                     d["goal/curric_k"] = curric_k[0]              # current reachable-radius curriculum offset
                     if args.goal_select == "highmse_under_d":
                         d["goal/curric_d"] = curric_d[0]          # current MSE-buffer latent-distance budget
+                        if args.goal_mse_curric:
+                            d["goal/curric_mse_pctl"] = curric_pctl[0]   # nested MSE-difficulty target percentile (rises within d)
                 if goal_recent["qpos_dist"]:                       # joint-space (physical) ground-truth
                     d["goal/qpos_dist"] = float(np.mean(goal_recent["qpos_dist"]))           # mean max-joint err (rad)
                     d["goal/success_rate_qpos"] = float(np.mean(goal_recent["qpos_reach"]))  # frac within eps on every joint
@@ -2177,6 +2224,11 @@ def parse_args():
     p.add_argument("--cotrain-beta", type=float, default=0.02,
                    help="SIGReg beta during the co-train phase (low avoids the isotropy scatter that kills locality on "
                         "directed frames; -1 -> use --sigreg-weight). 0.02 was the campaign's non-destructive value.")
+    p.add_argument("--cotrain-flatline", action="store_true",
+                   help="--cotrain-every: train each co-train phase to CONVERGENCE -- stop once the predictor MSE "
+                        "flatlines over --flatline-window grad steps (within --flatline-tol), with --cotrain-epochs "
+                        "as the MAX cap -- instead of always running the full fixed epoch budget. Implements 'fully "
+                        "consolidate each phase' (the predictor needs full training per phase, not a couple of epochs).")
     p.add_argument("--consolidate-every", type=int, default=0,
                    help="multi-epoch CONSOLIDATION (LeWM-regime test): every N collection steps, pause "
                         "stepping and train the WM for --consolidate-epochs full passes over the FROZEN "
@@ -2410,7 +2462,24 @@ def parse_args():
     p.add_argument("--goal-highmse-frac", type=float, default=0.25,
                    help="--goal-select highmse_under_d: pursue a goal sampled uniformly from the TOP this-fraction "
                         "by MSE among the under-d candidates (not always the single max). Softens the high-MSE "
-                        "selection so goals aren't always the least-reachable hardest-to-predict state. ->0 = argmax.")
+                        "selection so goals aren't always the least-reachable hardest-to-predict state. ->0 = argmax. "
+                        "Used only when --goal-mse-curric is OFF (else the percentile curriculum selects).")
+    p.add_argument("--goal-mse-curric", action="store_true",
+                   help="--goal-select highmse_under_d: NESTED MSE-DIFFICULTY curriculum within each distance budget d. "
+                        "Within a fixed d, target a percentile BAND (width --goal-mse-band) of the under-d MSE "
+                        "distribution that RISES from --goal-mse-pctl-start (LOW MSE = easy, reliably reachable) to "
+                        "--goal-mse-pctl-max (HIGH MSE = surprising, the objective) by --goal-mse-pctl-step each time "
+                        "windowed reach clears --goal-curric-thresh. Only grow d once the percentile tops out (the "
+                        "highest-MSE states mastered at this d), then RESET the percentile for the new d. Realizes "
+                        "'within each d, learn the low-MSE states first, then walk all the way up to the highest-MSE.'")
+    p.add_argument("--goal-mse-pctl-start", type=float, default=0.0,
+                   help="--goal-mse-curric: starting target percentile within each new d (0.0 = the LOWEST-MSE / easiest under-d states).")
+    p.add_argument("--goal-mse-pctl-max", type=float, default=1.0,
+                   help="--goal-mse-curric: top target percentile; reaching it triggers the d-advance (1.0 = the HIGHEST-MSE / most surprising under-d states).")
+    p.add_argument("--goal-mse-pctl-step", type=float, default=0.2,
+                   help="--goal-mse-curric: raise the target percentile by this each inner advance (reach>=thresh) until it tops out.")
+    p.add_argument("--goal-mse-band", type=float, default=0.2,
+                   help="--goal-mse-curric: width of the percentile window (centred on the target percentile) the goal is sampled from, so goals are a reachable spread, not a single state.")
     p.add_argument("--her-frac", type=float, default=0.5,
                    help="fraction of SAC transitions whose goal is HER-relabeled to an achieved future obs from "
                         "the same episode (densifies the reach reward).")
