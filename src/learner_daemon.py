@@ -383,7 +383,7 @@ def parse_args():
     p.add_argument("--critic-lr", type=float, default=1e-4)
     p.add_argument("--gamma", type=float, default=0.9)
     p.add_argument("--gamma-wm", type=float, default=0.95)
-    p.add_argument("--sigreg-weight", type=float, default=0.3)
+    p.add_argument("--sigreg-weight", type=float, default=0.09)
     p.add_argument("--tau", type=float, default=0.005)
     p.add_argument("--per-alpha", type=float, default=0.6)
     p.add_argument("--per-beta-start", type=float, default=0.4)
