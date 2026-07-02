@@ -2464,14 +2464,15 @@ def parse_args():
                         "by MSE among the under-d candidates (not always the single max). Softens the high-MSE "
                         "selection so goals aren't always the least-reachable hardest-to-predict state. ->0 = argmax. "
                         "Used only when --goal-mse-curric is OFF (else the percentile curriculum selects).")
-    p.add_argument("--goal-mse-curric", action="store_true",
+    p.add_argument("--goal-mse-curric", action=argparse.BooleanOptionalAction, default=True,
                    help="--goal-select highmse_under_d: NESTED MSE-DIFFICULTY curriculum within each distance budget d. "
                         "Within a fixed d, target a percentile BAND (width --goal-mse-band) of the under-d MSE "
                         "distribution that RISES from --goal-mse-pctl-start (LOW MSE = easy, reliably reachable) to "
                         "--goal-mse-pctl-max (HIGH MSE = surprising, the objective) by --goal-mse-pctl-step each time "
                         "windowed reach clears --goal-curric-thresh. Only grow d once the percentile tops out (the "
                         "highest-MSE states mastered at this d), then RESET the percentile for the new d. Realizes "
-                        "'within each d, learn the low-MSE states first, then walk all the way up to the highest-MSE.'")
+                        "'within each d, learn the low-MSE states first, then walk all the way up to the highest-MSE.' "
+                        "DEFAULT ON (the d=12->18 ceiling-break lever, 2026-06-30); disable with --no-goal-mse-curric.")
     p.add_argument("--goal-mse-pctl-start", type=float, default=0.0,
                    help="--goal-mse-curric: starting target percentile within each new d (0.0 = the LOWEST-MSE / easiest under-d states).")
     p.add_argument("--goal-mse-pctl-max", type=float, default=1.0,
