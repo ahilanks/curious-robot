@@ -279,7 +279,7 @@ def parse_args():
     p.add_argument("--h-fwd-start", type=int, default=1, help="rollout horizon for cold starts")
     p.add_argument("--h-fwd-max", type=int, default=1, help="buffer slack sizing only")
     p.add_argument("--gamma-wm", type=float, default=0.95)
-    p.add_argument("--sigreg-weight", type=float, default=0.3, help="beta, pinned (anti-collapse)")
+    p.add_argument("--sigreg-weight", type=float, default=0.09, help="beta (LeWM default 0.09; anti-collapse)")
     p.add_argument("--wm-batch-size", type=int, default=128)
     p.add_argument("--wm-lr", type=float, default=1e-5,
                    help="fine-tune default (train.py uses 5e-5); optimizers restart cold")
