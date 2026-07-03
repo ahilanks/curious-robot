@@ -1421,6 +1421,7 @@ def main(args):
     prev_qpos_dec = None                                      # last decision's final joint pose (for pose_step travel)
     recent_qpos = deque(maxlen=200)                           # rolling final-pose history -> pose_spread / pose_range
     step_jump_recent = deque(maxlen=400)                      # per-step ||z_t - z_{t+1}|| -> latent temporal locality
+    frac_trig = {"last": 0, "n": 0}                           # --cotrain-frac-thresh trigger state (step of last fire, count)
     recent = {k: deque(maxlen=400) for k in
               ("r_cur", "r_safe", "cur_contrib", "contacts", "table_contacts",
                "motion", "ret", "frac_block", "frac_table",
@@ -1711,6 +1712,16 @@ def main(args):
             h_fwd = learner_updates(step, h_fwd)
             if args.cotrain_every > 0 and step > 0 and step % args.cotrain_every == 0:
                 cotrain_encoder_phase(step, h_fwd)   # time-phased CEM-directed encoder co-train (offline cycle)
+            if (args.cotrain_frac_thresh > 0 and step > 0
+                    and len(step_jump_recent) == step_jump_recent.maxlen
+                    and step - frac_trig["last"] >= args.cotrain_frac_cooldown):
+                frac_now = float(np.mean(step_jump_recent)) / (2 * z_dim) ** 0.5
+                if frac_now > args.cotrain_frac_thresh:      # locality degraded under directed motion -> sleep
+                    print(f"[cotrain-trigger] frac_rand {frac_now:.3f} > {args.cotrain_frac_thresh} at step "
+                          f"{step} -> pause CEM, co-train phase #{frac_trig['n'] + 1}", flush=True)
+                    cotrain_encoder_phase(step, h_fwd)
+                    frac_trig["last"], frac_trig["n"] = step, frac_trig["n"] + 1
+                    step_jump_recent.clear()                 # measure post-sleep locality on fresh data only
         obs, sub_infos = env.step_block_wait()
         if args.no_torque_obs:
             scrub_torque_obs(obs, n_dof)
@@ -1983,6 +1994,8 @@ def main(args):
                 sj = float(np.mean(step_jump_recent))               # random-pair distance sqrt(2*z_dim)*z_std (z_std~1 post-warmup).
                 d["encoder/step_jump"] = sj                         # frac ~1.0 = NO locality (LeWM cube was ~0.09); small = local.
                 d["encoder/step_jump_frac_rand"] = sj / (2 * z_dim) ** 0.5
+            if args.cotrain_frac_thresh > 0:
+                d["cotrain/frac_triggers"] = frac_trig["n"]
             for key in ("mse_block", "mse_table", "mse_none"):   # curiosity MSE by contact type
                 if recent_mse[key]:
                     d[f"wm/{key}"] = float(np.mean(recent_mse[key]))
@@ -2229,6 +2242,15 @@ def parse_args():
                         "flatlines over --flatline-window grad steps (within --flatline-tol), with --cotrain-epochs "
                         "as the MAX cap -- instead of always running the full fixed epoch budget. Implements 'fully "
                         "consolidate each phase' (the predictor needs full training per phase, not a couple of epochs).")
+    p.add_argument("--cotrain-frac-thresh", type=float, default=0.0,
+                   help="EVENT-TRIGGERED co-train: when the windowed step_jump_frac_rand on executed (CEM) "
+                        "trajectories exceeds this, PAUSE stepping and run one cotrain phase (thaw -> "
+                        "--cotrain-epochs/--cotrain-flatline over the directed buffer -> re-freeze), i.e. sleep "
+                        "exactly when directed-motion locality degrades instead of on a timer. Composes with the "
+                        "same phase settings as --cotrain-every (which may stay 0). 0 = off.")
+    p.add_argument("--cotrain-frac-cooldown", type=int, default=400,
+                   help="--cotrain-frac-thresh: min steps between triggered phases. The 400-step frac_rand window "
+                        "is also cleared after each phase, so refire needs a full post-sleep window regardless.")
     p.add_argument("--consolidate-every", type=int, default=0,
                    help="multi-epoch CONSOLIDATION (LeWM-regime test): every N collection steps, pause "
                         "stepping and train the WM for --consolidate-epochs full passes over the FROZEN "
