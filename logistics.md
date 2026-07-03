@@ -1079,3 +1079,86 @@ Flags: `--cem --cem-horizon 1 --cem-replan-every 1 --goal-select mse --wm-cam wr
 **Why this should differ from the failed scratch runs:** A has no reach curriculum to poison (novelty goals; latent distances never gate anything); B runs entirely in the proven frozen regime; C thaws only in consolidated bursts between frozen stretches. Each stage's gate is immune to that stage's known failure mode (frac_rand for A, qpos for B, hold-through-thaw for C). The whole loop at d=4 is fast — roughly one A + one B per iteration before touching C.
 
 **Code change this session:** `--goal-mse-curric` DEFAULT ON (`argparse.BooleanOptionalAction`; disable with `--no-goal-mse-curric`) — the nested low→high MSE curriculum is the d=12→18 ceiling-break lever (06-30) and is now standard in every `highmse_under_d` curriculum run, including Stages B/C above.
+
+**CANONICAL LAUNCH COMMANDS (added 07-02 after a recipe-drift incident — ALWAYS launch stages from these, not from the prose flag lists above).** The first B attempts this session silently dropped `--goal-update-every 25`, `--cem-init-std 0.3`, `--goal-curric-patience 150`, `--buffer-frac 3` and used `--resume-name` (which carries the ckpt's stale goal archive) instead of `--init-ckpt` (weights-only) — because the plan paragraphs say "proven H=1 recipe" without restating those flags (they live in the 06-26 BEST RECIPE line + `jl7wfyqn`'s W&B config). LESSON: before launching any "same as run X" experiment, diff your args against X's actual W&B config.
+
+Stage A (from scratch; swap `--goal-select mse` ↔ `recent --goal-future-k 3` per fallback):
+```
+python src/train.py --name <name> --cem --cem-horizon 1 --cem-replan-every 1 --cem-init-std 0.3 \
+  --goal-select mse --goal-update-every 25 --wm-cam wrist --no-proprio --action-max 0.05 \
+  --consolidate-every 70 --consolidate-epochs 1 --buffer-frac 3 --sigreg-pertimestep \
+  --total-steps 3000 --n-envs 8 --env-threads 8
+```
+Stage B (frozen verdict lap; `--init-ckpt` NOT `--resume-name`):
+```
+python src/train.py --name <name> --init-ckpt <path/to/ckpt_XXXXXXX.pt> --freeze-encoder \
+  --cem --cem-horizon 1 --cem-replan-every 1 --cem-init-std 0.3 \
+  --goal-select highmse_under_d --goal-curriculum --goal-curric-d-start 3 --goal-curric-d-max 4 \
+  --goal-curric-thresh 0.05 --goal-curric-patience 150 --goal-update-every 25 \
+  --wm-cam wrist --no-proprio --action-max 0.05 \
+  --consolidate-every 70 --consolidate-epochs 1 --buffer-frac 3 --sigreg-pertimestep \
+  --total-steps 1500 --n-envs 8 --env-threads 8
+```
+Stage C = Stage B + `--cotrain-every 2000 --cotrain-epochs 30 --cotrain-flatline --cotrain-lr 2e-5 --cotrain-beta 0.02` (and/or the new event-triggered `--cotrain-frac-thresh 0.3 --cotrain-frac-cooldown 400`), `--goal-curric-d-max` raised once d=4 holds through thaws.
+
+## 2026-07-03 — ★ FROM-SCRATCH STAGE A+B PASSES (d=4 pctl-ladder complete, reach 0.108, qpos-confirmed) — after a RECIPE-DRIFT incident that faked 3 "failures" ★
+
+**THE ISSUE (read this before ever concluding "the latent is bad").** Executing the 07-02 staged plan, Stage B was launched from the plan paragraph's flag list; the paragraph says "proven H=1 recipe" WITHOUT restating flags that live only in the 06-26 BEST RECIPE line and the reference runs' W&B configs. The launched B runs therefore silently ran with: goals refreshed every **200** steps (the `goal_update_every<=0 → max_episode_steps` coercion; proven recipe = **25**, so bad goals are abandoned after 25 steps instead of chased for a full episode), CEM search std **1.0** (proven = **0.3**, gentler candidate set = less WM-exploitation), patience 200 (proven 150), buffer_frac 4 (proven 3), and `--resume-name` (which restores the ckpt's STALE goal archive) instead of `--init-ckpt` (weights-only). Consequences, all initially mis-attributed to the from-scratch latent:
+- `scratch_b1` (`4v98tkdl`, frozen A1 latent): reach 0.000 over 26 windows, pctl pinned (3,0.0), dist_goal 12–15, min_cand →7–12, frac_rand 0.16→0.51 under pursuit. Mis-diagnosed as "scratch latent non-local under directed motion."
+- `scratch_b1_trig` (`7ywkklee`): the new frac_rand-triggered co-train fired correctly (0.341@400, 0.695@800) but full-consolidation sleeps over the far-goal-chase buffer made locality WORSE (0.34→0.70 post-sleep). Real sub-lesson: **consolidation amplifies whatever the buffer holds** — sleeps are only useful on healthy pursuit data.
+- `scratch_b2` (`cxoagaxr`, A2 latent): identical failure → wrongly escalated to the terminal v3 fallback.
+- Even `scratch_b3_v3` (`dai66hw9`, the PROVEN v3 latent) failed under the drifted recipe (dist_goal 21.7!) — this run is what exposed the drift: a **W&B config diff vs `jl7wfyqn`** (the healthy d3→12 reference) listed every divergence in one shot. THE LESSON (now also in memory): before launching any "same as run X" experiment, diff planned argv against X's ACTUAL config (`wandb.Api().run(...).config`); prose recipes drift.
+- Metric-dive side-result (partially confounded by init_std but directionally real): far initial goals (dist ~12 ≫ d=3) and frac_rand ~0.28 under pursuit are the NORMAL bootstrap start (REF began identically); the discriminators between healthy/broken are `cem/cost_cv` (REF 0.035 vs 0.25–0.45 scratch) and `wm/sigreg` (REF ~16 vs ~55 scratch).
+
+**VALIDATION.** `b3_v3_fix` (`5zu9ynbl`, v3@3000 via `--init-ckpt` + corrected flags) matched REF immediately — reach 0.062 by step 450, cost_cv 0.037, pctl (3,0)→(3,0.4), qpos>0 — and was stopped once matched (purpose served).
+
+**★ THE WORKING FROM-SCRATCH RECIPE (exact, as-run, verified vs W&B configs `ysc8zudj` → `uyiem6w9`/`igcr3mjt`).**
+Stage A — build latent+WM from scratch on tight directed data (recent-goal pursuit), encoder TRAINS, 3000 steps (~50 min on the box):
+```
+python src/train.py --name scratch_a2 \
+  --cem --cem-horizon 1 --cem-replan-every 1 \
+  --goal-select recent --goal-future-k 3 --goal-update-every 25 \
+  --wm-cam wrist --no-proprio --action-max 0.05 \
+  --consolidate-every 70 --consolidate-epochs 1 --buffer-frac 4 --sigreg-pertimestep \
+  --total-steps 3000 --n-envs 8 --env-threads 8
+```
+(NB as-run A used default `cem_init_std 1.0` + `buffer-frac 4` — fine for A, which has no reach gating; the canonical block above suggests 0.3/3 for uniformity. A-gate observed: frac_rand 0.276 tail on its own directed data, z_std 1.07, rank 0.19–0.21, pvp 0.184 — "borderline" on the old gate, sufficient in fact.)
+Stage B — freeze + d-curriculum verdict lap from the A ckpt (weights-only init!), 3500 steps total:
+```
+python src/train.py --name b2_fix \
+  --init-ckpt <hf-cache>/scratch_a2/ckpt_0003000.pt --freeze-encoder \
+  --cem --cem-horizon 1 --cem-replan-every 1 --cem-init-std 0.3 \
+  --goal-select highmse_under_d --goal-curriculum --goal-curric-d-start 3 --goal-curric-d-max 4 \
+  --goal-curric-thresh 0.05 --goal-curric-patience 150 --goal-update-every 25 \
+  --wm-cam wrist --no-proprio --action-max 0.05 \
+  --consolidate-every 70 --consolidate-epochs 1 --buffer-frac 3 --sigreg-pertimestep \
+  --total-steps 3500 --n-envs 8 --env-threads 8
+```
+(`--goal-mse-curric` default-ON supplies the nested pctl ladder; run executed as 1500 steps + `--resume-name b2_fix` continuation to 3500.)
+
+**RESULT (`b2_fix`, the SAME A2 latent that "failed" under the drifted recipe).** Walked the FULL nested difficulty ladder at both radii: pctl (3,0)→(3,1.0) → d=4 → (4,0)→**(4,1.0)** by step ~2650; **sustained reach@d=4 = 0.108** (n=30 windows, 2× the 0.05 gate), `goal/success_rate_qpos` > 0 throughout (physically confirmed), dist_to_goal 12.7→5.0, min_cand settled at **1.98** (the healthy optimism floor), fantasy gap 4.3→3.3, locality frac_rand improved to **0.205** as pursuit tightened. Under the drifted recipe the identical ckpt read: reach 0.001, pctl pinned 0. ⇒ **the from-scratch latent was NEVER the blocker at d≤4; the recipe was.** Remaining true scratch-vs-v3 gaps (the levers if d>4 ceilings appear): `cem/cost_cv` 0.25–0.45 vs 0.037 and `wm/sigreg` ~55 vs ~16 — address with LONGER Stage-A builds (A2's pvp was still falling at its 3k cutoff) and gate future A's on those two, not frac_rand alone.
+
+**New instrumentation this session:** `--cotrain-frac-thresh` / `--cotrain-frac-cooldown` (+ `cotrain/frac_triggers` metric) — EVENT-triggered co-train phase when windowed step_jump_frac_rand exceeds the threshold (pause CEM → thaw → flatline-consolidate → re-freeze → window reset). Firing verified; its fair test is Stage C on healthy data (b1_trig only proved it faithfully amplifies a poisoned buffer).
+
+**NEXT — Stage C from scratch:** init from `b2_fix` final ckpt, Stage-B recipe + `--cotrain-every 2000 --cotrain-epochs 30 --cotrain-flatline --cotrain-lr 2e-5 --cotrain-beta 0.02 --cotrain-frac-thresh 0.3`; ~6000 steps (≥2 thaw cycles). GATE: reach@d=4 HOLDS through thaw cycles and frac_rand doesn't degrade phase-over-phase; only then raise `--goal-curric-d-max` toward the d≈10–14 band.
+
+## 2026-07-03 (cont.) — ★ STAGE C PASSES from scratch (2 thaw cycles held, ladder → (4,0.8), qpos success ×2) — after diagnosing the "reach collapse" as a LATENT-RESCALE MEASUREMENT ARTIFACT ★
+
+Ckpt lineage: `scratch_a2@3000` (`ysc8zudj`) → `b2_fix@3500` (`uyiem6w9`/`igcr3mjt`) → `c1_scratch@3000` (`7cs03svx`) → `c2_scratch@4500` (`ku0nqa4m`) → `c3_scratch` (`8h5xo181`, running).
+
+**c1 (`c1_scratch` `7cs03svx`, from b2_fix@3500, trigger 0.3): the thaw did NOT break behavior — it broke the ruler.** Per-phase anatomy (the decisive deep-dive): post-thaw the predictor IMPROVED (pred_loss 0.022→0.012, pvp 0.079→0.045), the planner landscape IMPROVED (cost_cv 0.54→0.34), conditioning MASSIVELY improved (sigreg 64→4), and PHYSICAL closing was flat (qpos_dist 1.44→1.30) — but SIGReg pulled z_std 0.82→1.03, inflating step_jump 5.0→6.6 (+32%) and ALL latent distances ~25–30% while `eps=2.0`/`d=4` stayed fixed ⇒ reach "fell" 0.037→0.02 purely in rescaled units. The frac_rand-trigger at 0.3 then thrashed (3 fires/800 steps — firing on the rescaled numerator, each phase re-perturbing before re-adaptation): reach pinned 0.03. Two lessons: **(1) after any thaw, latent-unit thresholds (eps, curric_d, frac-trigger) are stale until the scale settles — recalibrate or read qpos; (2) trigger threshold must sit ABOVE the post-thaw settling band (0.28–0.36), not in it.**
+**c2 (`c2_scratch`, from c1@3000 = the conditioned weights, trigger 0.4, 4500 steps): GATE PASSED.** Thaw#1@2000 (690 grad steps to converge): reach flat through boundary (0.046→0.043), ladder kept climbing (pctl 0.14→0.50), rescale only +21%. Thaw#2@4000 (295 steps — phases need LESS work each time): **NO rescale** (step_jump 6.80→6.81 — scale stable once near-isotropic), reach recovered in 250 steps, **ladder advanced THROUGH both thaws to (4,0.8)**, `success_rate_qpos` 0.010→0.018 (physical successes doubled), pvp 0.065→0.028, sigreg 18→6, cost_cv →0.39, frac_rand stable ~0.34, zero trigger fires. Caveat: window-MEAN reach ~0.03 (<0.05) — but pctl advances require windowed reach ≥0.05 and kept occurring; means are diluted by post-advance resets. The wake/sleep cycle is net-positive from scratch: each sleep improves the WM without costing behavior.
+**Verdict on the scratch-vs-v3 conditioning gap:** Stage C's sleeps CLOSED it (cost_cv 0.79→0.39 trending to v3-ish, sigreg 6 < v3's 16) — the gap flagged at B-time self-heals under phased co-train on healthy pursuit data.
+**NEXT (launched): `c3_scratch` (`8h5xo181`)** — radius extension unlocked by the C-gate pass. Exact command (= Stage C canonical + d-max 12):
+```
+python src/train.py --name c3_scratch \
+  --init-ckpt <hf-cache>/c2_scratch/ckpt_0004500.pt --freeze-encoder \
+  --cem --cem-horizon 1 --cem-replan-every 1 --cem-init-std 0.3 \
+  --goal-select highmse_under_d --goal-curriculum --goal-curric-d-start 3 --goal-curric-d-max 12 \
+  --goal-curric-thresh 0.05 --goal-curric-patience 150 --goal-update-every 25 \
+  --wm-cam wrist --no-proprio --action-max 0.05 \
+  --consolidate-every 70 --consolidate-epochs 1 --buffer-frac 3 --sigreg-pertimestep \
+  --cotrain-every 2000 --cotrain-epochs 30 --cotrain-flatline --cotrain-lr 2e-5 --cotrain-beta 0.02 \
+  --cotrain-frac-thresh 0.4 --total-steps 12000 --n-envs 8 --env-threads 8
+```
+Watch: does the from-scratch+cotrain stack extend the radius past d=4 toward the v3-stack's d=12–18; rescale artifacts should stay absent (scale settled); if reach stalls at larger d with rising fantasy gap, the planner-side levers (pessimism/trust-region, 06-30 §3c) are next.
