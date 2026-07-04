@@ -1230,6 +1230,36 @@ Watch: does the from-scratch+cotrain stack extend the radius past d=4 toward the
 5. **Success criterion:** arrival at d=4/eps 2.8/w50 rising from the measured 0.33 plateau toward ≥0.6 (the honeymoon level sustained); guardrail: cost_cv and reach must not collapse (over-rejection symptom).
 
 ## 2026-07-04 — GOAL-MODE NIGHT WRAP (3:21–9:00 AM PT, autonomous): the reach-mastery arc closed with the blocker isolated by controlled experiment
-Sequence run autonomously: `arrival90` (0.9 per-goal bar → honest arrival 0.51 fresh / 0.25 hardened, bar touchable at 0.911) → `arr90_w50` (travel-time arm → +25–30% but plateau 0.33 ⇒ precision dominant). Combined with the dwell arc (stay solved, entry choking): **the single remaining obstacle between the current stack and "reaches most goals it sets" is CEM close-range directional error, and the Jacobian trust region (spec above) is the designed, self-validating fix.** All results committed run-by-run; new tooling shipped this arc: `goal/arrival_rate` + `--goal-curric-metric`, dwell HOLD/shrink flags, frac_rand-triggered co-train. GPU idle at wrap; next session starts at the Jacobian spec.
+Sequence run autonomously: `arrival90` (0.9 per-goal bar → honest arrival 0.51 fresh / 0.25 hardened, bar touchable at 0.911) → `arr90_w50` (travel-time arm → +25–30% but plateau 0.33 ⇒ precision dominant). Combined with the dwell arc (stay solved, entry choking): **the single remaining obstacle between the current stack and "reaches most goals it sets" is CEM close-range directional error, and the Jacobian trust region (spec above) is the designed, self-validating fix.** All results committed run-by-run; new tooling shipped this arc: `goal/arrival_rate` + `--goal-curric-metric`, dwell HOLD/shrink flags, frac_rand-triggered co-train. GPU idle at wrap. *(Forward pointer retracted: the Jacobian trust region was DECLINED by user later on 07-04 — see the decision block above and the entry below. It is NOT the next build.)*
 
 **⇒ The 06-30 §3b DWELL FIXES are now the only path above ~0.15 sustained, and they have a precise baseline to beat:** arrival-HOLD (a=0 inside ~1.25×eps; converts each arrival into parked scoring — WM-free so unexploitable) + proximity-gated terminal action-shrink (drop action_max near the goal so the final step can land INSIDE the 4-unit ball instead of stepping over it) + eps recalibrated to the current latent scale (~0.45×step_jump ≈ 2.6–3.0). Success criterion for that experiment: sustained reach > 0.234 (the no-dwell max window) at d=4; the user's 0.5→0.9 bar idea then becomes an arrival-SPEED curriculum (with HOLD, a goal reached at step k of a 25-step window scores (25−k)/25). GPU idle; awaiting go on the dwell implementation.
+
+## 2026-07-04 — DECISION REAFFIRMED: NO JACOBIAN TRUST REGION (user, final) + `arr100_d1` launched: from-scratch "reach EVERY goal" ladder (arrival bar 1.0, d=1 → up, nested MSE curriculum)
+
+**DECISION (user, stated twice this date — treat as final): we do NOT want the Jacobian trust region.** Do not build it; do not re-propose it as the default next step. Earlier entries calling it "the designed fix" / "the confirmed sole path to 0.9" record the *analysis* of the close-range precision gap, not the *plan* — that path is closed by user decision. If the precision gap is ever attacked directly, the open levers remain: proximity-gated CEM search precision (init-std/iters schedule near goal, untried), cadence/window knobs, or investing elsewhere (radius at new mechanics, seeds, bigger predictor).
+
+**NEW RUN (user-designed): `arr100_d1` — "I want it to reach every goal it sets."** Gate = per-goal ARRIVAL (ever inside eps during the goal's window — binary per goal, NOT time-occupancy) with bar **1.0**: advance only when EVERY goal in the last ≥8 windows was entered (booleans ⇒ mean==1.0 exact, no float issue; verified in code). Full ladder from the bottom: **d-start 1**, nested MSE pctl 0→1 inside each d (`--goal-mse-curric` default-ON), then d+1 and pctl resets — exactly the user's "d=1, mse=0 → higher mse → higher d". Tabula rasa: fresh Stage A build `scratch_a3` (exact `scratch_a2`/`ysc8zudj` recipe, verified by W&B-config diff; only training-inert diff = `--keep-local-ckpts` for chaining) → main run inits **weights-only** from `scratch_a3@3000`. Main recipe = **`arr90_w50` (`p8hd4mnn`) exactly** (config-diffed per the 07-03 hygiene rule) with THREE deliberate diffs: `--init-ckpt` (scratch lineage), `--goal-curric-d-start 1`, `--goal-curric-thresh 1.0` — plus budget 24000 (taller ladder; any extension = fresh `--init-ckpt`, never `--resume-name`). Inherited defaults of record: metric arrival, w50 goal life, eps 2.8, dwell v2 (HOLD 1.25×, shrink 2.0×/floor 0.3), sleeps 3500 / trigger 0.45, H=1, cem-init-std 0.3, buffer-frac 3.
+
+```
+# Stage A (launched first):
+python src/train.py --name scratch_a3 \
+  --cem --cem-horizon 1 --cem-replan-every 1 \
+  --goal-select recent --goal-future-k 3 --goal-update-every 25 \
+  --wm-cam wrist --no-proprio --action-max 0.05 \
+  --consolidate-every 70 --consolidate-epochs 1 --buffer-frac 4 --sigreg-pertimestep \
+  --total-steps 3000 --n-envs 8 --env-threads 8 --keep-local-ckpts
+# Main (chained when A completes; the canonical arr100 block):
+python src/train.py --name arr100_d1 \
+  --init-ckpt runs/scratch_a3/ckpt_0003000.pt --freeze-encoder \
+  --cem --cem-horizon 1 --cem-replan-every 1 --cem-init-std 0.3 \
+  --goal-select highmse_under_d --goal-curriculum --goal-curric-d-start 1 --goal-curric-d-max 12 \
+  --goal-curric-thresh 1.0 --goal-curric-patience 150 --goal-curric-metric arrival \
+  --goal-update-every 50 --goal-reach-eps 2.8 \
+  --dwell-hold-mult 1.25 --dwell-shrink-start 2.0 --dwell-shrink-min 0.3 \
+  --wm-cam wrist --no-proprio --action-max 0.05 \
+  --consolidate-every 70 --consolidate-epochs 1 --buffer-frac 3 --sigreg-pertimestep \
+  --cotrain-every 3500 --cotrain-epochs 30 --cotrain-flatline --cotrain-lr 2e-5 --cotrain-beta 0.02 \
+  --cotrain-frac-thresh 0.45 --total-steps 24000 --n-envs 8 --env-threads 8
+```
+
+**Pre-registered expectations (so the verdict is honest):** (1) d=1–2 rungs are formally trivial — d < eps 2.8 means goals start inside the ball (no-under-d fallback = nearest candidate; likely parked-in-hold early) — they validate the 1.0-gate machinery, floor ≈450 steps/rung (8 windows × w50, gate checks at patience-150 multiples) ⇒ expect ~5–7k steps before real work at d≈3. (2) The 1.0 bar is strict; known capability (arr90_w50 plateau ~0.33 at (4,0.0), best window 0.911) says the ladder should park somewhere in **d≈3–5**; WHERE it parks IS the finding — the honest "reaches everything it sets" radius of the current stack. (3) Stall rule = r25's: 2+ full sleep cycles with no advance and flat/declining window peaks ⇒ ceiling called (report, don't churn). Monitoring: 15-min updates + stall/pathology alerts (dist_goal drift, frac_rand →0.5, trigger thrash, post-thaw rescale artifacts) via Pushover.
