@@ -1422,6 +1422,7 @@ def main(args):
     recent_qpos = deque(maxlen=200)                           # rolling final-pose history -> pose_spread / pose_range
     step_jump_recent = deque(maxlen=400)                      # per-step ||z_t - z_{t+1}|| -> latent temporal locality
     frac_trig = {"last": 0, "n": 0}                           # --cotrain-frac-thresh trigger state (step of last fire, count)
+    dwell_hold_recent = deque(maxlen=400)                     # --dwell-hold-mult: fraction of envs parked per decision
     recent = {k: deque(maxlen=400) for k in
               ("r_cur", "r_safe", "cur_contrib", "contacts", "table_contacts",
                "motion", "ret", "frac_block", "frac_table",
@@ -1694,6 +1695,23 @@ def main(args):
                 a = actor(z)                 # deterministic mean (deployment / eval)
             if args.explore_noise > 0:       # optional extra collection noise (sim pretrain only)
                 a = (a + args.explore_noise * torch.randn_like(a)).clamp(-1.0, 1.0)
+            if args.dwell_hold_mult > 0 or args.dwell_shrink_start > 0:
+                # DWELL mechanics (06-30 §3b): the stay-wall fix. Per-step latent jump (~6) exceeds the
+                # eps-ball width (4), so an always-moving planner can only arrive-and-bounce. SHRINK makes
+                # the final approach small enough to land INSIDE the ball; HOLD parks (a=0) once inside —
+                # WM-free, so planner model-exploitation cannot justify leaving. Gated on has_goal: no-goal
+                # envs carry a self-goal (distance ~0) and would freeze permanently without the gate.
+                with torch.no_grad():
+                    gd = (z - zstar_env).norm(dim=-1)
+                    hg = torch.as_tensor(has_goal, device=device)
+                    eps_now_d = reach_eps_now(step)
+                    if args.dwell_shrink_start > 0:
+                        scale = (gd / (args.dwell_shrink_start * eps_now_d)).clamp(args.dwell_shrink_min, 1.0)
+                        a = torch.where(hg.unsqueeze(1), a * scale.unsqueeze(1), a)
+                    if args.dwell_hold_mult > 0:
+                        held = hg & (gd < args.dwell_hold_mult * eps_now_d)
+                        a = torch.where(held.unsqueeze(1), torch.zeros_like(a), a)
+                        dwell_hold_recent.append(float(held.float().mean()))
         if args.action_max_warmup_steps > 0:
             if step < args.action_max_warmup_steps:
                 frac = args.action_max_start_frac + (args.action_max_end_frac - args.action_max_start_frac) \
@@ -1996,6 +2014,8 @@ def main(args):
                 d["encoder/step_jump_frac_rand"] = sj / (2 * z_dim) ** 0.5
             if args.cotrain_frac_thresh > 0:
                 d["cotrain/frac_triggers"] = frac_trig["n"]
+            if dwell_hold_recent:
+                d["goal/dwell_hold_frac"] = float(np.mean(dwell_hold_recent))
             for key in ("mse_block", "mse_table", "mse_none"):   # curiosity MSE by contact type
                 if recent_mse[key]:
                     d[f"wm/{key}"] = float(np.mean(recent_mse[key]))
@@ -2520,6 +2540,16 @@ def parse_args():
                         "NOTE: reach_rate is a DIAGNOSTIC only -- it does not affect collection or planning.")
     p.add_argument("--goal-reach-eps-anneal-frac", type=float, default=0.5,
                    help="fraction of --total-steps over which --goal-reach-eps-start anneals to --goal-reach-eps.")
+    p.add_argument("--dwell-hold-mult", type=float, default=0.0,
+                   help="ARRIVAL HOLD (06-30 §3b stay-wall fix): inside this multiple of the reach eps, bypass the "
+                        "planner and act a=0 (park). WM-free -> model-exploitation cannot justify leaving; converts "
+                        "each arrival into sustained in-ball scoring. 0 = off; spec value 1.25.")
+    p.add_argument("--dwell-shrink-start", type=float, default=0.0,
+                   help="TERMINAL ACTION-SHRINK: linearly scale the action from 1.0 at start*eps down to "
+                        "--dwell-shrink-min near the goal so the final approach's latent step can land INSIDE the "
+                        "eps ball instead of stepping over it (step_jump ~6 > ball width 4). 0 = off; spec value 3.0.")
+    p.add_argument("--dwell-shrink-min", type=float, default=0.2,
+                   help="floor of the terminal action-shrink scale.")
     p.add_argument("--goal-success-qpos-eps", type=float, default=0.05,
                    help="LeWM-reacher-style PHYSICAL success threshold (radians): a goal counts as reached "
                         "when EVERY joint is within this many rad of the goal's stored qpos "
