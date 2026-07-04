@@ -1290,6 +1290,11 @@ def main(args):
     goal_evictions = 0
     goal_recent = ({k: deque(maxlen=400) for k in ("dist", "reach", "dist_env", "qpos_dist", "qpos_reach")}
                    if args.goal_explore else None)
+    if goal_recent is not None:
+        # PER-GOAL ARRIVAL (vs reach = time-occupancy): a goal counts ARRIVED if the env ever dipped
+        # inside eps during its window. One entry per goal cycle -> maxlen 16 ~= reach's 400-step window.
+        goal_recent["arrival"] = deque(maxlen=16)
+    goal_min_dist = np.full(args.n_envs, np.inf, np.float32)     # min ||z - z*|| since this goal spawned
     # reachable-radius curriculum state: the CURRENT goal offset k (mutable). Pure goal-RANGE schedule --
     # grown by the controller in the main loop; refresh_goals reads curric_k[0]. No loss/arch involvement.
     curric_k = [args.goal_curric_start if (args.goal_curriculum and args.goal_curric_start > 0)
@@ -1605,6 +1610,10 @@ def main(args):
         #     (reach is masked for those in sac_update). Log dist/reach over real-goal envs. ---
         if args.goal_explore:
             if step % args.goal_update_every == 0:
+                if step > 0 and has_goal.any():      # close out the ending goal windows: arrival = ever inside eps
+                    goal_recent["arrival"].append(
+                        float((goal_min_dist[has_goal] < reach_eps_now(step)).mean()))
+                goal_min_dist[:] = np.inf
                 refresh_goals(np.arange(args.n_envs))
             with torch.no_grad():
                 if has_goal.any():
@@ -1616,6 +1625,7 @@ def main(args):
                     zstar_env[nog_t] = z[nog_t]
                 if has_goal.any():
                     gdist = (z - zstar_env).norm(dim=-1).cpu().numpy()       # ||z_t - z*|| per env
+                    np.minimum(goal_min_dist, np.where(has_goal, gdist, np.inf), out=goal_min_dist)
                     goal_recent["dist"].append(float(gdist[has_goal].mean()))
                     goal_recent["reach"].append(float((gdist[has_goal] < reach_eps_now(step)).mean()))
                     goal_recent["dist_env"].append(np.where(has_goal, gdist, np.nan))  # per-env series; NaN where self-goal (excluded)
@@ -1629,28 +1639,30 @@ def main(args):
             #     target stays LATENT goal/reach_rate, never qpos). Start goals INSIDE the planner's ~5-unit
             #     closing radius (small k) and grow k outward (further-back goal = larger reach_gap) once the
             #     windowed LATENT reach clears the threshold -- extends the reachable radius as the planner earns it.
+            _arr_metric = args.goal_curric_metric == "arrival"
+            _series = goal_recent["arrival"] if _arr_metric else goal_recent["reach"]
             if (args.goal_curriculum and step > 0 and step % args.goal_curric_patience == 0
-                    and len(goal_recent["reach"]) >= 50):
-                wr = float(np.mean(goal_recent["reach"]))
+                    and len(_series) >= (8 if _arr_metric else 50)):   # arrival: 1 entry/goal-cycle, 8 ~= 200 steps
+                wr = float(np.mean(_series))
                 if wr >= args.goal_curric_thresh:
                     if args.goal_select == "highmse_under_d":         # nested MSE curriculum, then grow d
                         if args.goal_mse_curric and curric_pctl[0] < args.goal_mse_pctl_max - 1e-9:
                             # INNER loop: walk the target MSE percentile UP (low/easy -> high/surprising states)
                             # within this d before extending the distance budget -- master each difficulty first.
                             curric_pctl[0] = min(args.goal_mse_pctl_max, curric_pctl[0] + args.goal_mse_pctl_step)
-                            goal_recent["reach"].clear()
-                            print(f"[goal-curriculum] step={step} latent_reach={wr:.2f} -> MSE pctl={curric_pctl[0]:.2f} (d held {curric_d[0]:.2f})", flush=True)
+                            goal_recent["reach"].clear(); goal_recent["arrival"].clear()
+                            print(f"[goal-curriculum] step={step} {args.goal_curric_metric}={wr:.2f} -> MSE pctl={curric_pctl[0]:.2f} (d held {curric_d[0]:.2f})", flush=True)
                         elif curric_d[0] < args.goal_curric_d_max:    # pctl topped out (or off): grow the budget d
                             curric_d[0] = min(curric_d[0] + args.goal_curric_d_step, args.goal_curric_d_max)
                             if args.goal_mse_curric:                  # restart the inner MSE curriculum for the new d
                                 curric_pctl[0] = float(args.goal_mse_pctl_start)
-                            goal_recent["reach"].clear()
-                            print(f"[goal-curriculum] step={step} latent_reach={wr:.2f} -> distance d={curric_d[0]:.2f}"
+                            goal_recent["reach"].clear(); goal_recent["arrival"].clear()
+                            print(f"[goal-curriculum] step={step} {args.goal_curric_metric}={wr:.2f} -> distance d={curric_d[0]:.2f}"
                                   + (f" (MSE pctl reset {curric_pctl[0]:.2f})" if args.goal_mse_curric else ""), flush=True)
                     elif curric_k[0] < args.goal_curric_max_k:        # grow the decisions-ago radius k (recent/future)
                         curric_k[0] += 1
-                        goal_recent["reach"].clear()             # measure the harder (larger-k) stage fresh
-                        print(f"[goal-curriculum] step={step} latent_reach={wr:.2f} -> radius k={curric_k[0]}", flush=True)
+                        goal_recent["reach"].clear(); goal_recent["arrival"].clear()             # measure the harder (larger-k) stage fresh
+                        print(f"[goal-curriculum] step={step} {args.goal_curric_metric}={wr:.2f} -> radius k={curric_k[0]}", flush=True)
 
         # --- act: SAC stochastic sample during sim training (the entropy-driven exploration
         #     that un-parks the policy and decorrelates the parallel envs), the DETERMINISTIC
@@ -1993,6 +2005,8 @@ def main(args):
                             d[f"goal/dist_env/{i:02d}"] = float(sm[i] / cnt[i])
                 if goal_recent["reach"]:
                     d["goal/reach_rate"] = float(np.mean(goal_recent["reach"]))
+                if goal_recent["arrival"]:
+                    d["goal/arrival_rate"] = float(np.mean(goal_recent["arrival"]))
                 if args.goal_curriculum:
                     d["goal/curric_k"] = curric_k[0]              # current reachable-radius curriculum offset
                     if args.goal_select == "highmse_under_d":
@@ -2540,6 +2554,12 @@ def parse_args():
                         "NOTE: reach_rate is a DIAGNOSTIC only -- it does not affect collection or planning.")
     p.add_argument("--goal-reach-eps-anneal-frac", type=float, default=0.5,
                    help="fraction of --total-steps over which --goal-reach-eps-start anneals to --goal-reach-eps.")
+    p.add_argument("--goal-curric-metric", choices=("reach", "arrival"), default="reach",
+                   help="which windowed metric gates curriculum advances: 'reach' = time-occupancy inside eps "
+                        "(the historical metric; travel time caps it ~0.75 even for a perfect agent at "
+                        "update-every 25), 'arrival' = fraction of GOALS entered at least once during their "
+                        "window (per-goal success; a perfect agent scores 1.0 -> high bars like 0.9 are "
+                        "meaningful). Logged as goal/arrival_rate either way.")
     p.add_argument("--dwell-hold-mult", type=float, default=0.0,
                    help="ARRIVAL HOLD (06-30 §3b stay-wall fix): inside this multiple of the reach eps, bypass the "
                         "planner and act a=0 (park). WM-free -> model-exploitation cannot justify leaving; converts "
