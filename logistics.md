@@ -1281,3 +1281,29 @@ python src/train.py --name arr100_d1 \
 **VERDICT: the current stack cannot "reach every goal it sets" at ANY radius on the honest ruler — the per-goal ceiling is ~0.31–0.35 (fresh nearest-band), and demanding 1.0 doesn't climb toward it, it destabilizes the run.** The blocker is the same isolated close-range precision gap (Jacobian trust region remains DECLINED; proximity-gated CEM precision / cadence knobs / invest-elsewhere remain the open levers). If a reach-everything-flavored bar is wanted, the gate needs headroom (≤0.95, or per-env gating, or arrival-speed scoring) — the 1.0 semantics are structurally self-defeating under the current gate.
 
 **Hygiene notes for future fresh-lineage runs:** (a) expect the first thaw to re-scale a fresh A-build's latent ~2× — pre-thaw arrival/reach numbers are RULER-INFLATED and must not be trusted for gates or verdicts; (b) killed-at-8450 ckpts (`arr100_d1/ckpt_0008000.pt` on HF) carry the matured predictor (pvp 0.034) + drift-degraded data regime — init from ≤7000 ckpts for clean continuations. GPU idle at wrap.
+
+## 2026-07-05 — HOT-GOAL RETARGETING shipped (`--goal-hot-retarget`) + `arr95_hot` launched (bar 0.95, retarget-to-fresh-surprise, same scratch_a3 lineage)
+
+**User directives after the arr100_d1 verdict:** (1) bar 1.0 → **0.95** (≥61/64 — the headroom the verdict showed 1.0 structurally lacks); (2) NEW MECHANISM: "if something in the most recent trajectory is higher MSE (ie just added to buffer) it should set a new goal — buffer should be instantaneously updated and so should goals."
+
+**Implementation (src/train.py):** flags `--goal-hot-retarget <margin>` (0=off; launch 1.2 — sub-1.2 margins churn on MSE-estimate noise across consolidations), `--goal-hot-cooldown 10`, `--goal-hot-window 25`; metric `goal/hot_retarget_rate` (per-env per-step; ×n_envs×update_every ≈ retargets/window). Mechanics: rolling pool of the last window×n_envs collected states (obs + collect-time latent + r_cur; r_cur and refresh-time candidate MSE share the per-dim-mean normalization — verified); each step an env retargets to the pool's argmax-MSE state within its curriculum budget d when that MSE > margin × its current goal's (stored at selection, updated on retarget); per-env cooldown; the scheduled w50 refresh is unchanged and overwrites all goals. **Arrival bookkeeping deliberately NOT reset on retarget** → a window's arrival = "entered the ball of ANY goal held during that window" (goals the system supersedes mid-pursuit are not misses). Notes: (a) at rungs where d < buffer granularity (~1 step_jump) the under-d pool is parked-clusters-only ⇒ retargeting is mostly inert below d≈3 — it wakes up exactly where the ladder gets hard; (b) buf.add lands before the next refresh reads candidates, so refresh-time selection already sees this-step states — the hot path closes the remaining 50-step cadence gap.
+
+**Smoke (`smoke_hot` `nf45691h`, 400 steps from scratch_a3@3000, d-start 4):** clean; hot_rate 0.017→0.031 (~12 retargets/window fleet-wide ≈1.5/env — active, cooldown-bounded), arrival 0.97–1.0 (honeymoon ruler, as documented for this lineage).
+
+**Pre-registered hypothesis:** retargeting redirects pursuit to the arm's own recent wake — recently-visited ⇒ definitionally arrivable; hot-MSE ⇒ max training value per visit (the Go-Explore loop tightened to zero lag). If wake-goals dominate, per-goal arrival can exceed the 0.33 static ceiling (wake-pursuit ≈ 'recent'-mode reach ~0.95 in Stage A); if fantasy still blocks final entry, arrival plateaus ≤~0.5 and the close-range precision gap is re-confirmed under a friendlier goal distribution. Stall + honesty rules unchanged (pre-thaw#1 numbers are ruler-inflated: jump ~2.1–2.7 vs mature ~6).
+
+**`arr95_hot`** = arr100_d1 canonical block + `--goal-curric-thresh 0.95` + the three hot flags, same `scratch_a3@3000` init (isolates {bar, retargeting} as the only diffs vs arr100_d1), 24k budget:
+```
+python src/train.py --name arr95_hot \
+  --init-ckpt runs/scratch_a3/ckpt_0003000.pt --freeze-encoder \
+  --cem --cem-horizon 1 --cem-replan-every 1 --cem-init-std 0.3 \
+  --goal-select highmse_under_d --goal-curriculum --goal-curric-d-start 1 --goal-curric-d-max 12 \
+  --goal-curric-thresh 0.95 --goal-curric-patience 150 --goal-curric-metric arrival \
+  --goal-update-every 50 --goal-reach-eps 2.8 \
+  --goal-hot-retarget 1.2 --goal-hot-cooldown 10 --goal-hot-window 25 \
+  --dwell-hold-mult 1.25 --dwell-shrink-start 2.0 --dwell-shrink-min 0.3 \
+  --wm-cam wrist --no-proprio --action-max 0.05 \
+  --consolidate-every 70 --consolidate-epochs 1 --buffer-frac 3 --sigreg-pertimestep \
+  --cotrain-every 3500 --cotrain-epochs 30 --cotrain-flatline --cotrain-lr 2e-5 --cotrain-beta 0.02 \
+  --cotrain-frac-thresh 0.45 --total-steps 24000 --n-envs 8 --env-threads 8
+```

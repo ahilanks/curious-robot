@@ -1295,6 +1295,9 @@ def main(args):
         # inside eps during its window. One entry per goal cycle -> maxlen 16 ~= reach's 400-step window.
         goal_recent["arrival"] = deque(maxlen=16)
     goal_min_dist = np.full(args.n_envs, np.inf, np.float32)     # min ||z - z*|| since this goal spawned
+    goal_mse_env = np.zeros(args.n_envs)                          # current goal's 1-step MSE at (re)selection time
+    hot_ring = deque(maxlen=max(args.goal_hot_window, 1))         # --goal-hot-retarget: fresh-surprise pool (per-step batches)
+    hot_last = np.full(args.n_envs, -10**9)                       # --goal-hot-retarget: last retarget step per env
     # reachable-radius curriculum state: the CURRENT goal offset k (mutable). Pure goal-RANGE schedule --
     # grown by the controller in the main loop; refresh_goals reads curric_k[0]. No loss/arch involvement.
     curric_k = [args.goal_curric_start if (args.goal_curriculum and args.goal_curric_start > 0)
@@ -1390,6 +1393,7 @@ def main(args):
                         j = int(dist.argmin())                             # fallback: nearest
                     goal_px_env[e] = gpx[j]
                     goal_prop_env[e] = gprop[j]
+                    goal_mse_env[e] = float(mse[j])                        # --goal-hot-retarget compares against this
                     has_goal[e] = True
             return
         near = args.goal_select == "near"
@@ -1433,7 +1437,7 @@ def main(args):
                "motion", "ret", "frac_block", "frac_table",
                "rate", "rate2", "energy", "qd_mean", "tau_sat", "qd_rev",
                "r_rate", "r_energy", "pose_step",
-               "r_rnd", "rnd_contrib", "r_knn", "knn_contrib")}
+               "r_rnd", "rnd_contrib", "r_knn", "knn_contrib", "hot_retargets")}
     recent_mse = {k: deque(maxlen=2000) for k in ("mse_block", "mse_table", "mse_none")}
     t0 = time.time()
     last_wm = last_sac = last_rnd = None
@@ -1887,6 +1891,37 @@ def main(args):
             if mask.any():
                 recent_mse[key].extend(r_cur[mask].tolist())
 
+        # --- hot-goal RETARGETING (--goal-hot-retarget, highmse_under_d only): chase FRESH surprise
+        #     mid-window. Pool = every env's transitions from the last goal_hot_window steps (latents
+        #     stored at collect time -- exact under the frozen encoder, ~fresh during brief thaws; the
+        #     pool rolls over in goal_hot_window steps either way). An env retargets when a pool state
+        #     within its curriculum budget d shows 1-step MSE > margin x its current goal's (r_cur and
+        #     refresh-time mse share the per-dim-mean normalization). goal_min_dist is deliberately NOT
+        #     reset: a window's arrival = "entered the ball of ANY goal held during the window". ---
+        hot_fired = np.zeros(args.n_envs, np.float32)
+        if args.goal_explore and args.goal_hot_retarget > 0 and args.goal_select == "highmse_under_d":
+            hot_ring.append((obs["image"].copy(), obs["proprio"].copy(),
+                             z_next.detach().clone(), np.asarray(r_cur, np.float64).copy()))
+            if has_goal.any():
+                ring_z = torch.cat([t[2] for t in hot_ring], 0)                  # (W*n_envs, D)
+                ring_mse = np.concatenate([t[3] for t in hot_ring], 0)           # (W*n_envs,)
+                dmat = torch.cdist(z_next, ring_z).cpu().numpy()                 # (n_envs, W*n_envs)
+                ok = (dmat < float(curric_d[0])) & (dmat > 1e-3)                 # within budget d, not self
+                for e in range(args.n_envs):
+                    if not has_goal[e] or step - hot_last[e] < args.goal_hot_cooldown:
+                        continue
+                    cand = np.where(ok[e])[0]
+                    if not cand.size:
+                        continue
+                    j = int(cand[np.argmax(ring_mse[cand])])
+                    if ring_mse[j] > args.goal_hot_retarget * goal_mse_env[e]:
+                        w, i = divmod(j, args.n_envs)
+                        goal_px_env[e] = hot_ring[w][0][i]
+                        goal_prop_env[e] = hot_ring[w][1][i]
+                        goal_mse_env[e] = float(ring_mse[j])
+                        hot_last[e] = step
+                        hot_fired[e] = 1.0
+
         # --- store transition (truncation-as-done time limit) ---
         ep_len += 1
         ep_ret += reward
@@ -1909,7 +1944,8 @@ def main(args):
                          ("qd_mean", qd_mean), ("tau_sat", tau_sat), ("qd_rev", qd_rev),
                          ("r_rate", r_rate), ("r_energy", r_energy), ("pose_step", pose_step),
                          ("r_rnd", r_rnd), ("rnd_contrib", rnd_term),
-                         ("r_knn", r_knn), ("knn_contrib", knn_term)):
+                         ("r_knn", r_knn), ("knn_contrib", knn_term),
+                         ("hot_retargets", hot_fired)):
             recent[key].append(float(np.mean(val)))
 
         # --- advance latent + history; reset timed-out envs ---
@@ -2007,6 +2043,9 @@ def main(args):
                     d["goal/reach_rate"] = float(np.mean(goal_recent["reach"]))
                 if goal_recent["arrival"]:
                     d["goal/arrival_rate"] = float(np.mean(goal_recent["arrival"]))
+                if args.goal_hot_retarget > 0 and recent["hot_retargets"]:
+                    # per-env per-step retarget probability; x n_envs x update_every ~= retargets/window
+                    d["goal/hot_retarget_rate"] = float(np.mean(recent["hot_retargets"]))
                 if args.goal_curriculum:
                     d["goal/curric_k"] = curric_k[0]              # current reachable-radius curriculum offset
                     if args.goal_select == "highmse_under_d":
@@ -2570,6 +2609,19 @@ def parse_args():
                         "eps ball instead of stepping over it (step_jump ~6 > ball width 4). 0 = off; spec value 3.0.")
     p.add_argument("--dwell-shrink-min", type=float, default=0.2,
                    help="floor of the terminal action-shrink scale.")
+    p.add_argument("--goal-hot-retarget", type=float, default=0.0,
+                   help="highmse_under_d: mid-window retargeting to FRESH surprise. When a state "
+                        "collected in the last --goal-hot-window steps (any env) has 1-step WM MSE > "
+                        "this margin x the current goal's AND lies within the curriculum budget d of "
+                        "the env's z, adopt it as the goal IMMEDIATELY (no wait for --goal-update-every) "
+                        "-- the buffer's freshest surprise is always chaseable. 0 = off; 1.2 = needs "
+                        "20%% more surprise (guards against MSE-estimate churn across consolidations). "
+                        "Arrival bookkeeping is NOT reset on retarget: a window's arrival = entered "
+                        "the ball of ANY goal held during that window.")
+    p.add_argument("--goal-hot-cooldown", type=int, default=10,
+                   help="--goal-hot-retarget: min steps between retargets per env (churn guard).")
+    p.add_argument("--goal-hot-window", type=int, default=25,
+                   help="--goal-hot-retarget: fresh-pool depth in steps (pool = this x n_envs states).")
     p.add_argument("--goal-success-qpos-eps", type=float, default=0.05,
                    help="LeWM-reacher-style PHYSICAL success threshold (radians): a goal counts as reached "
                         "when EVERY joint is within this many rad of the goal's stored qpos "
