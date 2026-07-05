@@ -1307,3 +1307,28 @@ python src/train.py --name arr95_hot \
   --cotrain-every 3500 --cotrain-epochs 30 --cotrain-flatline --cotrain-lr 2e-5 --cotrain-beta 0.02 \
   --cotrain-frac-thresh 0.45 --total-steps 24000 --n-envs 8 --env-threads 8
 ```
+
+## 2026-07-05 — ★★ arr95_hot RESULT (24000 steps, COMPLETED): tabula-rasa ladder d=1 → d=8, 42 advances, HONEST post-thaw arrival 0.958 sustained (~3× the 0.33 ceiling) — hot-goal retargeting + 0.95 bar UNBLOCKED the reach-every-goal regime; all-time physical records (qpos_dist 0.095 rad, qpos succ 61%) ★★
+
+**Result (`8j2tej3r`, from scratch_a3@3000 — same lineage/budget as the arr100_d1 null result; diffs ONLY {bar 1.0→0.95, hot retargeting}):** the nested ladder walked **(1,0.0) → (8,0.0)** — every MSE band of d=1..7 cleared (42 advances, mostly at the ~450-step gate-floor cadence; contested rungs at d≥6 took 750–1350 steps) — vs arr100_d1's ZERO advances. **Honest arrival (post-thaw#1, steps 3500–24000, 310 windows): mean 0.958, min 0.875, 87 windows at literal 1.000.** Final window at the d=8 frontier: 0.891. The 0.9-sustained target that closed the previous arc as "needs more than cadence or dwell" is now EXCEEDED at d≤7 by the goal-distribution lever alone.
+**Physical records (ruler-independent):** `qpos_dist` min **0.095 rad** (first sub-0.1; prior best 0.237), mean 0.244; `success_rate_qpos` peak **0.613**, run-mean 0.279 (prior best peak 0.52 one-off, sustained tails ~0.1). The arm is objectively the most precise it has ever been, while covering d=8 latent radius.
+**Mechanism health:** hot_retarget_rate mean 0.033/env/step (~12/window fleet-wide, max 0.042 — no churn at margin 1.2); dwell holds 0.45–0.80 by regime; **zero frac-rand trigger fires in 24k steps (first ever)** — frac_rand never exceeded 0.223 post-thaw; 6 timer thaws (1076→892→313→280→271→250 grad steps — monotone maturation), thaw→pop 5-for-5 on top-band clears (d4..d7 top bands all cleared within 150–450 steps of a thaw); no rescale artifacts after thaw#2 (z_std_probe 0.97→1.17 total drift); pred_loss 0.002 / pvp 0.014–0.024 = all-time-best band.
+**Read (why it works):** hot retargeting redirects pursuit into the arm's own recent wake — recently-visited ⇒ arrivable, high-MSE ⇒ maximal training value per visit — so the Go-Explore loop (arrive → collect → drain → frontier moves) runs at zero lag and the buffer stays park-anchored (the arr100_d1 corrosion never starts). The 0.95 bar supplies the headroom the 1.0 gate mathematically lacked (≤3 misses/64), so advances flow and band-refreshes keep goals fresh. NB the honest caveat for external claims: arrival is measured on goals the system itself selects (wake-biased by design — that IS the mechanism); the d-budget and eps 2.8 are exercised honestly (dist_goal 4–6 at d=7–8, map scale z_std~1.17, qpos confirms) but this is "reaches everything IT sets", not "reaches arbitrary externally-imposed states". Radius-under-mastery is the right external metric: d=8 at 0.958 arrival from tabula rasa in 24k steps.
+**Levers banked:** `--goal-hot-retarget 1.2` (+cooldown 10, window 25) joins w50/eps 2.8/dwell v2 as an operating default for arrival-mode runs. The close-range precision gap (0.33 plateau) is CIRCUMVENTED by goal distribution, not solved for arbitrary goals — the distinction matters for any future fixed-goal benchmark.
+
+**CONTINUATION (user): `arr95_hot2` — 80k steps, "let it climb higher in d; NEVER kill it."** Init weights-only from `arr95_hot/ckpt_0024000.pt` (HF), ladder regime-matched (`--goal-curric-d-start 8`), headroom raised (`--goal-curric-d-max 22` = the random-pair latent ceiling), all else identical. Monitor is REPORT-ONLY: no stall-kill authority (alerts via Pushover on pathology; run rides to 80k regardless). Canonical block:
+```
+python src/train.py --name arr95_hot2 \
+  --init-ckpt <hf-cache>/arr95_hot/ckpt_0024000.pt --freeze-encoder \
+  --cem --cem-horizon 1 --cem-replan-every 1 --cem-init-std 0.3 \
+  --goal-select highmse_under_d --goal-curriculum --goal-curric-d-start 8 --goal-curric-d-max 22 \
+  --goal-curric-thresh 0.95 --goal-curric-patience 150 --goal-curric-metric arrival \
+  --goal-update-every 50 --goal-reach-eps 2.8 \
+  --goal-hot-retarget 1.2 --goal-hot-cooldown 10 --goal-hot-window 25 \
+  --dwell-hold-mult 1.25 --dwell-shrink-start 2.0 --dwell-shrink-min 0.3 \
+  --wm-cam wrist --no-proprio --action-max 0.05 \
+  --consolidate-every 70 --consolidate-epochs 1 --buffer-frac 3 --sigreg-pertimestep \
+  --cotrain-every 3500 --cotrain-epochs 30 --cotrain-flatline --cotrain-lr 2e-5 --cotrain-beta 0.02 \
+  --cotrain-frac-thresh 0.45 --total-steps 80000 --n-envs 8 --env-threads 8
+```
+(Buffer cap clips at 50k transitions either way ⇒ VRAM ~26GB unchanged. ~22 timer thaws over the budget. Continuation-hygiene reminder honored: fresh `--init-ckpt`, never `--resume-name`; curriculum state is NOT in the ckpt ⇒ d-start must be set manually.)
