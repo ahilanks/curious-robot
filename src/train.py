@@ -882,6 +882,85 @@ def save_buffer(buf, out_dir):
     return path
 
 
+def save_state_snapshot(buf, out_dir, step, repo_id=None, run_name=None, upload=False):
+    """FULL continuation snapshot (default-on via --save-state): raw per-env rings +
+    pointers (+ HER goal fields) in ONE rolling file (~1.2 GB at the 50k cap) so disk
+    stays bounded. Written every --save-state-every steps and at run end (end also
+    uploads to HF when enabled). Restored by --init-buffer so a chained run keeps its
+    goal-candidate COVERAGE of the deep shell instead of re-collecting from empty --
+    the weights remember the dynamics, but highmse_under_d can only propose goals the
+    buffer contains."""
+    path = out_dir / "state_latest.npz"
+    d = dict(fmt=np.int64(1), step=np.int64(step), head=buf.head, count=buf.count,
+             pixels=buf.pixels, proprio=buf.proprio, action=buf.action, r=buf.r,
+             done=buf.d, is_start=buf.is_start, prio=buf.prio)
+    if buf.rc is not None:
+        d["rc"] = buf.rc
+    if buf.goal_explore:
+        d.update(goal_px=buf.goal_px, goal_prop=buf.goal_prop, goal_valid=buf.goal_valid,
+                 ep_id=buf.ep_id, cur_ep=buf.cur_ep)
+    tmp = path.with_name("state_latest.tmp.npz")
+    np.savez(tmp, **d)                                # uncompressed: fast, no long training pause
+    tmp.replace(path)                                 # atomic swap: no torn file on crash
+    print(f"[state] snapshot @ {step}: {buf.total} transitions -> {path} "
+          f"({path.stat().st_size / 1e9:.2f} GB)", flush=True)
+    if upload and repo_id and os.environ.get("HF_TOKEN"):
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi(token=os.environ["HF_TOKEN"])
+            api.create_repo(repo_id, repo_type="model", exist_ok=True)
+            api.upload_file(path_or_fileobj=str(path), repo_id=repo_id,
+                            path_in_repo=f"{run_name}/state_latest.npz")
+            print(f"[hf] uploaded {run_name}/state_latest.npz -> {repo_id}", flush=True)
+        except Exception as ex:
+            print(f"[hf] state upload failed (kept locally): {ex}", flush=True)
+    return path
+
+
+def load_state_snapshot(buf, path):
+    """Restore a save_state_snapshot into a FRESH buffer. Ring-size-agnostic: unrolls each
+    env chronologically and keeps the newest min(n, cap) transitions; env count and obs
+    dims must match (else skipped). The oldest retained slot is marked is_start so no WM
+    window reaches before the snapshot horizon. Returns True iff loaded."""
+    z = np.load(path)
+    if (int(z["head"].shape[0]) != buf.n_envs
+            or z["pixels"].shape[2] != buf.pixels.shape[2]
+            or z["proprio"].shape[-1] != buf.proprio.shape[-1]
+            or z["action"].shape[-1] != buf.action.shape[-1]):
+        print(f"[state] snapshot {path} shape-mismatched (envs/obs dims) -> starting empty", flush=True)
+        return False
+    C_old = z["pixels"].shape[1]
+    has_goal = ("goal_px" in z.files) and buf.goal_explore
+    for e in range(buf.n_envs):
+        n = min(int(z["count"][e]), buf.C)
+        if n == 0:
+            continue
+        start = (int(z["head"][e]) - n) % C_old
+        idx = (start + np.arange(n)) % C_old
+        buf.pixels[e, :n] = z["pixels"][e, idx]
+        buf.proprio[e, :n] = z["proprio"][e, idx]
+        buf.action[e, :n] = z["action"][e, idx]
+        buf.r[e, :n] = z["r"][e, idx]
+        buf.d[e, :n] = z["done"][e, idx]
+        buf.is_start[e, :n] = z["is_start"][e, idx]
+        buf.prio[e, :n] = z["prio"][e, idx]
+        if buf.rc is not None and "rc" in z.files:
+            buf.rc[e, :n] = z["rc"][e, idx]
+        if has_goal:
+            buf.goal_px[e, :n] = z["goal_px"][e, idx]
+            buf.goal_prop[e, :n] = z["goal_prop"][e, idx]
+            buf.goal_valid[e, :n] = z["goal_valid"][e, idx]
+            buf.ep_id[e, :n] = z["ep_id"][e, idx]
+        buf.is_start[e, 0] = True                     # snapshot horizon = episode boundary
+        buf.head[e] = n % buf.C
+        buf.count[e] = n
+    if has_goal:
+        buf.cur_ep[:] = z["cur_ep"]
+    print(f"[state] restored {buf.total} transitions from {path} "
+          f"(saved @ step {int(z['step'])})", flush=True)
+    return True
+
+
 def save_and_upload(state, out_dir, step, repo_id, run_name, enable_hf, keep_local):
     """Save a checkpoint, upload to HF under <run_name>/ckpt_<step>.pt, then (unless
     keep_local) delete the local copy once the upload succeeds -- so disk stays
@@ -1218,6 +1297,30 @@ def main(args):
                       f"across {len(archives)} buffer(s)", flush=True)
         except Exception as _ex:
             print(f"[resume] goal archive not loaded ({_ex}); starting empty", flush=True)
+
+    # --- default-on buffer continuity (--init-buffer): restore the previous run's FULL
+    #     replay state so goal-candidate coverage survives chaining. Weights come from
+    #     --init-ckpt and the goal archive rides inside the ckpt; this carries the BUFFER
+    #     (the one piece --init-ckpt loses). 'auto' looks for state_latest.npz next to
+    #     the init ckpt (works for local out_dirs and HF snapshot dirs alike). ---
+    if args.init_buffer != "none":
+        _sp = None
+        if args.init_buffer == "auto":
+            if args.init_ckpt:
+                _cand = Path(args.init_ckpt).parent / "state_latest.npz"
+                _sp = _cand if _cand.exists() else None
+                if _sp is None:
+                    print("[state] no state_latest.npz next to init-ckpt -> starting empty", flush=True)
+        else:
+            _sp = Path(args.init_buffer)
+            if not _sp.exists():
+                print(f"[state] --init-buffer {_sp} not found -> starting empty", flush=True)
+                _sp = None
+        if _sp is not None:
+            try:
+                load_state_snapshot(buf, _sp)
+            except Exception as _ex:
+                print(f"[state] restore failed ({_ex}) -> starting empty", flush=True)
 
     run_name = args.name
     out_dir = Path(args.out_dir) if args.out_dir else Path("runs") / run_name
@@ -2142,6 +2245,11 @@ def main(args):
                             args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
                             run_name, not args.no_hf, args.keep_local_ckpts)
 
+        # --- full-state snapshot (default-on): rolling buffer+pointer file for chaining ---
+        if (args.save_state and args.save_state_every > 0 and step > 0
+                and step % args.save_state_every == 0):
+            save_state_snapshot(buf, out_dir, step)
+
         # --- train videos: save the buffered wrist + overhead clips (every video_every) ---
         if video_on and step > 0 and step % args.video_every == 0:
             roll_dir = out_dir / "rollouts"; roll_dir.mkdir(exist_ok=True)
@@ -2161,6 +2269,10 @@ def main(args):
     # --- final: collected data (frozen / --save-buffer) and/or model checkpoint ---
     if args.frozen_policy or args.save_buffer:
         save_buffer(buf, out_dir)
+    if args.save_state:                           # final full-state snapshot + HF upload for chaining
+        save_state_snapshot(buf, out_dir, step if _stop["flag"] else args.total_steps,
+                            repo_id=args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
+                            run_name=run_name, upload=not args.no_hf)
     if not args.frozen_policy:                    # frozen: weights are unchanged, skip the re-upload
         state = {"step": args.total_steps, "wm": wm.state_dict(), "actor": actor.state_dict(),
                  "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
@@ -2690,6 +2802,18 @@ def parse_args():
     p.add_argument("--frozen-policy", action="store_true",
                    help="data-collection/eval: act with the loaded policy, NO gradient updates "
                         "(much higher cadence, learner removed). Refuses on hardware without a loaded policy.")
+    p.add_argument("--save-state", action=argparse.BooleanOptionalAction, default=True,
+                   help="DEFAULT ON: periodically snapshot the FULL replay buffer (rings+pointers+HER "
+                        "goal fields) to out_dir/state_latest.npz (single rolling file, ~1.2 GB at the "
+                        "50k cap) and upload the final one to HF -- chained runs then restore coverage "
+                        "via --init-buffer instead of re-collecting the deep shell from empty. "
+                        "--no-save-state disables.")
+    p.add_argument("--save-state-every", type=int, default=10000,
+                   help="--save-state cadence (decision steps); also saved at run end / graceful stop.")
+    p.add_argument("--init-buffer", default="auto",
+                   help="restore a state_latest.npz into the fresh buffer at startup: 'auto' (default) = "
+                        "use the file next to --init-ckpt if present, 'none' = always start empty, or an "
+                        "explicit path. Complements --init-ckpt (weights) + the ckpt-embedded goal archive.")
     p.add_argument("--save-buffer", action="store_true",
                    help="dump the replay buffer to out_dir/buffer_<N>.npz on exit (implied by "
                         "--frozen-policy); enables graceful Ctrl-C save.")
