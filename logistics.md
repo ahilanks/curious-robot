@@ -1357,3 +1357,28 @@ Minimal-diff continuation per hygiene (fresh `--init-ckpt` from HF `arr95_hot2/c
 **Physical/WM at the deepest shells:** qpos_dist min **0.125** / mean 0.238 rad; strict succ max 0.381 / mean 0.239; end-of-run pred_loss **0.0013**, pvp **0.0073** — both ALL-TIME BESTS (the WM keeps improving through d=13); hot rate 0.033 steady; frac_rand max 0.276, **zero trigger fires — the campaign's 360k total steps have never fired one**; 30 thaws (225–455 grad steps).
 **Record motion at the frontier:** (13,0.0) opened at dist_goal **6.98** / pose_step **0.073** — both campaign records; the arm reaches ~40% farther per goal than at d=8.
 **NEXT (user-ordered): `arr95_hot4`** — +100k continuation, `--init-ckpt arr95_hot3/ckpt_0100000.pt` (HF), **`--goal-curric-d-start 13`**, d-max 22, all else byte-identical, NEVER-STOP monitor. NB hot3 predates the buffer-snapshot feature ⇒ hot4 starts buffer-empty ONE FINAL TIME and (running the new default-on `--save-state` code) will be the first run to persist `state_latest.npz` — hot5+ continuations carry full experience.
+
+## 2026-07-08 — arr95_hot4 mid-run ledger @91.5k + FIRST PROJECTION TO d=22: ~2.3–5.2M more steps (~1–2.5 months continuous A100) at the measured 1.4×/level ladder inflation — with three identified break-points in the extrapolation
+
+**hot4 band ledger so far (`5jihuwm0`, d-start 13, bar 0.95 + hot retargeting; gate = rolling arrival ≥0.95; wall-clock at the run's steady ~0.9 counter-steps/s = 7.3 env-sps ÷ 8):**
+
+| Band | Entered → Cleared | Cost | ~Wall | Notes |
+|---|---|---|---|---|
+| (13,0.0) | 0 → 11,250 | 11.25k | 3.5h | includes cold-start buffer refill to 50k cap (last-ever buffer-empty chain start) |
+| (13,0.2) | 11,250 → 16,350 | 5.1k | 1.6h | clean single-cycle grind |
+| (13,0.4) | 16,350 → 20,400 | 4.05k | 1.3h | fastest of the run |
+| (13,0.6) | 20,400 → 25,350 | 4.95k | 1.5h | peaked 0.953 at the gate |
+| (13,0.8) | 25,350 → 46,650 | **21.3k** | 6.6h | campaign record at the time; ~6 thaw cycles of .80↔.94 whipsaw; tipped by thaw#13 |
+| (13,1.0) | 46,650 → 73,050 | **26.4k** | 8.2h | NEW campaign record; 100th-pctl goals + archive hardening mid-chase (evict 40→47); cleared on record planner quiet (jump 3.08, frac_rand .157) |
+| (14,0.0) | 73,050 → in progress | 18.4k+ | 5.7h+ | peaks .93, base .79–.84; thaw#25 ran 373 grad steps (vs 217–272 norm) = d=14 data genuinely reshaping the encoder; archive evict 47→66 |
+
+**d=13 ladder total: 73k steps (~68k net of cold start) — vs ~50k/ladder at d=11–12 (hot3) ⇒ measured inflation ~1.4–1.5×/level.** The top two MSE bands are the cost center: (13,0.8)+(13,1.0) = 47.7k = 65% of the ladder. Same super-linear tail hot3 measured on the d-axis, now resolved onto the MSE-percentile axis: at fixed deep d, the hardest-novelty bands are where the steps go. Corroboration: (14,0.0) at 18.4k+ is already 4th-longest band of the campaign for what cost 5.1k one level down.
+
+**Projection to d=22 (8 more ladders d=14..21, r=1.4×/level, base d=14≈100k, 78k steps/day):** d=14 ~100k → d=15 ~140k → d=16 ~196k → d=17 ~274k → d=18 ~384k → d=19 ~538k → d=20 ~753k → d=21 ~1.05M ⇒ **cumulative ≈3.44M steps ≈44 days continuous ≈34 chained 100k runs.** Bracket across r=1.3–1.5: **~2.3M–5.2M steps ≈ 30–66 days.**
+
+**Three identified break-points in this extrapolation (order of importance):**
+1. **Latent-diameter ceiling (breaks in our favor):** curric-d only binds while the buffer holds states FARTHER than d. Once d exceeds the workspace's max pairwise latent separation, every candidate is "under d", selection degenerates to pure high-MSE, and per-ladder cost PLATEAUS instead of inflating — but "reaching d=22" becomes partly label rather than harder task. The buffer diameter has never been measured (d-max 22 was set from the random-pair ceiling, a different quantity). **ACTION BANKED: measure max/95th-pctl pairwise latent distance over the buffer (5-min analysis on any state_latest.npz) before committing to a d=22 campaign.**
+2. **Single-band blowout:** at r=1.4, by d≈17 the 1.0-band ALONE exceeds a 100k run — whole continuations inside one band, zero advances. Workable now that state persistence is default-on, but expect long silent grinds and plan monitoring around it.
+3. **Encoder cost per level is returning:** thaw#25's 373 grad steps (vs 217–272 late-d=13 norm) says each new shell now buys real representation change again; this is where a growth-rate surprise (either direction) would come from. WM itself shows no ceiling (pred_loss/pvp still at all-time bests through d=14 entry).
+
+Run status at entry: 91.5k/100k, (14,0.0) ~18.4k in-band, arrival base .79–.84 with .93 peaks, zero trigger fires (campaign streak intact through ~450k total steps), snapshots 10k–90k all written (15.07 GB each; wrist-res transitions ~300KB — compression is a banked future patch). Wrap + verdict entry to follow at 100k.
