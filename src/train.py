@@ -21,6 +21,7 @@ os.environ.setdefault("MUJOCO_GL", "glfw" if platform.system() == "Darwin" else 
 import argparse
 import contextlib
 import json
+import math
 import sys
 import time
 from collections import deque
@@ -489,7 +490,7 @@ def score_obs_mse(wm, gpx, gprop, spx, sprop, sact, device, H):
 
 @torch.no_grad()
 def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, device, diag=None, gamma=0.0,
-             min_std=0.0, mppi_temp=0.0):
+             min_std=0.0, mppi_temp=0.0, early_stop_tol=0.0, early_stop_min_iters=12):
     """CEM planner in LATENT space -- a faithful port of LeWM's stable_worldmodel.solver.CEMSolver
     (+ JEPA.rollout/criterion). Per replan: sample H-step action SEQUENCES from a per-step Gaussian,
     FORCE candidate 0 = the current mean (LeWM's candidates[:,0]=mean), roll each AUTOREGRESSIVELY
@@ -515,6 +516,7 @@ def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, dev
     amp = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
            if device.type == "cuda" else contextlib.nullcontext())
     predict = getattr(wm, "predict_eager", wm.predict)   # EAGER: torch.compile + bf16 autocast -> NaN rollout
+    prev_el = None                                       # early-stop: elite-cost plateau tracker
     with amp:
         for it in range(iters):
             seq = mu.unsqueeze(1) + std.unsqueeze(1) * torch.randn(n, K, T, a_dim, device=device)
@@ -534,6 +536,20 @@ def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, dev
                 cost = sum((gamma ** (T - 1 - h)) * step_costs[h] for h in range(T)).reshape(n, K)
             else:
                 cost = step_costs[-1].reshape(n, K)                      # terminal ||.||^2 (LeWM: SUM over dims)
+            # EARLY-STOP (elite branch only): CEM iterations are the planner's sequential wall-clock cost.
+            # Stop once the mean elite cost plateaus (relative change <= tol) after a floor of iterations --
+            # by then refits barely move the mean, so the returned plan is the converged one. Sampling noise
+            # makes exact equality impossible; the tol is RELATIVE. Diverged (inf) elite costs disable the
+            # plateau test for that iter (never stop on garbage). tol=0 => off (byte-identical to before).
+            stop_now = False
+            if early_stop_tol > 0 and mppi_temp <= 0:
+                c_el = cost.topk(elite, largest=False, dim=1).values.float()
+                cur_el = float(c_el[torch.isfinite(c_el)].mean()) if torch.isfinite(c_el).any() else float("inf")
+                if (math.isfinite(cur_el) and prev_el is not None and it + 1 >= max(early_stop_min_iters, 2)
+                        and abs(prev_el - cur_el) <= early_stop_tol * max(abs(prev_el), 1e-9)):
+                    stop_now = True
+                prev_el = cur_el if math.isfinite(cur_el) else None
+            last_it = stop_now or it == iters - 1
             if diag is not None and it == 0:
                 # action-sensitivity probe on the FIRST (widest, std=init_std) candidate batch:
                 #   cost_cv       = spread of terminal cost across candidates (~0 => CEM has no signal to optimize)
@@ -555,7 +571,7 @@ def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, dev
                     diag["z_term_spread"] = float(zvar.sum(-1).sqrt().nanmean())
                     z_now = z0.reshape(n, K, Hb, D)[:, 0, -1]
                     diag["reach_gap"] = float((z_now - z_goal).pow(2).sum(-1).clamp_min(0).sqrt().mean())
-            if diag is not None and it == iters - 1:
+            if diag is not None and last_it:
                 # CONVERGED-plan probe (narrow std): distinguishes 'reachable set too small' from
                 #   'planner can't aim'. min_cand_to_goal = best candidate endpoint distance to the goal
                 #   after CEM has refit -- if this stays ~reach_gap, no plan can get closer (size/WM-limited);
@@ -571,6 +587,7 @@ def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, dev
                     ztm = torch.where(finite.unsqueeze(-1), ztf, torch.full_like(ztf, float("nan"))).nanmean(1)  # (n, D)
                     z_now2 = z0.reshape(n, K, Hb, D)[:, 0, -1]
                     diag["endpoint_disp"] = float((ztm - z_now2).pow(2).sum(-1).clamp_min(0).sqrt().nanmean())
+                    diag["iters_used"] = float(it + 1)               # actual CEM iterations this replan (early-stop visibility)
             if mppi_temp > 0:
                 # MPPI / information-theoretic SOFT update: weight ALL candidates by exp(-cost/temp)
                 # instead of CEM's hard top-k elites. Lower temp -> greedier (approaches argmin = max
@@ -590,6 +607,8 @@ def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, dev
                 std = el.std(1)                                          # LeWM: NO min-std floor (unless --cem-min-std)
             if min_std > 0:
                 std = std.clamp_min(min_std)                             # floor to keep exploration / curb std-collapse
+            if stop_now:
+                break                                                    # plateaued: mu/std already refit from this iter's elites
     return mu                                                            # full H-step plan (open-loop receding horizon)
 
 
@@ -1582,6 +1601,13 @@ def main(args):
         if args.consolidate_every > 0:                    # multi-epoch consolidation regime (LeWM-like)
             do_wm = step % args.consolidate_every == 0
             n_grad = args.consolidate_epochs * max(1, buf.total // args.wm_batch_size)  # ~epochs over the frozen buffer
+            if args.consolidate_max_steps > 0:
+                # CAP the burst: n_grad above scales with the buffer (the sps 15.7->7.3 decay driver). Each
+                # iteration draws a fresh random batch, so a capped burst is an unbiased subsample of the same
+                # sweep -- coverage over successive bursts stays uniform, each burst just costs less. The
+                # predictor runs far into diminishing returns per burst (thaws converge in 2-3% of budget),
+                # so the cap trades invisible replay for wall-clock. 0 = uncapped (legacy behavior).
+                n_grad = min(n_grad, args.consolidate_max_steps)
         else:                                             # default online schedule
             do_wm = step % args.wm_update_every == 0
             n_grad = args.wm_grad_steps
@@ -1801,7 +1827,9 @@ def main(args):
                                            args.cem_samples, args.cem_iters, args.cem_elites,
                                            args.cem_init_std, args.cem_horizon, device, diag=cem_diag,
                                            gamma=args.cem_gamma, min_std=args.cem_min_std,
-                                           mppi_temp=args.cem_mppi_temp)
+                                           mppi_temp=args.cem_mppi_temp,
+                                           early_stop_tol=args.cem_early_stop,
+                                           early_stop_min_iters=args.cem_early_stop_min_iters)
                     cem_ptr[ridx] = 0
                 a = cem_buf[torch.arange(args.n_envs, device=device),
                             torch.as_tensor(cem_ptr, device=device)].clamp(-1.0, 1.0)  # safety: bound to trained range
@@ -2128,6 +2156,7 @@ def main(args):
                 d["cem/move_vs_gap"] = (cem_diag["z_term_spread"] / _rg) if _rg > 1e-9 else float("nan")
                 d["cem/min_cand_to_goal"] = cem_diag.get("min_cand_to_goal", float("nan"))  # best CONVERGED candidate->goal dist
                 d["cem/endpoint_disp"] = cem_diag.get("endpoint_disp", float("nan"))        # mean converged endpoint move from z_now
+                d["cem/iters_used"] = cem_diag.get("iters_used", float("nan"))              # CEM iterations after early-stop (30 = never stopped)
             if args.goal_explore:
                 d["goal/archive_size"] = sum(a.n for a in archives)        # total across buffer(s)
                 _ms = [a.mean_score() for a in archives if a.n]
@@ -2445,6 +2474,11 @@ def parse_args():
     p.add_argument("--consolidate-epochs", type=int, default=2,
                    help="epochs over the buffer per consolidation burst (--consolidate-every). "
                         "burst grad steps = epochs * (buffer_transitions // wm_batch_size).")
+    p.add_argument("--consolidate-max-steps", type=int, default=0,
+                   help="CAP grad steps per consolidation burst. The epochs*buffer/batch formula scales the "
+                        "burst with buffer size (the main sps decay as the buffer fills to cap); each burst "
+                        "iteration draws a fresh random batch, so a cap = an unbiased subsample per burst with "
+                        "uniform coverage over successive bursts. 0 = uncapped (legacy).")
     p.add_argument("--lambda-slow", type=float, default=0.0,
                    help="slowness/temporal-coherence weight: penalize mean sq per-step latent jump "
                         "||z_t - z_{t+1}||^2 on real consecutive frames. Forces temporal locality "
@@ -2772,6 +2806,14 @@ def parse_args():
                         "re-planning, decoupling execution from the H-step lookahead. 1 = true receding-horizon MPC "
                         "(plan H, execute 1, replan -- fresh goal feedback every step). 0 (default) = LeWM open-loop "
                         "(stride == --cem-horizon: execute all H before replanning). Clamped to [1, cem_horizon].")
+    p.add_argument("--cem-early-stop", type=float, default=0.0,
+                   help="CEM iteration early-stop: break the (sequential, wall-clock-dominant) iteration loop "
+                        "once the mean elite cost's RELATIVE change drops <= this tol (e.g. 0.005 = 0.5%%). "
+                        "Refits barely move the mean past that point, so the returned plan is the converged one. "
+                        "Elite branch only (ignored under --cem-mppi-temp). 0 = off (exact legacy behavior).")
+    p.add_argument("--cem-early-stop-min-iters", type=int, default=12,
+                   help="floor on CEM iterations before --cem-early-stop may fire (plateau tests are meaningless "
+                        "while the sampling std is still wide; min 2).")
     p.add_argument("--cem-gamma", type=float, default=0.0,
                    help="running/shaped-cost discount: cost = sum_h gamma^(H-1-h) ||z_h - z*||^2 over the rollout "
                         "(terminal weight 1). 0 (default) = terminal-only, the exact LeWM objective. >0 rewards "
