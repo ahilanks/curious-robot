@@ -2474,11 +2474,13 @@ def parse_args():
     p.add_argument("--consolidate-epochs", type=int, default=2,
                    help="epochs over the buffer per consolidation burst (--consolidate-every). "
                         "burst grad steps = epochs * (buffer_transitions // wm_batch_size).")
-    p.add_argument("--consolidate-max-steps", type=int, default=0,
+    p.add_argument("--consolidate-max-steps", type=int, default=60,
                    help="CAP grad steps per consolidation burst. The epochs*buffer/batch formula scales the "
                         "burst with buffer size (the main sps decay as the buffer fills to cap); each burst "
                         "iteration draws a fresh random batch, so a cap = an unbiased subsample per burst with "
-                        "uniform coverage over successive bursts. 0 = uncapped (legacy).")
+                        "uniform coverage over successive bursts. DEFAULT 60 (validated 2026-07-08: sps 7.3->16.2 "
+                        "at the 50k cap, arrival unchanged, pred_loss equilibrium ~0.003; raise to 120 if long-run "
+                        "pred_loss drifts). 0 = uncapped (legacy).")
     p.add_argument("--lambda-slow", type=float, default=0.0,
                    help="slowness/temporal-coherence weight: penalize mean sq per-step latent jump "
                         "||z_t - z_{t+1}||^2 on real consecutive frames. Forces temporal locality "
@@ -2806,11 +2808,12 @@ def parse_args():
                         "re-planning, decoupling execution from the H-step lookahead. 1 = true receding-horizon MPC "
                         "(plan H, execute 1, replan -- fresh goal feedback every step). 0 (default) = LeWM open-loop "
                         "(stride == --cem-horizon: execute all H before replanning). Clamped to [1, cem_horizon].")
-    p.add_argument("--cem-early-stop", type=float, default=0.0,
+    p.add_argument("--cem-early-stop", type=float, default=0.005,
                    help="CEM iteration early-stop: break the (sequential, wall-clock-dominant) iteration loop "
-                        "once the mean elite cost's RELATIVE change drops <= this tol (e.g. 0.005 = 0.5%%). "
+                        "once the mean elite cost's RELATIVE change drops <= this tol (0.005 = 0.5%%). "
                         "Refits barely move the mean past that point, so the returned plan is the converged one. "
-                        "Elite branch only (ignored under --cem-mppi-temp). 0 = off (exact legacy behavior).")
+                        "Elite branch only (ignored under --cem-mppi-temp). DEFAULT 0.005 (validated 2026-07-08: "
+                        "mean 21.5/30 iters, arrival + finite_frac unchanged); 0 = legacy always-full-iters.")
     p.add_argument("--cem-early-stop-min-iters", type=int, default=12,
                    help="floor on CEM iterations before --cem-early-stop may fire (plateau tests are meaningless "
                         "while the sampling std is still wide; min 2).")
