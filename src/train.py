@@ -202,6 +202,13 @@ class ReplayBuffer:
         self.prio = np.zeros(s, np.float64)
         self.head = np.zeros(n_envs, np.int64)
         self.count = np.zeros(n_envs, np.int64)
+        # frozen-encoder LATENT CACHE for consolidation (sps: the burst's cost is dominated by
+        # re-encoding replay frames through the frozen encoder, whose latents are CONSTANT
+        # between thaws -- hot5b measured learn=27.9% of wall). Rows fill live at add() time
+        # (the loop already encoded o_t) and lazily at sample time; everything invalidates on
+        # cotrain (encoder weights moved). ~n_envs*C*192*4B ~= 38MB at the 50k cap.
+        self.z_cache = None                       # (n_envs, C, D) float32, allocated on first put
+        self.z_valid = np.zeros(s, bool)
         # --goal-explore: per-transition PURSUED goal obs o* + an episode id for HER future-relabel
         self.goal_explore = goal_explore
         if goal_explore:
@@ -235,6 +242,17 @@ class ReplayBuffer:
                     self.goal_valid[e, i] = goal_valid[e]
             self.head[e] = (i + 1) % self.C
             self.count[e] = min(self.count[e] + 1, self.C)
+
+    def z_put(self, env_ids, slots, z):
+        """Store frozen-encoder latents for (env, slot) rows. z: (n, D) float32 ndarray."""
+        if self.z_cache is None:
+            self.z_cache = np.zeros((self.n_envs, self.C, z.shape[-1]), np.float32)
+        self.z_cache[env_ids, slots] = z
+        self.z_valid[env_ids, slots] = True
+
+    def z_invalidate(self):
+        """Encoder weights moved (cotrain thaw) -> every cached latent is stale."""
+        self.z_valid[:] = False
 
     @property
     def total(self):
@@ -435,7 +453,8 @@ class ReplayBuffer:
         idx = s[:, None] + np.arange(T)[None, :]
         ee = e[:, None].repeat(T, 1)
         return (self.pixels[ee, idx], self.proprio[ee, idx],
-                torch.as_tensor(self.action[ee, idx], device=self.device))
+                torch.as_tensor(self.action[ee, idx], device=self.device),
+                (ee, idx))                        # (B,T) ring coords for the frozen-encoder z-cache
 
 
 REWARD_COMPONENTS = ("cur", "safe", "rate", "energy")   # --multihead-q head order
@@ -666,14 +685,31 @@ def rnd_novelty_reward(rnd_pred, rnd_target, img84, prop):
     return (rnd_pred(img84, prop) - rnd_target(img84, prop)).pow(2).mean(-1)
 
 
-def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device, pertimestep=False, lambda_slow=0.0):
+def wm_update(wm, sigreg, opt, batch, H_bwd, h, gamma_wm, beta, device, pertimestep=False, lambda_slow=0.0,
+              z_lookup=None):
     """One AdamW step on L_wm = discounted plain-MSE autoregressive rollout + beta*SIGReg
-    (LeWM-style: mean squared error per step over batch+feature dims, no symlog)."""
-    px, prop, ac = batch
+    (LeWM-style: mean squared error per step over batch+feature dims, no symlog).
+    z_lookup=(buf) with a 4-element batch: FROZEN-encoder fast path -- emb comes from the
+    buffer's latent cache (missing rows encoded once and back-filled) instead of re-encoding
+    B*T frames every grad step. Caller must pass it ONLY while the encoder is frozen+eval."""
+    px, prop, ac = batch[:3]
     B, T = px.shape[:2]
-    px_n = to_norm_pixel(px, device).reshape(B * T, 3, px.shape[2], px.shape[3])
-    prop_t = torch.as_tensor(prop, device=device).float().reshape(B * T, -1)
-    emb = wm.encode(px_n, prop_t).reshape(B, T, -1)       # (B,T,D) WITH grad
+    if z_lookup is not None and len(batch) > 3:
+        buf = z_lookup
+        ee, idx = batch[3]
+        valid = buf.z_valid[ee, idx]                      # (B, T)
+        if not valid.all():
+            miss = ~valid                                 # encode the cache misses once (eval, no grad)
+            with torch.no_grad():
+                pm = to_norm_pixel(px[miss], device)      # (M, 3, H, W)
+                qm = torch.as_tensor(prop[miss], device=device).float()
+                zm = wm.encode(pm, qm)
+            buf.z_put(ee[miss], idx[miss], zm.float().cpu().numpy())
+        emb = torch.as_tensor(buf.z_cache[ee, idx], device=device)   # (B,T,D), constant while frozen
+    else:
+        px_n = to_norm_pixel(px, device).reshape(B * T, 3, px.shape[2], px.shape[3])
+        prop_t = torch.as_tensor(prop, device=device).float().reshape(B * T, -1)
+        emb = wm.encode(px_n, prop_t).reshape(B, T, -1)   # (B,T,D) WITH grad
     a_emb = wm.action_encoder(ac)
     ctx_z, ctx_a = emb[:, :H_bwd], a_emb[:, :H_bwd]
     cur = wm.predict(ctx_z, ctx_a)                         # cur[:, -1] = zhat_{t+1}
@@ -984,31 +1020,52 @@ def load_state_snapshot(buf, path):
     return True
 
 
-def save_and_upload(state, out_dir, step, repo_id, run_name, enable_hf, keep_local):
+_upload_pool = None                                       # lazy single-worker pool for background HF uploads
+
+
+def _get_upload_pool():
+    global _upload_pool
+    if _upload_pool is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _upload_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hf-upload")
+    return _upload_pool
+
+
+def save_and_upload(state, out_dir, step, repo_id, run_name, enable_hf, keep_local, background=False):
     """Save a checkpoint, upload to HF under <run_name>/ckpt_<step>.pt, then (unless
     keep_local) delete the local copy once the upload succeeds -- so disk stays
-    bounded over a long run. On upload failure the local file is kept as a fallback."""
+    bounded over a long run. On upload failure the local file is kept as a fallback.
+    background=True: the torch.save stays sync but the HF upload runs on a single
+    worker thread -- the train loop no longer blocks on HF (measured up to ~10 min
+    on a flaky volume/endpoint). Ordering preserved (1 worker); flush via
+    _upload_pool.shutdown(wait=True) at teardown before [done]."""
     path = out_dir / f"ckpt_{step:07d}.pt"
     torch.save(state, path)
-    uploaded = False
-    if enable_hf and repo_id and os.environ.get("HF_TOKEN"):
-        try:
-            from huggingface_hub import HfApi
-            api = HfApi(token=os.environ["HF_TOKEN"])
-            api.create_repo(repo_id, repo_type="model", exist_ok=True)
-            api.upload_file(path_or_fileobj=str(path), repo_id=repo_id,
-                            path_in_repo=f"{run_name}/ckpt_{step:07d}.pt")
-            uploaded = True
-            print(f"[hf] uploaded {run_name}/ckpt_{step:07d}.pt -> {repo_id}", flush=True)
-        except Exception as ex:
-            print(f"[hf] upload failed (non-fatal, keeping local): {ex}", flush=True)
-    if uploaded and not keep_local:
-        try:
-            path.unlink()
-        except OSError:
-            pass
-        return None
-    return path
+
+    def _upload():
+        uploaded = False
+        if enable_hf and repo_id and os.environ.get("HF_TOKEN"):
+            try:
+                from huggingface_hub import HfApi
+                api = HfApi(token=os.environ["HF_TOKEN"])
+                api.create_repo(repo_id, repo_type="model", exist_ok=True)
+                api.upload_file(path_or_fileobj=str(path), repo_id=repo_id,
+                                path_in_repo=f"{run_name}/ckpt_{step:07d}.pt")
+                uploaded = True
+                print(f"[hf] uploaded {run_name}/ckpt_{step:07d}.pt -> {repo_id}", flush=True)
+            except Exception as ex:
+                print(f"[hf] upload failed (non-fatal, keeping local): {ex}", flush=True)
+        if uploaded and not keep_local:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    if background:
+        _get_upload_pool().submit(_upload)
+        return path
+    _upload()
+    return path if path.exists() else None
 
 
 def resolve_ckpt(ckpt=None, name="baseline", step=None, hf_repo=None):
@@ -1638,7 +1695,8 @@ def main(args):
                 last_wm = wm_update(wm, sigreg, wm_opt, batch, H, h_fwd,
                                     args.gamma_wm, _beta, device,
                                     pertimestep=args.sigreg_pertimestep,
-                                    lambda_slow=args.lambda_slow)
+                                    lambda_slow=args.lambda_slow,
+                                    z_lookup=(buf if (args.freeze_encoder and not _thawed) else None))
                 wm.eval()
                 pred_hist.append(last_wm[0]); updates_at_stage += 1; did_wm = True
             # curriculum: bump H_fwd when pred loss flatlines over the last window
@@ -1720,6 +1778,7 @@ def main(args):
         for p in wm.encoder.parameters():                # RE-FREEZE: predictor bootstrap needs a stationary latent
             p.requires_grad_(False)
         wm.eval()                                        # restore eval (dropout off) for acting-time encoding
+        buf.z_invalidate()                               # encoder moved -> every cached latent is stale
         print(f"[cotrain] step={step} thawed encoder, {done}/{n_grad} grad steps over {buf.total} directed "
               f"transitions (beta={cb}, enc_lr={args.cotrain_lr if args.cotrain_lr > 0 else args.wm_lr}"
               f"{', CONVERGED' if converged else (', capped' if args.cotrain_flatline else '')})", flush=True)
@@ -2096,10 +2155,14 @@ def main(args):
             g_valid = has_goal.copy()        # reach reward only counts where a real goal was pursued
         else:
             g_px = g_prop = g_valid = None
+        _slots = buf.head.copy()             # ring slots buf.add is about to write (z-cache live-fill)
         buf.add(pixels=cur_px, proprio=cur_prop, action=a_np,
                 r=reward, d=done, is_start=is_start.copy(), prio=r_cur,
                 rc=comps if args.multihead_q else None,
                 goal_px=g_px, goal_prop=g_prop, goal_valid=g_valid)
+        if args.freeze_encoder:              # z (o_t's latent, encoded this iter anyway) is exactly
+            buf.z_put(np.arange(args.n_envs), _slots,      # what consolidation would recompute
+                      z.detach().float().cpu().numpy())
         for key, val in (("r_cur", r_cur), ("r_safe", r_safe), ("cur_contrib", cur_term),
                          ("contacts", contacts), ("table_contacts", table_contacts),
                          ("motion", motion), ("ret", reward),
@@ -2311,7 +2374,8 @@ def main(args):
                 state["goal_archive"] = [a.state_dict() for a in archives]
             save_and_upload(state, out_dir, step,
                             args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
-                            run_name, not args.no_hf, args.keep_local_ckpts)
+                            run_name, not args.no_hf, args.keep_local_ckpts,
+                            background=True)              # loop never blocks on HF (stall class)
 
         # --- full-state snapshot (default-on): rolling buffer+pointer file for chaining ---
         if (args.save_state and args.save_state_every > 0 and step > 0
@@ -2369,6 +2433,9 @@ def main(args):
                          " -- GIVING UP, the last periodic snapshot stands"), flush=True)
                 if _attempt < 2:
                     time.sleep(60)
+    if _upload_pool is not None:                  # flush background ckpt uploads before exit
+        print("[hf] flushing pending background uploads...", flush=True)
+        _upload_pool.shutdown(wait=True)
     env.close()
     if run is not None:
         run.finish()
