@@ -1732,10 +1732,18 @@ def main(args):
                   "(Ctrl-C again to force-quit).", flush=True)
         signal.signal(signal.SIGINT, _on_sigint)
 
+    # perf/t_* wall-clock section split (fractions per log window). Async GPU work is
+    # attributed at its sync point: plan syncs at a.cpu(), learn at loss.item().
+    _tacc = {"goal": 0.0, "plan": 0.0, "learn": 0.0, "env_wait": 0.0, "rest": 0.0}
+    _tmark = None
     for step in range(args.total_steps):
         if _stop["flag"]:
             print(f"[frozen] graceful stop at step {step} ({buf.total} transitions).", flush=True)
             break
+        _tnow = time.perf_counter()
+        if _tmark is not None:
+            _tacc["rest"] += _tnow - _tmark          # tail of the previous iteration (buf.add/reward/log)
+        _tmark = _tnow
         cur_px, cur_prop = obs["image"], obs["proprio"]          # o_t (before acting)
 
         # --- goal-explore: (re)sample goals on the cadence, then RE-ENCODE z* EVERY step from the
@@ -1797,6 +1805,7 @@ def main(args):
                         goal_recent["reach"].clear(); goal_recent["arrival"].clear()             # measure the harder (larger-k) stage fresh
                         print(f"[goal-curriculum] step={step} {args.goal_curric_metric}={wr:.2f} -> radius k={curric_k[0]}", flush=True)
 
+        _tnow = time.perf_counter(); _tacc["goal"] += _tnow - _tmark; _tmark = _tnow
         # --- act: SAC stochastic sample during sim training (the entropy-driven exploration
         #     that un-parks the policy and decorrelates the parallel envs), the DETERMINISTIC
         #     mean on hardware / frozen deployment / eval (stochastic_act is False there).
@@ -1870,6 +1879,7 @@ def main(args):
         a_np = a.detach().cpu().numpy()
         a_env = a_np.reshape(args.n_envs, args.action_block, n_dof)
 
+        _tnow = time.perf_counter(); _tacc["plan"] += _tnow - _tmark; _tmark = _tnow
         # --- async actor-learner: launch the env rollout for this decision, then run
         #     the GPU updates on buffered data WHILE the workers render -> overlap CPU/GPU ---
         env.step_block_async(a_env)
@@ -1887,7 +1897,9 @@ def main(args):
                     cotrain_encoder_phase(step, h_fwd)
                     frac_trig["last"], frac_trig["n"] = step, frac_trig["n"] + 1
                     step_jump_recent.clear()                 # measure post-sleep locality on fresh data only
+        _tnow = time.perf_counter(); _tacc["learn"] += _tnow - _tmark; _tmark = _tnow
         obs, sub_infos = env.step_block_wait()
+        _tnow = time.perf_counter(); _tacc["env_wait"] += _tnow - _tmark; _tmark = _tnow
         if args.no_torque_obs:
             scrub_torque_obs(obs, n_dof)
 
@@ -2136,6 +2148,12 @@ def main(args):
                  "smooth/qd_reversal_frac": np.mean(recent["qd_rev"]),
                  "explore/pose_step": np.mean(recent["pose_step"]),     # joint travel/decision; ~0 = parked
                  "buffer/transitions": buf.total, "perf/steps_per_sec": sps}
+            _twall = sum(_tacc.values())
+            if _twall > 0:                     # wall split of the loop since the last log window
+                for _k, _v in _tacc.items():
+                    d[f"perf/t_{_k}_frac"] = _v / _twall
+                d["perf/t_ms_per_step"] = 1000.0 * _twall / args.log_every
+                _tacc = {k: 0.0 for k in _tacc}
             # reward-component breakdowns only when that term is enabled (all off in CEM -> omitted)
             if args.lambda_rnd:
                 d["reward/r_rnd"] = np.mean(recent["r_rnd"]); d["reward/rnd_contrib"] = np.mean(recent["rnd_contrib"])
