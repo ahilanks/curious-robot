@@ -1843,9 +1843,15 @@ def main(args):
                         # just-reset envs. Goal-refresh steps replan everything cold (all z* re-rolled).
                         # Hot-retargets between refreshes get one stale-seeded replan -- candidate 0 is
                         # then wrong, but the K-1 fresh samples at full init_std dominate the refit.
+                        # CLAMP+DECAY (sps4_warm post-mortem): CEM optimizes UNCLAMPED, so the raw mean
+                        # ratchets across consecutive replans (arm flails at the clamp walls: action_rate
+                        # 0.83 vs 0.05, tau_sat 10x). Clamp bounds the seed to the executable range;
+                        # decay pulls it toward the old cold anchor so persistence must re-earn itself
+                        # through the elites each step. decay=0 == cold start.
                         warm = torch.as_tensor(~is_start[ridx], device=device)
-                        mu0 = torch.where(warm[:, None, None], cem_buf[rt],
-                                          torch.zeros_like(cem_buf[rt]))
+                        seed = cem_buf[rt].clamp(-1.0, 1.0) * args.cem_warm_decay
+                        mu0 = torch.where(warm[:, None, None], seed,
+                                          torch.zeros_like(seed))
                     cem_buf[rt] = cem_plan(wm, hist_z[:, rt], hist_a[:, rt], zstar_env[rt],
                                            args.cem_samples, args.cem_iters, args.cem_elites,
                                            args.cem_init_std, args.cem_horizon, device, diag=cem_diag,
@@ -2854,8 +2860,13 @@ def parse_args():
                    help="seed each replan's CEM mean from that env's PREVIOUS converged plan instead of zeros "
                         "(H=1 + replan-every-1 => consecutive problems near-identical, so the --cem-early-stop "
                         "plateau fires earlier). std still opens at full --cem-init-std and candidate 0 becomes "
-                        "'keep the last plan'. Cold seed on just-reset envs and on goal-refresh steps. "
+                        "'keep the last plan'. Cold seed on just-reset envs and on goal-refresh steps. The seed "
+                        "is clamp(prev, +-1) * --cem-warm-decay (raw unclamped seeding ratchets: sps4_warm FAIL). "
                         "EXPERIMENTAL (sps-boost2 lever 1): default off pending its 3k chain A/B.")
+    p.add_argument("--cem-warm-decay", type=float, default=0.5,
+                   help="decay on the clamped --cem-warm-start seed: mu0 = clamp(prev_plan, +-1) * decay. "
+                        "1.0 = full carry-over (momentum bias, see sps4_warm), 0 = cold start. 0.5 makes "
+                        "directional persistence re-earn itself through the elites every replan.")
     p.add_argument("--cem-gamma", type=float, default=0.0,
                    help="running/shaped-cost discount: cost = sum_h gamma^(H-1-h) ||z_h - z*||^2 over the rollout "
                         "(terminal weight 1). 0 (default) = terminal-only, the exact LeWM objective. >0 rewards "
