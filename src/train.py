@@ -2316,7 +2316,14 @@ def main(args):
         # --- full-state snapshot (default-on): rolling buffer+pointer file for chaining ---
         if (args.save_state and args.save_state_every > 0 and step > 0
                 and step % args.save_state_every == 0):
-            save_state_snapshot(buf, out_dir, step)
+            try:
+                save_state_snapshot(buf, out_dir, step)
+            except OSError as e:
+                # transient network-volume EIO must not kill a multi-hour run (arr95_hot5 died
+                # at 50k on a MooseFS blip mid-15GB write). The previous state_latest.npz is
+                # still intact (tmp+rename); skip this snapshot and retry on the next cadence.
+                print(f"[state] periodic snapshot at step {step} FAILED ({e}) -- continuing, "
+                      f"next attempt at step {step + args.save_state_every}", flush=True)
 
         # --- train videos: save the buffered wrist + overhead clips (every video_every) ---
         if video_on and step > 0 and step % args.video_every == 0:
