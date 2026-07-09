@@ -1436,3 +1436,17 @@ Run status at entry: 91.5k/100k, (14,0.0) ~18.4k in-band, arrival base .79–.84
 1. **CEM warm-start** mu from the previous step's converged mean — H=1 + replan-every-1 makes consecutive problems near-identical yet every replan starts from zeros; this run's iters_used mean **23.0** (A/B was 21.5) says the plateau test still burns most of the 30-iter budget. Warm-start should pull the plateau earlier (~12–14 plausible), compounding with the shipped early-stop. Bounded exploitation risk (std still reopens at init_std).
 2. **Proximity-gated CEM budget** — full iters/samples only near-goal (dwell/shrink phases); mine the iters_used-vs-dist_goal correlation from `xymyja69` + the experiment runs to size it BEFORE writing code.
 3. **Sample count 300→200/150** (elite fraction preserved) — linear compute cut, highest quality risk at hard bands; goes LAST with the strictest A/B.
+
+## 2026-07-09 — sps-boost2 lever 1 A/B: raw CEM warm-start FAILED on quality (arrival 0.51 vs 0.89) — root cause: UNCLAMPED-MEAN RATCHET; retry with clamp+decay (sps5)
+
+**Profile first (perf/t_* timers shipped, `a030f32`; py-spy unattachable in this container — ptrace denied):** under the new defaults at (14,0.0)/50k buffer: **plan 87.0% of wall**, rest 7.9%, env_wait 2.6%, goal 2.4%, learn (capped consolidation) **0.12%**; GPU ~89% busy, 380 ms/step. More-envs lever DEAD (env fully hidden by async overlap; GPU saturated). Planner iters are the only surface. PufferLib assessed and rejected on the same numbers (env-side lever, ≤1.03–1.16× ceiling, wrong paradigm for WM+CEM).
+**Lever 1 as-implemented (`b6659d0`, `--cem-warm-start`, default OFF):** seed replan mu from the env's previous converged plan (cold on resets + goal-refresh steps), std reopens at init_std. A/B `sps4_warm` (3k chain from sps3_10k endpoint, W&B `6008sbxk`) vs sps3_10k@7–10k window:
+| | sps4_warm | baseline | |
+|---|---|---|---|
+| sps inst / iters | **25.3** / 20.7 | 17.6 / 24.3 | speed "win" is an artifact |
+| arrival / reach | **0.513** / 0.118 | 0.891 / 0.311 | FAIL |
+| dist_goal / pred_loss | 11.9 / **0.0158** | 5.0 / 0.0026 | FAIL |
+| pose_range / pose_step | 2.9 rad / 0.13 | ~0.5 / 0.035 | flailing |
+| action_rate / tau_sat / energy | **0.83 / 0.37 / 1.51** | 0.051 / 0.039 / 0.19 | ratchet signature |
+**Mechanism (bad from window 1, not a slow feedback loop):** LeWM CEM optimizes UNCLAMPED (caller clamps only the executed action; cem_buf stores the raw mean). Cold zeros re-anchored every replan; warm-seeding removed that anchor → mean magnitude ratchets across consecutive replans to the clamp walls → max-torque directional sweeps; wild data also drove pred_loss 6× up and polluted the buffer. **DO NOT CHAIN from `sps4_warm/state_latest.npz`** — chain point remains sps3_10k endpoint. finite_frac stayed 1.000 (not a NaN failure).
+**Next (lever 1b, `sps5_warmdecay`):** `mu0 = clamp(prev_plan, ±1) * decay` (decay 0.5, `--cem-warm-decay`) — clamp kills the ratchet, decay makes persistence re-earn itself each step through the elites. Same A/B protocol; if quality fails again, abandon mean-seeding and eval warm-CANDIDATE (inject prev plan as forced candidate row 1, sampling stays cold) before falling back to proximity-gated budgets (lever 2).
