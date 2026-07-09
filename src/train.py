@@ -2344,11 +2344,10 @@ def main(args):
     # --- final: collected data (frozen / --save-buffer) and/or model checkpoint ---
     if args.frozen_policy or args.save_buffer:
         save_buffer(buf, out_dir)
-    if args.save_state:                           # final full-state snapshot + HF upload for chaining
-        save_state_snapshot(buf, out_dir, step if _stop["flag"] else args.total_steps,
-                            repo_id=args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
-                            run_name=run_name, upload=not args.no_hf)
     if not args.frozen_policy:                    # frozen: weights are unchanged, skip the re-upload
+        # model ckpt FIRST (small + precious, incl. goal_archive): the 15GB state snapshot below
+        # can EIO on the network volume and must never cost the final weights (arr95_hot5b lost
+        # ckpt_0060000 exactly this way -- final snapshot raised before this block ran).
         state = {"step": args.total_steps, "wm": wm.state_dict(), "actor": actor.state_dict(),
                  "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
                  "h_fwd": h_fwd, "args": vars(args)}
@@ -2357,6 +2356,19 @@ def main(args):
         save_and_upload(state, out_dir, args.total_steps,
                         args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
                         run_name, not args.no_hf, args.keep_local_ckpts)
+    if args.save_state:                           # final full-state snapshot + HF upload for chaining
+        for _attempt in range(3):                 # transient volume EIO: retry, never kill teardown
+            try:
+                save_state_snapshot(buf, out_dir, step if _stop["flag"] else args.total_steps,
+                                    repo_id=args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
+                                    run_name=run_name, upload=not args.no_hf)
+                break
+            except OSError as e:
+                print(f"[state] FINAL snapshot attempt {_attempt + 1}/3 failed ({e})"
+                      + ("; retrying in 60s" if _attempt < 2 else
+                         " -- GIVING UP, the last periodic snapshot stands"), flush=True)
+                if _attempt < 2:
+                    time.sleep(60)
     env.close()
     if run is not None:
         run.finish()
