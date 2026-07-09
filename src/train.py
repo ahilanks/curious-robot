@@ -490,7 +490,7 @@ def score_obs_mse(wm, gpx, gprop, spx, sprop, sact, device, H):
 
 @torch.no_grad()
 def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, device, diag=None, gamma=0.0,
-             min_std=0.0, mppi_temp=0.0, early_stop_tol=0.0, early_stop_min_iters=12):
+             min_std=0.0, mppi_temp=0.0, early_stop_tol=0.0, early_stop_min_iters=12, mu0=None):
     """CEM planner in LATENT space -- a faithful port of LeWM's stable_worldmodel.solver.CEMSolver
     (+ JEPA.rollout/criterion). Per replan: sample H-step action SEQUENCES from a per-step Gaussian,
     FORCE candidate 0 = the current mean (LeWM's candidates[:,0]=mean), roll each AUTOREGRESSIVELY
@@ -508,7 +508,11 @@ def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, dev
     z0 = hist_z.transpose(0, 1).unsqueeze(1).expand(n, K, Hb, D).reshape(n * K, Hb, D)        # latent history
     a0 = hist_a.transpose(0, 1).unsqueeze(1).expand(n, K, Hb, a_dim).reshape(n * K, Hb, a_dim)  # action history
     zg = z_goal.unsqueeze(1).expand(n, K, D).reshape(n * K, D)
-    mu = torch.zeros(n, T, a_dim, device=device)
+    # mu0 (--cem-warm-start): seed the mean from the caller's previous converged plan instead of
+    # zeros -- with H=1/replan-every-1 consecutive problems are near-identical, so the plateau
+    # early-stop fires earlier. std STILL opens at full init_std (exploration per replan unchanged;
+    # only the starting mean moves), and candidate 0 = mu0 gives the refit a "keep last plan" elite.
+    mu = mu0.detach().clone().float() if mu0 is not None else torch.zeros(n, T, a_dim, device=device)
     std = torch.full((n, T, a_dim), init_std, device=device)         # LeWM: var = var_scale, used as the std
     # bf16 autocast on the rollout: the WM forwards run on tensor cores (~2-3x), and bf16 keeps
     # fp32 exponent range so an inference rollout is numerically safe. mu/std/topk stay fp32
@@ -1827,18 +1831,29 @@ def main(args):
                 # refreshed this step (LeWM clears the plan deque on terminated / _needs_flush).
                 need = cem_ptr >= cem_stride                     # replan stride (== cem_H unless --cem-replan-every)
                 need |= is_start                                 # a just-reset env: stale plan + fresh goal
-                if step % args.goal_update_every == 0:           # goals just refreshed for ALL envs
+                goal_refresh = step % args.goal_update_every == 0
+                if goal_refresh:                                 # goals just refreshed for ALL envs
                     need[:] = True
                 if need.any():
                     ridx = np.where(need)[0]
                     rt = torch.as_tensor(ridx, device=device)
+                    mu0 = None
+                    if args.cem_warm_start and not goal_refresh:
+                        # previous converged plan as the seed; cold (zeros) where the plan is stale:
+                        # just-reset envs. Goal-refresh steps replan everything cold (all z* re-rolled).
+                        # Hot-retargets between refreshes get one stale-seeded replan -- candidate 0 is
+                        # then wrong, but the K-1 fresh samples at full init_std dominate the refit.
+                        warm = torch.as_tensor(~is_start[ridx], device=device)
+                        mu0 = torch.where(warm[:, None, None], cem_buf[rt],
+                                          torch.zeros_like(cem_buf[rt]))
                     cem_buf[rt] = cem_plan(wm, hist_z[:, rt], hist_a[:, rt], zstar_env[rt],
                                            args.cem_samples, args.cem_iters, args.cem_elites,
                                            args.cem_init_std, args.cem_horizon, device, diag=cem_diag,
                                            gamma=args.cem_gamma, min_std=args.cem_min_std,
                                            mppi_temp=args.cem_mppi_temp,
                                            early_stop_tol=args.cem_early_stop,
-                                           early_stop_min_iters=args.cem_early_stop_min_iters)
+                                           early_stop_min_iters=args.cem_early_stop_min_iters,
+                                           mu0=mu0)
                     cem_ptr[ridx] = 0
                 a = cem_buf[torch.arange(args.n_envs, device=device),
                             torch.as_tensor(cem_ptr, device=device)].clamp(-1.0, 1.0)  # safety: bound to trained range
@@ -2835,6 +2850,12 @@ def parse_args():
     p.add_argument("--cem-early-stop-min-iters", type=int, default=12,
                    help="floor on CEM iterations before --cem-early-stop may fire (plateau tests are meaningless "
                         "while the sampling std is still wide; min 2).")
+    p.add_argument("--cem-warm-start", action=argparse.BooleanOptionalAction, default=False,
+                   help="seed each replan's CEM mean from that env's PREVIOUS converged plan instead of zeros "
+                        "(H=1 + replan-every-1 => consecutive problems near-identical, so the --cem-early-stop "
+                        "plateau fires earlier). std still opens at full --cem-init-std and candidate 0 becomes "
+                        "'keep the last plan'. Cold seed on just-reset envs and on goal-refresh steps. "
+                        "EXPERIMENTAL (sps-boost2 lever 1): default off pending its 3k chain A/B.")
     p.add_argument("--cem-gamma", type=float, default=0.0,
                    help="running/shaped-cost discount: cost = sum_h gamma^(H-1-h) ||z_h - z*||^2 over the rollout "
                         "(terminal weight 1). 0 (default) = terminal-only, the exact LeWM objective. >0 rewards "
