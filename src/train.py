@@ -490,7 +490,7 @@ def score_obs_mse(wm, gpx, gprop, spx, sprop, sact, device, H):
 
 @torch.no_grad()
 def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, device, diag=None, gamma=0.0,
-             min_std=0.0, mppi_temp=0.0, early_stop_tol=0.0, early_stop_min_iters=12):
+             min_std=0.0, mppi_temp=0.0, early_stop_tol=0.0, early_stop_min_iters=12, mu0=None):
     """CEM planner in LATENT space -- a faithful port of LeWM's stable_worldmodel.solver.CEMSolver
     (+ JEPA.rollout/criterion). Per replan: sample H-step action SEQUENCES from a per-step Gaussian,
     FORCE candidate 0 = the current mean (LeWM's candidates[:,0]=mean), roll each AUTOREGRESSIVELY
@@ -508,7 +508,11 @@ def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, dev
     z0 = hist_z.transpose(0, 1).unsqueeze(1).expand(n, K, Hb, D).reshape(n * K, Hb, D)        # latent history
     a0 = hist_a.transpose(0, 1).unsqueeze(1).expand(n, K, Hb, a_dim).reshape(n * K, Hb, a_dim)  # action history
     zg = z_goal.unsqueeze(1).expand(n, K, D).reshape(n * K, D)
-    mu = torch.zeros(n, T, a_dim, device=device)
+    # mu0 (--cem-warm-start): seed the mean from the caller's previous converged plan instead of
+    # zeros -- with H=1/replan-every-1 consecutive problems are near-identical, so the plateau
+    # early-stop fires earlier. std STILL opens at full init_std (exploration per replan unchanged;
+    # only the starting mean moves), and candidate 0 = mu0 gives the refit a "keep last plan" elite.
+    mu = mu0.detach().clone().float() if mu0 is not None else torch.zeros(n, T, a_dim, device=device)
     std = torch.full((n, T, a_dim), init_std, device=device)         # LeWM: var = var_scale, used as the std
     # bf16 autocast on the rollout: the WM forwards run on tensor cores (~2-3x), and bf16 keeps
     # fp32 exponent range so an inference rollout is numerically safe. mu/std/topk stay fp32
@@ -1732,10 +1736,18 @@ def main(args):
                   "(Ctrl-C again to force-quit).", flush=True)
         signal.signal(signal.SIGINT, _on_sigint)
 
+    # perf/t_* wall-clock section split (fractions per log window). Async GPU work is
+    # attributed at its sync point: plan syncs at a.cpu(), learn at loss.item().
+    _tacc = {"goal": 0.0, "plan": 0.0, "learn": 0.0, "env_wait": 0.0, "rest": 0.0}
+    _tmark = None
     for step in range(args.total_steps):
         if _stop["flag"]:
             print(f"[frozen] graceful stop at step {step} ({buf.total} transitions).", flush=True)
             break
+        _tnow = time.perf_counter()
+        if _tmark is not None:
+            _tacc["rest"] += _tnow - _tmark          # tail of the previous iteration (buf.add/reward/log)
+        _tmark = _tnow
         cur_px, cur_prop = obs["image"], obs["proprio"]          # o_t (before acting)
 
         # --- goal-explore: (re)sample goals on the cadence, then RE-ENCODE z* EVERY step from the
@@ -1797,6 +1809,7 @@ def main(args):
                         goal_recent["reach"].clear(); goal_recent["arrival"].clear()             # measure the harder (larger-k) stage fresh
                         print(f"[goal-curriculum] step={step} {args.goal_curric_metric}={wr:.2f} -> radius k={curric_k[0]}", flush=True)
 
+        _tnow = time.perf_counter(); _tacc["goal"] += _tnow - _tmark; _tmark = _tnow
         # --- act: SAC stochastic sample during sim training (the entropy-driven exploration
         #     that un-parks the policy and decorrelates the parallel envs), the DETERMINISTIC
         #     mean on hardware / frozen deployment / eval (stochastic_act is False there).
@@ -1818,18 +1831,35 @@ def main(args):
                 # refreshed this step (LeWM clears the plan deque on terminated / _needs_flush).
                 need = cem_ptr >= cem_stride                     # replan stride (== cem_H unless --cem-replan-every)
                 need |= is_start                                 # a just-reset env: stale plan + fresh goal
-                if step % args.goal_update_every == 0:           # goals just refreshed for ALL envs
+                goal_refresh = step % args.goal_update_every == 0
+                if goal_refresh:                                 # goals just refreshed for ALL envs
                     need[:] = True
                 if need.any():
                     ridx = np.where(need)[0]
                     rt = torch.as_tensor(ridx, device=device)
+                    mu0 = None
+                    if args.cem_warm_start and not goal_refresh:
+                        # previous converged plan as the seed; cold (zeros) where the plan is stale:
+                        # just-reset envs. Goal-refresh steps replan everything cold (all z* re-rolled).
+                        # Hot-retargets between refreshes get one stale-seeded replan -- candidate 0 is
+                        # then wrong, but the K-1 fresh samples at full init_std dominate the refit.
+                        # CLAMP+DECAY (sps4_warm post-mortem): CEM optimizes UNCLAMPED, so the raw mean
+                        # ratchets across consecutive replans (arm flails at the clamp walls: action_rate
+                        # 0.83 vs 0.05, tau_sat 10x). Clamp bounds the seed to the executable range;
+                        # decay pulls it toward the old cold anchor so persistence must re-earn itself
+                        # through the elites each step. decay=0 == cold start.
+                        warm = torch.as_tensor(~is_start[ridx], device=device)
+                        seed = cem_buf[rt].clamp(-1.0, 1.0) * args.cem_warm_decay
+                        mu0 = torch.where(warm[:, None, None], seed,
+                                          torch.zeros_like(seed))
                     cem_buf[rt] = cem_plan(wm, hist_z[:, rt], hist_a[:, rt], zstar_env[rt],
                                            args.cem_samples, args.cem_iters, args.cem_elites,
                                            args.cem_init_std, args.cem_horizon, device, diag=cem_diag,
                                            gamma=args.cem_gamma, min_std=args.cem_min_std,
                                            mppi_temp=args.cem_mppi_temp,
                                            early_stop_tol=args.cem_early_stop,
-                                           early_stop_min_iters=args.cem_early_stop_min_iters)
+                                           early_stop_min_iters=args.cem_early_stop_min_iters,
+                                           mu0=mu0)
                     cem_ptr[ridx] = 0
                 a = cem_buf[torch.arange(args.n_envs, device=device),
                             torch.as_tensor(cem_ptr, device=device)].clamp(-1.0, 1.0)  # safety: bound to trained range
@@ -1870,6 +1900,7 @@ def main(args):
         a_np = a.detach().cpu().numpy()
         a_env = a_np.reshape(args.n_envs, args.action_block, n_dof)
 
+        _tnow = time.perf_counter(); _tacc["plan"] += _tnow - _tmark; _tmark = _tnow
         # --- async actor-learner: launch the env rollout for this decision, then run
         #     the GPU updates on buffered data WHILE the workers render -> overlap CPU/GPU ---
         env.step_block_async(a_env)
@@ -1887,7 +1918,9 @@ def main(args):
                     cotrain_encoder_phase(step, h_fwd)
                     frac_trig["last"], frac_trig["n"] = step, frac_trig["n"] + 1
                     step_jump_recent.clear()                 # measure post-sleep locality on fresh data only
+        _tnow = time.perf_counter(); _tacc["learn"] += _tnow - _tmark; _tmark = _tnow
         obs, sub_infos = env.step_block_wait()
+        _tnow = time.perf_counter(); _tacc["env_wait"] += _tnow - _tmark; _tmark = _tnow
         if args.no_torque_obs:
             scrub_torque_obs(obs, n_dof)
 
@@ -2136,6 +2169,12 @@ def main(args):
                  "smooth/qd_reversal_frac": np.mean(recent["qd_rev"]),
                  "explore/pose_step": np.mean(recent["pose_step"]),     # joint travel/decision; ~0 = parked
                  "buffer/transitions": buf.total, "perf/steps_per_sec": sps}
+            _twall = sum(_tacc.values())
+            if _twall > 0:                     # wall split of the loop since the last log window
+                for _k, _v in _tacc.items():
+                    d[f"perf/t_{_k}_frac"] = _v / _twall
+                d["perf/t_ms_per_step"] = 1000.0 * _twall / args.log_every
+                _tacc = {k: 0.0 for k in _tacc}
             # reward-component breakdowns only when that term is enabled (all off in CEM -> omitted)
             if args.lambda_rnd:
                 d["reward/r_rnd"] = np.mean(recent["r_rnd"]); d["reward/rnd_contrib"] = np.mean(recent["rnd_contrib"])
@@ -2789,9 +2828,17 @@ def parse_args():
                         "policy, no reach reward (reward stays MSE-only); SAC off. Implies --goal-explore.")
     # CEM solver defaults match LeWM's cube config (stable_worldmodel solver/cem.yaml + cube.yaml:
     # 300 samples / 30 iters / 30 elites / var_scale=1.0; horizon=receding_horizon=5 -> open-loop).
-    p.add_argument("--cem-samples", type=int, default=300, help="CEM action samples per iter (per env); LeWM=300")
-    p.add_argument("--cem-iters", type=int, default=30, help="CEM refit iterations (LeWM cem.yaml n_steps=30)")
-    p.add_argument("--cem-elites", type=int, default=30, help="CEM elite count (top-k lowest cost); LeWM topk=30")
+    p.add_argument("--cem-samples", type=int, default=200,
+                   help="CEM action samples per iter (per env). DEFAULT 200 (validated 2026-07-09 sps7+sps8: "
+                        "with elites 20 keeps the 10%% elite fraction; cost_cv/min_cand_to_goal unchanged, "
+                        "arrival clean at 10k/2-thaw scale). LeWM-faithful legacy: 300.")
+    p.add_argument("--cem-iters", type=int, default=18,
+                   help="CEM refit iterations cap. DEFAULT 18 (validated 2026-07-09 sps6+sps8: iters >18 are "
+                        "post-plateau refits — early-stop p10 was 18 with no arrival penalty; LeWM itself uses "
+                        "10 everywhere but PushT). LeWM cem.yaml legacy: 30.")
+    p.add_argument("--cem-elites", type=int, default=20,
+                   help="CEM elite count (top-k lowest cost). DEFAULT 20 (10%% of the 200 default samples, "
+                        "fraction matched to LeWM's 30/300). LeWM-faithful legacy: 30.")
     p.add_argument("--cem-init-std", type=float, default=1.0, help="CEM initial action std; LeWM var_scale=1.0")
     p.add_argument("--cem-min-std", type=float, default=0.0,
                    help="elite-refit std FLOOR: clamp the per-step action std to at least this after each refit "
@@ -2817,6 +2864,17 @@ def parse_args():
     p.add_argument("--cem-early-stop-min-iters", type=int, default=12,
                    help="floor on CEM iterations before --cem-early-stop may fire (plateau tests are meaningless "
                         "while the sampling std is still wide; min 2).")
+    p.add_argument("--cem-warm-start", action=argparse.BooleanOptionalAction, default=False,
+                   help="seed each replan's CEM mean from that env's PREVIOUS converged plan instead of zeros "
+                        "(H=1 + replan-every-1 => consecutive problems near-identical, so the --cem-early-stop "
+                        "plateau fires earlier). std still opens at full --cem-init-std and candidate 0 becomes "
+                        "'keep the last plan'. Cold seed on just-reset envs and on goal-refresh steps. The seed "
+                        "is clamp(prev, +-1) * --cem-warm-decay (raw unclamped seeding ratchets: sps4_warm FAIL). "
+                        "EXPERIMENTAL (sps-boost2 lever 1): default off pending its 3k chain A/B.")
+    p.add_argument("--cem-warm-decay", type=float, default=0.5,
+                   help="decay on the clamped --cem-warm-start seed: mu0 = clamp(prev_plan, +-1) * decay. "
+                        "1.0 = full carry-over (momentum bias, see sps4_warm), 0 = cold start. 0.5 makes "
+                        "directional persistence re-earn itself through the elites every replan.")
     p.add_argument("--cem-gamma", type=float, default=0.0,
                    help="running/shaped-cost discount: cost = sum_h gamma^(H-1-h) ||z_h - z*||^2 over the rollout "
                         "(terminal weight 1). 0 (default) = terminal-only, the exact LeWM objective. >0 rewards "
