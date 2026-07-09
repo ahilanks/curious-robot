@@ -1408,3 +1408,31 @@ Run status at entry: 91.5k/100k, (14,0.0) ~18.4k in-band, arrival base .79–.84
 **NaN verification (user-ordered):** the historical failure is compile+bf16 CEM — untouched (CEM stays eager+bf16 via `predict_eager`; compiling CEM was previously measured ~1.0× anyway, it's compute-bound). `cem/finite_frac` = 1.000 min across BOTH experiment runs end-to-end; only nan strings in logs are the standard `crit_loss=nan` placeholder + step-0 cold-start. Also fixed: `math` import (early-stop uses `math.isfinite`).
 **DEFAULTS FLIPPED (this commit):** `--consolidate-max-steps 0→60`, `--cem-early-stop 0.0→0.005`. Legacy behavior reachable via `--consolidate-max-steps 0 --cem-early-stop 0`. Canonical launch blocks NO LONGER need these flags — future hot5+ chains inherit 2.4× automatically. Merged `sps-boost` → main.
 **Acceptance caveat for the next long run:** 3k test windows contain NO thaw (cotrain fires at 3500) — cotrain's own 11700-budget flatline loop is untouched by either lever, but the first long continuation should watch pred_loss over its first 10k as the at-scale check (fallback: cap 120). ETA impact on the d=22 projection: 2.4× throughput ⇒ the 30–66-day continuous estimate compresses to **~13–28 days** at unchanged band economics.
+
+## 2026-07-09 — ★ sps3_10k AT-SCALE DEFAULTS CHECK PASSED (10k steps, 2 thaws crossed): pred_loss flat-to-FALLING across both cotrains, arrival 0.890 last-2k, 17.6 sps sustained, zero NaN — the 2026-07-08 acceptance caveat is CLOSED, cap-120 fallback NOT needed ★
+
+**Setup:** pure-defaults chain run — NO sps flags passed, byte-identical to how a future hot5 launches: `arr95_hot4/ckpt_0092000.pt` (HF) + hot4 `state_latest.npz` (`[state] restored 50000 transitions`), regime (14,0.0)/d-start 14, 10k steps crossing cotrains at 3500 AND 7000 — the thaw×cap interaction the 3k A/B windows could not see. W&B `xymyja69`. Wall 22:37→00:04 UTC ≈87 min (incl. two ~2-min cotrain pauses + HF uploads); 80k env-steps.
+
+| Acceptance | target | result | verdict |
+|---|---|---|---|
+| pred_loss | flat ~.003, no drift across thaws | 1st-half mean .0031 → 2nd-half **.0026** (drift DOWNWARD) | PASS |
+| arrival | ≥ baseline .86 | run mean .859, last-2k **.890**, final-window .86–.91 | PASS |
+| sps | holding ~17 | **17.6** instantaneous (excl. thaw pauses; = the A/B number exactly); 16.1 cumulative incl. pauses | PASS |
+| cem/finite_frac | 1.0 | min **1.0000** over all 199 rows | PASS |
+
+**Thaw crossings (the actual test):**
+- **3500:** 312/11700 grad steps, CONVERGED. pred_loss pre .0018–.0040 → post .0019–.0038 (settles ~.0025 by 3800); arrival dips .83–.85 for ~250 steps, recovers .87–.88; frac_rand continuous through the crossing.
+- **7000:** 364/11700, CONVERGED. pred_loss mean .0028 → .0028 with a TIGHTER post band (.0022–.0034 vs .0020–.0042); arrival .833 pre → **.893** post — no dip at all.
+- pred_loss spikes (.0156@2200, .0086@4350, .0067@9550) are contact-novelty transients (contacts/s→0.2 entering the window), recover ≤200 steps, uncorrelated with thaws. Grad-step counts (312/364) match hot4's per-thaw range (260–344) — cotrain economics unchanged by the consolidation cap.
+
+**Encoder:** rank_frac_probe .2496 → .2532 (thaw 1) → .2459 (thaw 2) — ~47–49/192 eff dims (RankMe, fixed probe), per-thaw wiggle in BOTH directions; rank only moves AT thaws (encoder frozen otherwise), and cross-run absolute values are approximate (probe set re-frozen per run from that run's warmup obs). frac_rand smooth .16–.24 all run. Clarified (user Q): the LIVE sigreg β is `--cotrain-beta` **0.02** (thaws only) — the 0.09 `--sigreg-weight` default is gradient-INERT during consolidation because SIGReg acts on encoder outputs and the encoder is frozen there (`train.py` wm_update: `sig = sigreg(emb…)`, `emb = wm.encode(...)`).
+
+**Curriculum:** d=14 k=1 the entire 10k (arrival .84–.91 never clears the .95 advance bar) — the same d=14 grind hot4 ended in; defaults change nothing about ladder behavior, but note the at-scale check therefore ran at ONE band.
+
+**Chain point (freshest):** `runs/sps3_10k/state_latest.npz` (15.1 GB local; also HF `sps3_10k/state_latest.npz`) + HF `sps3_10k/ckpt_0010000.pt`.
+
+**Next — branch `sps-boost2` (ranked; protocol unchanged: one lever per 3k chain run vs the 17.6-sps/0.86-arrival baseline, defaults flip only on pass):**
+0. **Re-profile FIRST** — 60-sec py-spy on a scratch run under the new defaults for the true post-cap split (CEM vs env-step vs misc). GPU util was 66–81% pre-speedup; if env rendering is now the wall, the lever is MORE ENVS (8→12/16, also amortizes the CEM batch), not planner surgery.
+1. **CEM warm-start** mu from the previous step's converged mean — H=1 + replan-every-1 makes consecutive problems near-identical yet every replan starts from zeros; this run's iters_used mean **23.0** (A/B was 21.5) says the plateau test still burns most of the 30-iter budget. Warm-start should pull the plateau earlier (~12–14 plausible), compounding with the shipped early-stop. Bounded exploitation risk (std still reopens at init_std).
+2. **Proximity-gated CEM budget** — full iters/samples only near-goal (dwell/shrink phases); mine the iters_used-vs-dist_goal correlation from `xymyja69` + the experiment runs to size it BEFORE writing code.
+3. **Sample count 300→200/150** (elite fraction preserved) — linear compute cut, highest quality risk at hard bands; goes LAST with the strictest A/B.
