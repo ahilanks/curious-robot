@@ -982,15 +982,19 @@ def load_state_snapshot(buf, path):
     dims must match (else skipped). The oldest retained slot is marked is_start so no WM
     window reaches before the snapshot horizon. Returns True iff loaded."""
     z = np.load(path)
-    if (int(z["head"].shape[0]) != buf.n_envs
+    snap_envs = int(z["head"].shape[0])
+    if (snap_envs > buf.n_envs
             or z["pixels"].shape[2] != buf.pixels.shape[2]
             or z["proprio"].shape[-1] != buf.proprio.shape[-1]
             or z["action"].shape[-1] != buf.action.shape[-1]):
         print(f"[state] snapshot {path} shape-mismatched (envs/obs dims) -> starting empty", flush=True)
         return False
+    if snap_envs < buf.n_envs:                    # scaling envs UP mid-campaign (e.g. 8 -> 12):
+        print(f"[state] snapshot has {snap_envs} env streams < buffer {buf.n_envs} -> "
+              f"filling the first {snap_envs} rings; the rest start empty and fill live", flush=True)
     C_old = z["pixels"].shape[1]
     has_goal = ("goal_px" in z.files) and buf.goal_explore
-    for e in range(buf.n_envs):
+    for e in range(snap_envs):
         n = min(int(z["count"][e]), buf.C)
         if n == 0:
             continue
@@ -1014,7 +1018,7 @@ def load_state_snapshot(buf, path):
         buf.head[e] = n % buf.C
         buf.count[e] = n
     if has_goal:
-        buf.cur_ep[:] = z["cur_ep"]
+        buf.cur_ep[:snap_envs] = z["cur_ep"]
     print(f"[state] restored {buf.total} transitions from {path} "
           f"(saved @ step {int(z['step'])})", flush=True)
     return True
