@@ -2828,9 +2828,17 @@ def parse_args():
                         "policy, no reach reward (reward stays MSE-only); SAC off. Implies --goal-explore.")
     # CEM solver defaults match LeWM's cube config (stable_worldmodel solver/cem.yaml + cube.yaml:
     # 300 samples / 30 iters / 30 elites / var_scale=1.0; horizon=receding_horizon=5 -> open-loop).
-    p.add_argument("--cem-samples", type=int, default=300, help="CEM action samples per iter (per env); LeWM=300")
-    p.add_argument("--cem-iters", type=int, default=30, help="CEM refit iterations (LeWM cem.yaml n_steps=30)")
-    p.add_argument("--cem-elites", type=int, default=30, help="CEM elite count (top-k lowest cost); LeWM topk=30")
+    p.add_argument("--cem-samples", type=int, default=200,
+                   help="CEM action samples per iter (per env). DEFAULT 200 (validated 2026-07-09 sps7+sps8: "
+                        "with elites 20 keeps the 10%% elite fraction; cost_cv/min_cand_to_goal unchanged, "
+                        "arrival clean at 10k/2-thaw scale). LeWM-faithful legacy: 300.")
+    p.add_argument("--cem-iters", type=int, default=18,
+                   help="CEM refit iterations cap. DEFAULT 18 (validated 2026-07-09 sps6+sps8: iters >18 are "
+                        "post-plateau refits — early-stop p10 was 18 with no arrival penalty; LeWM itself uses "
+                        "10 everywhere but PushT). LeWM cem.yaml legacy: 30.")
+    p.add_argument("--cem-elites", type=int, default=20,
+                   help="CEM elite count (top-k lowest cost). DEFAULT 20 (10%% of the 200 default samples, "
+                        "fraction matched to LeWM's 30/300). LeWM-faithful legacy: 30.")
     p.add_argument("--cem-init-std", type=float, default=1.0, help="CEM initial action std; LeWM var_scale=1.0")
     p.add_argument("--cem-min-std", type=float, default=0.0,
                    help="elite-refit std FLOOR: clamp the per-step action std to at least this after each refit "
