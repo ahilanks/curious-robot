@@ -88,10 +88,13 @@ class MujocoSO101Env:
                                                  # "adult" that moves blocks in the child's view. Child action/obs/
                                                  # safety/contact semantics are UNCHANGED (child ids resolved
                                                  # explicitly; parent geoms excluded from the child's contact sets).
-        parent_pos: tuple[float, float, float] = (0.62, 0.0, 0.0),
+        parent_pos: tuple[float, float, float] = (0.55, 0.0, 0.02),   # 2cm float: at z=0 the base mesh
+                                                 # interpenetrates the tabletop and the WHOLE arm jams
+                                                 # (saturated torque, zero motion — 2026-07-10 post-mortem)
         parent_yaw: float = 3.141592653589793,   # face the child across the block spawn zone
     ):
         self.parent_arm = bool(parent_arm)
+        self.parent_base_xy = np.asarray(parent_pos[:2], np.float64)
         if parent_arm:
             self.model = self._build_two_arm_model(scene_path, parent_pos, parent_yaw)
         else:
@@ -260,6 +263,7 @@ class MujocoSO101Env:
             "inview": sorted(inview, key=lambda t: t[1]),
             "block_xy": np.stack([self.data.xpos[b][:2] for b in self._object_body_ids]),
             "block_rgba": self.model.geom_rgba[self._object_geom_ids].copy(),
+            "parent_base_xy": self.parent_base_xy.copy(),
         }
 
     def _sample_xy(self, in_frustum: bool) -> tuple[float, float]:
