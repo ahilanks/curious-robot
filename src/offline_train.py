@@ -144,24 +144,37 @@ def main(args):
           f"(a_dim={a_dim}, prop_dim={prop_dim}, H={H}, h_fwd={h_fwd})", flush=True)
 
     # --- models + optimizers, exactly as train.py builds them ---
+    # use_proprio must follow the warm-start ckpt: it changes z_dim (192 pixels-only
+    # vs 256 fused), and every campaign ckpt since no_proprio runs at 192.
     wm = WorldModel(n_dof=n_dof, action_block=action_block, history_size=H,
-                    dropout=wm_dropout, **(pred_dims_from_args(src_args) if src_args else {})).to(device)
+                    dropout=wm_dropout, use_proprio=not bool(src_args.get("no_proprio", False)),
+                    **(pred_dims_from_args(src_args) if src_args else {})).to(device)
     wm.eval()                                  # train() only inside wm_update
     sigreg = SIGReg(knots=17, num_proj=1024).to(device)
-    actor = Actor(wm.z_dim, a_dim).to(device)
-    critic = TwinQ(wm.z_dim, a_dim).to(device)
-    critic_tgt = TwinQ(wm.z_dim, a_dim).to(device)
-    critic_tgt.load_state_dict(critic.state_dict())
-    for p in critic_tgt.parameters():
-        p.requires_grad_(False)
-    if ck is not None:
+    if args.wm_only:
+        # WM-only consolidation: no live actor/critic (the campaign's goal-conditioned
+        # actor predates this script's SAC path anyway); the warm-start policy weights
+        # pass through UNCHANGED into the saved 8-key checkpoint so redeploy still loads.
+        if ck is None:
+            raise SystemExit("--wm-only requires --init-ckpt/--resume-name (policy passes through)")
+        actor = critic = critic_tgt = None
         wm.load_state_dict(ck["wm"])
-        load_actor_state(actor, ck["actor"])
-        critic.load_state_dict(ck["critic"])
-        critic_tgt.load_state_dict(ck["critic_tgt"])
-        print(f"[resume] loaded wm+actor+critic+critic_tgt (h_fwd={h_fwd})", flush=True)
-    actor_opt = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
-    critic_opt = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
+        print(f"[resume] loaded wm; actor/critic pass through untouched (h_fwd={h_fwd})", flush=True)
+    else:
+        actor = Actor(wm.z_dim, a_dim).to(device)
+        critic = TwinQ(wm.z_dim, a_dim).to(device)
+        critic_tgt = TwinQ(wm.z_dim, a_dim).to(device)
+        critic_tgt.load_state_dict(critic.state_dict())
+        for p in critic_tgt.parameters():
+            p.requires_grad_(False)
+        if ck is not None:
+            wm.load_state_dict(ck["wm"])
+            load_actor_state(actor, ck["actor"])
+            critic.load_state_dict(ck["critic"])
+            critic_tgt.load_state_dict(ck["critic_tgt"])
+            print(f"[resume] loaded wm+actor+critic+critic_tgt (h_fwd={h_fwd})", flush=True)
+        actor_opt = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
+        critic_opt = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
     wm_opt = torch.optim.AdamW([p for p in wm.parameters() if p.requires_grad],
                                lr=args.wm_lr, weight_decay=1e-3)
 
@@ -188,6 +201,10 @@ def main(args):
         print(f"[wandb] {run.url}", flush=True)
 
     def ckpt_state(step):   # the EXACT 8 keys train.py saves -> redeploy loads cleanly
+        if args.wm_only:
+            return {"step": step, "wm": wm.state_dict(), "actor": ck["actor"],
+                    "critic": ck["critic"], "critic_tgt": ck["critic_tgt"],
+                    "h_fwd": h_fwd, "args": saved_args}
         return {"step": step, "wm": wm.state_dict(), "actor": actor.state_dict(),
                 "critic": critic.state_dict(), "critic_tgt": critic_tgt.state_dict(),
                 "h_fwd": h_fwd, "args": saved_args}
@@ -206,8 +223,8 @@ def main(args):
                                     args.gamma_wm, args.sigreg_weight, device)
                 wm.eval()
                 n_wm += 1
-        res = sac_update(buf, wm, actor, critic, critic_tgt, actor_opt, critic_opt,
-                         args, step, device)
+        res = None if args.wm_only else sac_update(buf, wm, actor, critic, critic_tgt,
+                                                   actor_opt, critic_opt, args, step, device)
         if res is not None:
             last_sac = (res["critic_loss"], res["actor_loss"])
             last_zb = res["zb"]
@@ -246,7 +263,7 @@ def main(args):
         print(f"[warn] wm_update NEVER fired: every stream is shorter than "
               f"history+h_fwd+1={H + h_fwd + 1} or too few windows for "
               f"--wm-batch-size {args.wm_batch_size}", flush=True)
-    if n_sac == 0:
+    if n_sac == 0 and not args.wm_only:
         print(f"[warn] sac_update NEVER fired: valid (t,t+1) pairs < --batch-size "
               f"{args.batch_size} (single-stream pairs = len-1); lower --batch-size "
               "or collect more transitions", flush=True)
@@ -271,6 +288,10 @@ def parse_args():
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--keep-local-ckpts", action="store_true")
+    p.add_argument("--wm-only", action="store_true",
+                   help="consolidate the WM only: no actor/critic build/load/updates "
+                        "(required for goal-conditioned ckpts, whose actor this script "
+                        "predates); warm-start policy weights pass through to the ckpt")
     p.add_argument("--seed", type=int, default=0)
     # world model (defaults = train.py's except the fine-tune LR; history/dropout
     # default to the warm-start checkpoint's values)
