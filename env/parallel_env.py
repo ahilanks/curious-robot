@@ -163,9 +163,15 @@ def _env_worker(remote, parent_remote, env_kwargs):
             if cmd == "step":
                 remote.send(env.step(data))
             elif cmd == "step_block":          # run a whole action_block in-worker: 1 IPC round-trip / decision
+                if isinstance(data, tuple):    # (child_block, parent_block|None): parent-arm runs
+                    data, parent_block = data
+                else:
+                    parent_block = None
                 obs, infos = None, []
                 last = len(data) - 1
                 for k, a_k in enumerate(data): # data: (action_block, n_dof)
+                    if parent_block is not None:
+                        env.set_parent_target(parent_block[k])     # one VLA action per sub-step
                     obs, info = env.step(a_k, render=(k == last))  # render only the kept (final) obs
                     infos.append(info)
                 remote.send((obs, infos))      # final obs + per-substep info list
@@ -173,6 +179,8 @@ def _env_worker(remote, parent_remote, env_kwargs):
                 remote.send(env.reset())
             elif cmd == "render_overhead":
                 remote.send(env.render_overhead())
+            elif cmd == "parent_context":      # refill-cadence bundle for the main-process parent driver
+                remote.send(env.parent_context())
             elif cmd == "spaces":
                 remote.send((env.n_dof, env.tau_max))
             elif cmd == "close":
@@ -327,14 +335,24 @@ class SubprocVectorMujocoEnv:
         info = {k: np.stack([d[k] for d in info_list]) for k in _INFO_KEYS}
         return VectorMujocoEnv._stack_obs(obs_list), info
 
-    def step_block_async(self, action_blocks: np.ndarray) -> None:
+    def step_block_async(self, action_blocks: np.ndarray,
+                         parent_blocks: np.ndarray | None = None) -> None:
         """Dispatch a full action_block per env (non-blocking). Workers run all
         action_block substeps while the trainer does GPU work; collect with
-        step_block_wait(). This overlaps CPU rollout with GPU learning."""
+        step_block_wait(). This overlaps CPU rollout with GPU learning.
+        parent_blocks: optional (n_envs, action_block, 6) absolute parent joint targets
+        (radians), applied one per substep alongside the child's actions."""
         action_blocks = np.asarray(action_blocks, dtype=np.float32)
         assert action_blocks.shape[0] == self.n_envs and action_blocks.ndim == 3
-        for w, ab in zip(self._workers, action_blocks):
-            w.send("step_block", ab)
+        for i, (w, ab) in enumerate(zip(self._workers, action_blocks)):
+            w.send("step_block", ab if parent_blocks is None else (ab, parent_blocks[i]))
+
+    def parent_context(self) -> list[dict]:
+        """Refill-cadence bundle from every worker (parent cams + qpos + child gaze +
+        block state). One round-trip; call sparingly (~every 10 decisions)."""
+        for w in self._workers:
+            w.send("parent_context")
+        return [w.recv() for w in self._workers]
 
     def step_block_wait(self):
         """Collect step_block_async(): final stacked obs + a list (over the action_block)

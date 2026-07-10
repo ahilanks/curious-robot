@@ -215,6 +215,115 @@ class ScriptedParentDriver:
         return np.asarray(q, np.float64)
 
 
+# ---------------------------------------------------------------- training fleet
+class ParentFleet:
+    """Batched parent driver for the N-env TRAINING loop. Per-env 50-action chunk queues;
+    when any env runs low, ONE parent_context() round-trip + ONE batched
+    predict_action_chunk refills them all together (per-env gaze-aware instructions
+    re-issued at each refill). next_blocks() is called once per child decision and
+    returns (n_envs, action_block, 6) absolute parent targets in radians.
+
+    mode='scripted' runs the privileged keyframe sweep instead (no GPU), same queues."""
+
+    def __init__(self, n_envs: int, mode: str = "smolvla", device: str = "cuda",
+                 refill_below: int = 5, log=print):
+        from collections import deque
+        self.n, self.mode, self.device = n_envs, mode, device
+        self.refill_below = refill_below
+        self.gen = InstructionGen()
+        self.queues = [deque() for _ in range(n_envs)]
+        self.instr = [""] * n_envs
+        self._scripted_t = np.zeros(n_envs, np.int64)
+        self._scripted_aim = [None] * n_envs             # (pan, lift, elbow, dir) per env
+        self.parent_contact_rate = 0.0                   # for the trainer's metrics window
+        if mode == "smolvla":
+            from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+            self.policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base").to(device).eval()
+            self.cam_keys = [k for k in self.policy.config.input_features if "image" in k]
+            self._tok = self.policy.model.vlm_with_expert.processor.tokenizer
+            self._max_len = int(getattr(self.policy.config, "tokenizer_max_length", 48))
+            log(f"[parent] SmolVLA fleet driver up ({n_envs} envs, radian-native)", flush=True)
+        else:
+            self.policy = None
+            log(f"[parent] scripted fleet driver up ({n_envs} envs)", flush=True)
+
+    def _instructions_from(self, ctxs, ids):
+        for i in ids:
+            inview = ctxs[i]["inview"]
+            if inview:
+                bidx = inview[0][0]
+                block = {"color": color_word(ctxs[i]["block_rgba"][bidx]), "idx": bidx}
+                self.instr[i] = self.gen.instruction_for(block)
+                self._scripted_aim[i] = (bidx, -1.0 if "left" in self.instr[i] else 1.0)
+            else:
+                self.instr[i] = "move a cube on the table"
+                self._scripted_aim[i] = None
+
+    @torch.no_grad()
+    def _refill_smolvla(self, ctxs, ids):
+        imgs1 = torch.stack([torch.as_tensor(ctxs[i]["parent_view"]).permute(2, 0, 1)
+                             for i in ids]).to(self.device).float() / 255.0
+        imgs2 = torch.stack([torch.as_tensor(ctxs[i]["overhead"]).permute(2, 0, 1)
+                             for i in ids]).to(self.device).float() / 255.0
+        state = torch.stack([torch.as_tensor(ctxs[i]["parent_qpos"]) for i in ids]).to(self.device)
+        enc = self._tok([self.instr[i] for i in ids], max_length=self._max_len,
+                        truncation=True, padding="max_length", return_tensors="pt")
+        batch = {"observation.state": state,
+                 "task": [self.instr[i] for i in ids],
+                 "observation.language.tokens": enc["input_ids"].to(self.device),
+                 "observation.language.attention_mask": enc["attention_mask"].to(self.device, dtype=torch.bool)}
+        zeros = torch.zeros_like(imgs1)
+        for k, key in enumerate(self.cam_keys):
+            batch[key] = (imgs1, imgs2, zeros)[min(k, 2)]
+        chunks = self.policy.predict_action_chunk(batch).float().cpu().numpy()  # (B, 50, 6) rad
+        for j, i in enumerate(ids):
+            self.queues[i].extend(chunks[j])
+
+    def _refill_scripted(self, ctxs, ids):
+        for i in ids:
+            aim = self._scripted_aim[i]
+            steps = []
+            for t in range(50):
+                if aim is None:
+                    steps.append(np.zeros(6))
+                    continue
+                bidx, direction = aim
+                rel = ctxs[i]["block_xy"][bidx] - np.array([0.62, 0.0])
+                r = float(np.linalg.norm(rel))
+                pan = float(np.arctan2(-rel[1], -rel[0]))
+                f = np.clip((r - 0.16) / 0.14, 0.0, 1.4)
+                lift, elbow = -0.75 - 0.30 * f, 1.15 + 0.30 * f
+                ph = ((self._scripted_t[i] + t) % 90) / 90
+                sw = np.deg2rad(22.0)
+                if ph < 0.25:
+                    q = [pan - direction * sw, lift + 0.35, elbow - 0.2, 0.5, 0.0, 0.5]
+                elif ph < 0.45:
+                    q = [pan - direction * sw, lift, elbow, 0.5, 0.0, 0.3]
+                elif ph < 0.75:
+                    s = (ph - 0.45) / 0.30
+                    q = [pan + direction * sw * (2 * s - 1), lift, elbow, 0.5, 0.0, 0.3]
+                else:
+                    q = [pan + direction * sw, lift + 0.35, elbow - 0.25, 0.5, 0.0, 0.5]
+                steps.append(np.asarray(q))
+            self._scripted_t[i] += 50
+            self.queues[i].extend(steps)
+
+    def next_blocks(self, env, action_block: int) -> np.ndarray:
+        low = [i for i in range(self.n) if len(self.queues[i]) < action_block]
+        if low:
+            ctxs = env.parent_context()                  # one worker round-trip for the fleet
+            self._instructions_from(ctxs, low)
+            if self.mode == "smolvla":
+                self._refill_smolvla(ctxs, low)
+            else:
+                self._refill_scripted(ctxs, low)
+        out = np.zeros((self.n, action_block, 6))
+        for i in range(self.n):
+            for k in range(action_block):
+                out[i, k] = self.queues[i].popleft() if self.queues[i] else 0.0
+        return out
+
+
 # ---------------------------------------------------------------- orchestrator
 def run_parent_child_demo(env, driver, episodes=4, decisions=120, retarget_every=40,
                           child_policy=None, log=print):

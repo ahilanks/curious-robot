@@ -237,6 +237,31 @@ class MujocoSO101Env:
         self._overhead_renderer.update_scene(self.data, camera=self._parent_view_cam_id)
         return self._overhead_renderer.render()
 
+    def parent_context(self) -> dict:
+        """Everything the MAIN-process parent driver needs at chunk-refill cadence, in one
+        worker round-trip: the parent's cameras + proprio, plus gaze geometry (which blocks
+        the CHILD's wrist cam currently sees) and raw block state for scripted drivers."""
+        cid = self._wrist_cam_id
+        cam_pos = self.data.cam_xpos[cid].copy()
+        R = self.data.cam_xmat[cid].reshape(3, 3)
+        half = float(np.tan(np.deg2rad(float(self.model.cam_fovy[cid])) / 2))
+        inview = []
+        for i, bid in enumerate(self._object_body_ids):
+            p = R.T @ (self.data.xpos[bid] - cam_pos)
+            if p[2] > -0.03:
+                continue
+            u, v = p[0] / -p[2], p[1] / -p[2]
+            if abs(u) < half * 0.92 and abs(v) < half * 0.92:
+                inview.append((i, float(max(abs(u), abs(v)) / half)))
+        return {
+            "parent_view": self.render_parent_view(),
+            "overhead": self.render_overhead(),
+            "parent_qpos": self.parent_qpos(),
+            "inview": sorted(inview, key=lambda t: t[1]),
+            "block_xy": np.stack([self.data.xpos[b][:2] for b in self._object_body_ids]),
+            "block_rgba": self.model.geom_rgba[self._object_geom_ids].copy(),
+        }
+
     def _sample_xy(self, in_frustum: bool) -> tuple[float, float]:
         if in_frustum:
             return (float(self.rng.uniform(*self.spawn_x_range)),

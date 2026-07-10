@@ -1234,6 +1234,7 @@ def main(args):
         if args.fixed_objects:
             print("[env] fixed-objects ON: identical deterministic scene for every env & reset "
                   "(variance = arm only)", flush=True)
+        env_kwargs["parent_arm"] = bool(args.parent_vla)   # second (parent) arm for the VLA driver
     if args.env_backend == "subproc":      # GPU EGL render only in the CUDA-free subproc workers
         env_kwargs["render_backend"] = args.render_backend
         print(f"[render] subproc workers render via {args.render_backend.upper()} "
@@ -1243,6 +1244,10 @@ def main(args):
     a_dim = n_dof * args.action_block
     prop_dim = 3 * n_dof
     H = args.history_size
+    parent_fleet = None
+    if args.parent_vla:                          # VLA/scripted parent arm ("adult") in every env:
+        from src.parent_vla import ParentFleet   # moves blocks where the child looks. Lazy import --
+        parent_fleet = ParentFleet(args.n_envs, mode=args.parent_vla)  # lerobot loads only when used.
 
     wm = WorldModel(n_dof=n_dof, action_block=args.action_block,
                     history_size=H, dropout=args.wm_dropout,
@@ -1620,7 +1625,7 @@ def main(args):
     frac_trig = {"last": 0, "n": 0}                           # --cotrain-frac-thresh trigger state (step of last fire, count)
     dwell_hold_recent = deque(maxlen=400)                     # --dwell-hold-mult: fraction of envs parked per decision
     recent = {k: deque(maxlen=400) for k in
-              ("r_cur", "r_safe", "cur_contrib", "contacts", "table_contacts",
+              ("r_cur", "r_safe", "cur_contrib", "contacts", "table_contacts", "parent_contacts",
                "motion", "ret", "frac_block", "frac_table",
                "rate", "rate2", "energy", "qd_mean", "tau_sat", "qd_rev",
                "r_rate", "r_energy", "pose_step",
@@ -1966,7 +1971,9 @@ def main(args):
         _tnow = time.perf_counter(); _tacc["plan"] += _tnow - _tmark; _tmark = _tnow
         # --- async actor-learner: launch the env rollout for this decision, then run
         #     the GPU updates on buffered data WHILE the workers render -> overlap CPU/GPU ---
-        env.step_block_async(a_env)
+        env.step_block_async(a_env,
+                             parent_fleet.next_blocks(env, args.action_block)
+                             if parent_fleet is not None else None)
         if not args.frozen_policy:                # frozen: skip ALL gradient work (data collection only)
             h_fwd = learner_updates(step, h_fwd)
             if args.cotrain_every > 0 and step > 0 and step % args.cotrain_every == 0:
@@ -1997,11 +2004,14 @@ def main(args):
         tau_sat = np.zeros(args.n_envs, np.float32)
         qd_rev = np.zeros(args.n_envs, np.float32)      # sign-flip fraction of qd between substeps
         prev_qd = None
+        parent_contacts = np.zeros(args.n_envs, np.float32)
         for info in sub_infos:
             r_safe += info["safety_reward"]
             contacts += info["object_contacts"].astype(np.float32)
             table_contacts += info["table_contacts"].astype(np.float32)
             motion += info["object_motion"]
+            if "parent_object_contacts" in info:
+                parent_contacts += info["parent_object_contacts"].astype(np.float32)
             tau, qd = info["applied_torque"], info["qvel"]
             energy += np.abs(tau * qd).mean(-1)
             qd_mean += np.abs(qd).mean(-1)
@@ -2176,7 +2186,8 @@ def main(args):
                          ("r_rate", r_rate), ("r_energy", r_energy), ("pose_step", pose_step),
                          ("r_rnd", r_rnd), ("rnd_contrib", rnd_term),
                          ("r_knn", r_knn), ("knn_contrib", knn_term),
-                         ("hot_retargets", hot_fired)):
+                         ("hot_retargets", hot_fired),
+                         ("parent_contacts", parent_contacts)):
             recent[key].append(float(np.mean(val)))
 
         # --- advance latent + history; reset timed-out envs ---
@@ -2225,6 +2236,7 @@ def main(args):
                  "reward/total": np.mean(recent["ret"]),
                  "interact/contacts_per_step": np.mean(recent["contacts"]),
                  "interact/table_contacts_per_step": np.mean(recent["table_contacts"]),
+                 "interact/parent_contacts_per_step": np.mean(recent["parent_contacts"]),
                  "interact/object_motion": np.mean(recent["motion"]),
                  "interact/frac_touch_block": np.mean(recent["frac_block"]),
                  "interact/frac_touch_table": np.mean(recent["frac_table"]),
@@ -2463,6 +2475,12 @@ def parse_args():
                         "inproc: envs in this process (sequential or --env-threads); "
                         "hardware: one physical SO-ARM101 via env/hardware_env.py (forces n_envs=1)")
     p.add_argument("--frame-skip", type=int, default=6)
+    p.add_argument("--parent-vla", default="", choices=["", "smolvla", "scripted"],
+                   help="enable the SECOND (parent) SO-101 and drive it: 'smolvla' = lerobot SmolVLA "
+                        "with gaze-aware instructions (moves blocks where the CHILD's wrist cam looks), "
+                        "'scripted' = privileged keyframe sweeps (same orchestration, no GPU). The child's "
+                        "action/obs/safety/contact semantics are unchanged; parent-block contacts are "
+                        "logged separately as interact/parent_contacts_per_step. Empty (default) = off.")
     p.add_argument("--fixed-objects", action="store_true",
                    help="place all scene objects at an IDENTICAL deterministic layout for every env and "
                         "every reset (constant-seed positions/sizes/colors/orientations, placed against a "
