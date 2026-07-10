@@ -84,8 +84,18 @@ class MujocoSO101Env:
         table_drop_threshold: float = -0.10,
         seed: int = 0,
         fixed_objects: bool = False,             # place objects deterministically (same layout EVERY env & reset)
+        parent_arm: bool = False,                # attach a second (parent) SO-101 across the table -- a VLA-driven
+                                                 # "adult" that moves blocks in the child's view. Child action/obs/
+                                                 # safety/contact semantics are UNCHANGED (child ids resolved
+                                                 # explicitly; parent geoms excluded from the child's contact sets).
+        parent_pos: tuple[float, float, float] = (0.62, 0.0, 0.0),
+        parent_yaw: float = 3.141592653589793,   # face the child across the block spawn zone
     ):
-        self.model = mujoco.MjModel.from_xml_path(str(scene_path))
+        self.parent_arm = bool(parent_arm)
+        if parent_arm:
+            self.model = self._build_two_arm_model(scene_path, parent_pos, parent_yaw)
+        else:
+            self.model = mujoco.MjModel.from_xml_path(str(scene_path))
         self.data = mujoco.MjData(self.model)
         self.frame_skip = frame_skip
         self.dt_safe = frame_skip * float(self.model.opt.timestep)   # accel finite-diff window
@@ -105,12 +115,28 @@ class MujocoSO101Env:
         self.respawn_z_padding = float(respawn_z_padding)
         self.table_drop_threshold = table_drop_threshold
 
-        self.n_dof = int(self.model.nu)
-        self.tau_max = self.model.actuator_forcerange[:, 1].copy().astype(np.float32)
-        self.ctrl_low = self.model.actuator_ctrlrange[:, 0].copy().astype(np.float32)
-        self.ctrl_high = self.model.actuator_ctrlrange[:, 1].copy().astype(np.float32)
+        # CHILD actuator/joint ids resolved explicitly: with --parent-arm the model holds 12
+        # actuators (child 0-5 unchanged + parent_ 6-11); everything child-facing below slices
+        # by these ids so the child's action/proprio/safety surface is byte-identical.
+        _act_names = [mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+                      for i in range(int(self.model.nu))]
+        self._parent_act_ids = [i for i, n in enumerate(_act_names) if n and n.startswith("parent_")]
+        self._child_act_ids = [i for i, n in enumerate(_act_names) if i not in self._parent_act_ids]
+        self.n_dof = len(self._child_act_ids)
+        self.tau_max = self.model.actuator_forcerange[self._child_act_ids, 1].copy().astype(np.float32)
+        self.ctrl_low = self.model.actuator_ctrlrange[self._child_act_ids, 0].copy().astype(np.float32)
+        self.ctrl_high = self.model.actuator_ctrlrange[self._child_act_ids, 1].copy().astype(np.float32)
         self.adapter = SOArmAdapter(self.ctrl_low, self.ctrl_high,
                                     action_max=action_max)
+        if self.parent_arm:
+            self._parent_ctrl_low = self.model.actuator_ctrlrange[self._parent_act_ids, 0].copy()
+            self._parent_ctrl_high = self.model.actuator_ctrlrange[self._parent_act_ids, 1].copy()
+            _pj = [f"parent_{n}" for n in
+                   ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")]
+            self._parent_qpos_adr = np.array(
+                [int(self.model.jnt_qposadr[_name_lookup(self.model, mujoco.mjtObj.mjOBJ_JOINT, j)])
+                 for j in _pj])
+            self._parent_view_cam_id = _name_lookup(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "parent_view")
 
         self._wrist_cam_id = _name_lookup(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam")
         self._overhead_cam_id = _name_lookup(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "overhead")
@@ -141,11 +167,16 @@ class MujocoSO101Env:
         # leaves the arm set empty and no contact ever registers.
         self._arm_geom_ids: set[int] = set()
         self._table_geom_ids: set[int] = set()
-        for gid in range(self.model.ngeom):
+        self._parent_geom_ids: set[int] = set()   # parent-arm links: EXCLUDED from the child's
+        for gid in range(self.model.ngeom):       # contact buckets (its touches are not ours)
             if gid in self._object_geom_id_set:
                 continue
             name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, gid)
-            if name is not None and name.startswith(("table", "floor")):
+            body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY,
+                                          int(self.model.geom_bodyid[gid]))
+            if self.parent_arm and body_name is not None and body_name.startswith("parent_"):
+                self._parent_geom_ids.add(gid)
+            elif name is not None and name.startswith(("table", "floor")):
                 self._table_geom_ids.add(gid)
             else:
                 self._arm_geom_ids.add(gid)
@@ -163,6 +194,48 @@ class MujocoSO101Env:
         self._prev_obj_xpos = np.zeros((n_objects, 3), dtype=np.float64)
 
     # --- Object randomisation -------------------------------------------------
+
+    @staticmethod
+    def _build_two_arm_model(scene_path, parent_pos, parent_yaw):
+        """Compile the scene with a second (parent) SO-101 attached via MjSpec: bodies/
+        joints/actuators arrive prefixed `parent_` and APPENDED, so the child keeps qpos
+        0-5 / actuators 0-5 / block qpos from 6 -- verified layout-identical. Also adds a
+        fixed `parent_view` camera framing the shared block zone for the parent's VLA."""
+        import math
+        spec = mujoco.MjSpec.from_file(str(scene_path))
+        arm = mujoco.MjSpec.from_file(str(Path(scene_path).parent / "so101_new_calib.xml"))
+        frame = spec.worldbody.add_frame(
+            pos=list(parent_pos),
+            quat=[math.cos(parent_yaw / 2), 0.0, 0.0, math.sin(parent_yaw / 2)])
+        spec.attach(arm, prefix="parent_", frame=frame)
+        cam_pos = np.array([parent_pos[0] - 0.02, -0.44, 0.42])
+        target = np.array([0.31, 0.0, 0.02])                  # block spawn zone centre
+        z = cam_pos - target; z = z / np.linalg.norm(z)       # camera looks along -z
+        x = np.cross(np.array([0.0, 0.0, 1.0]), z); x = x / np.linalg.norm(x)
+        y = np.cross(z, x)
+        quat = np.empty(4)
+        mujoco.mju_mat2Quat(quat, np.stack([x, y, z], axis=1).flatten())
+        spec.worldbody.add_camera(name="parent_view", pos=cam_pos.tolist(), quat=quat.tolist())
+        return spec.compile()
+
+    # ---- parent-arm API (the VLA-driven "adult"; no-ops unless parent_arm=True) ----
+    def parent_qpos(self) -> np.ndarray:
+        return self.data.qpos[self._parent_qpos_adr].copy().astype(np.float32)
+
+    def set_parent_target(self, q_rad: np.ndarray) -> None:
+        """Absolute joint-position targets (radians) for the parent's position servos --
+        the VLA's native output space (converted from its dataset units by the caller)."""
+        self.data.ctrl[self._parent_act_ids] = np.clip(
+            q_rad, self._parent_ctrl_low, self._parent_ctrl_high)
+
+    def parent_home(self) -> None:
+        self.data.qpos[self._parent_qpos_adr] = 0.0
+        self.data.ctrl[self._parent_act_ids] = 0.0
+
+    def render_parent_view(self) -> np.ndarray:
+        """256x256 RGB from the fixed parent_view camera (the parent VLA's scene camera)."""
+        self._overhead_renderer.update_scene(self.data, camera=self._parent_view_cam_id)
+        return self._overhead_renderer.render()
 
     def _sample_xy(self, in_frustum: bool) -> tuple[float, float]:
         if in_frustum:
@@ -267,7 +340,11 @@ class MujocoSO101Env:
             self.data.qpos[:self.n_dof] = self.rng.normal(0.0, 0.02, size=self.n_dof)
             self.randomise_all_objects()
         self._prev_ctrl = self.data.qpos[:self.n_dof].copy().astype(np.float64)
-        self.data.ctrl[:] = self._prev_ctrl
+        self.data.ctrl[:self.n_dof] = self._prev_ctrl
+        if self.parent_arm:                       # parent wakes at home pose, holding position
+            self.data.qpos[self._parent_qpos_adr] = 0.0
+            self.data.ctrl[self._parent_act_ids] = 0.0
+            self._parent_obj_contacts = 0
         mujoco.mj_forward(self.model, self.data)
         self._prev_qvel = self.data.qvel[:self.n_dof].copy().astype(np.float32)
         self._prev_obj_xpos = self._object_xpos()
@@ -282,9 +359,14 @@ class MujocoSO101Env:
         total object xy-displacement since last step). Each contact is classified
         once, object before table, so the buckets never double-count."""
         n_obj = n_table = 0
+        self._parent_obj_contacts = 0            # parent-arm touches (diagnostic; NOT the child's)
         for c in range(self.data.ncon):
             con = self.data.contact[c]
             g1, g2 = int(con.geom1), int(con.geom2)
+            if self.parent_arm:
+                p1, p2 = g1 in self._parent_geom_ids, g2 in self._parent_geom_ids
+                if (p1 and g2 in self._object_geom_id_set) or (p2 and g1 in self._object_geom_id_set):
+                    self._parent_obj_contacts += 1
             a1, a2 = g1 in self._arm_geom_ids, g2 in self._arm_geom_ids
             if not (a1 or a2):
                 continue
@@ -309,17 +391,17 @@ class MujocoSO101Env:
         if self.substep_interp:
             for k in range(self.frame_skip):
                 alpha = (k + 1) / self.frame_skip
-                self.data.ctrl[:] = (1.0 - alpha) * prev + alpha * target
+                self.data.ctrl[:self.n_dof] = (1.0 - alpha) * prev + alpha * target
                 mujoco.mj_step(self.model, self.data)
         else:
-            self.data.ctrl[:] = target
+            self.data.ctrl[:self.n_dof] = target
             for _ in range(self.frame_skip):
                 mujoco.mj_step(self.model, self.data)
         self._prev_ctrl = target
         n_contact, n_table, obj_motion = self._interaction_stats()   # before respawn (teleports excluded)
         self._maybe_respawn_fallen()
 
-        applied_torque = self.data.actuator_force.copy().astype(np.float32)
+        applied_torque = self.data.actuator_force[self._child_act_ids].copy().astype(np.float32)
         qvel = self.data.qvel[:self.n_dof].copy().astype(np.float32)
         r_safe = float(safety_reward_np(applied_torque, qvel, qvel_before, self.tau_max,
                                         dt_safe=self.dt_safe, delta=self.safety_delta))
@@ -335,6 +417,8 @@ class MujocoSO101Env:
             "table_contacts": np.int64(n_table),
             "object_motion": np.float32(obj_motion),
         }
+        if self.parent_arm:
+            info["parent_object_contacts"] = np.int64(self._parent_obj_contacts)
         self._prev_qvel = qvel
         return obs, info
 
@@ -364,7 +448,7 @@ class MujocoSO101Env:
         proprio = np.concatenate([
             self.data.qpos[:self.n_dof].astype(np.float32),
             self.data.qvel[:self.n_dof].astype(np.float32),
-            self.data.actuator_force.astype(np.float32),
+            self.data.actuator_force[self._child_act_ids].astype(np.float32),
         ])
         return {"image": wrist, "proprio": proprio}
 
