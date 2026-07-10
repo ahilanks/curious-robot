@@ -96,17 +96,24 @@ class VectorMujocoEnv:
         info = {k: np.stack([d[k] for d in info_list]) for k in _INFO_KEYS}
         return self._stack_obs(obs_list), info
 
-    def step_block_async(self, action_blocks: np.ndarray) -> None:
+    def step_block_async(self, action_blocks: np.ndarray,
+                         parent_blocks: np.ndarray | None = None) -> None:
         action_blocks = np.asarray(action_blocks, dtype=np.float32)
 
-        def run(env, ab):
+        def run(env, ab, pb):
             obs, infos = None, []
             last = len(ab) - 1
             for k, a_k in enumerate(ab):
+                if pb is not None:
+                    env.set_parent_target(pb[k])
                 obs, info = env.step(a_k, render=(k == last))      # render only the kept (final) obs
                 infos.append(info)
             return obs, infos
-        self._pending = self._map(run, self.envs, list(action_blocks))
+        pbs = list(parent_blocks) if parent_blocks is not None else [None] * self.n_envs
+        self._pending = self._map(run, self.envs, list(action_blocks), pbs)
+
+    def parent_context(self) -> list[dict]:
+        return [e.parent_context() for e in self.envs]
 
     def step_block_wait(self):
         results, self._pending = self._pending, None
@@ -123,10 +130,15 @@ class VectorMujocoEnv:
     @staticmethod
     def _stack_sub_infos(infos_per_env):
         """infos_per_env: list over envs of list over substeps of info-dicts ->
-        list over substeps of {key: (n_envs, ...)} (so the loop accumulates per substep)."""
+        list over substeps of {key: (n_envs, ...)} (so the loop accumulates per substep).
+        Optional keys (e.g. parent_object_contacts under --parent-arm) are stacked when
+        every env emits them -- a FIXED key tuple silently dropped them (2026-07-10:
+        the parent's contact counts never reached the trainer)."""
         n_sub = len(infos_per_env[0])
+        keys = [k for k in (*_INFO_KEYS, "parent_object_contacts")
+                if k in infos_per_env[0][0]]
         return [{k: np.stack([infos_per_env[e][s][k] for e in range(len(infos_per_env))])
-                 for k in _INFO_KEYS} for s in range(n_sub)]
+                 for k in keys} for s in range(n_sub)]
 
     def render_overhead(self) -> np.ndarray:
         return np.stack(self._map(lambda e: e.render_overhead()))

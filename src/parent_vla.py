@@ -250,8 +250,20 @@ class ParentFleet:
     def _instructions_from(self, ctxs, ids):
         for i in ids:
             inview = ctxs[i]["inview"]
-            if inview:
-                bidx = inview[0][0]
+            # target = most child-centred block the PARENT can actually reach (its keyframe
+            # calibration covers r ~ 0.17-0.40 from the parent base at (0.62, 0)); if the
+            # child watches none of those, fall back to ANY reachable block -- motion the
+            # child may catch beats guaranteed no motion.
+            base = ctxs[i].get("parent_base_xy", np.array([0.55, 0.0]))
+            def reach_r(b):
+                return float(np.linalg.norm(ctxs[i]["block_xy"][b] - base))
+            reachable = [b for b, _ in inview if 0.14 <= reach_r(b) <= 0.41]
+            if not reachable:
+                allr = [(reach_r(b), b) for b in range(len(ctxs[i]["block_xy"]))
+                        if 0.16 <= reach_r(b) <= 0.28]
+                reachable = [min(allr)[1]] if allr else []
+            if reachable:
+                bidx = reachable[0]
                 block = {"color": color_word(ctxs[i]["block_rgba"][bidx]), "idx": bidx}
                 self.instr[i] = self.gen.instruction_for(block)
                 self._scripted_aim[i] = (bidx, -1.0 if "left" in self.instr[i] else 1.0)
@@ -279,31 +291,34 @@ class ParentFleet:
         for j, i in enumerate(ids):
             self.queues[i].extend(chunks[j])
 
+    # RISE-DROP-SWEEP cycle: the exact phase structure the contact calibration VERIFIED
+    # (2026-07-10: reset -> settle at depth -> short sweep = 45-172 contacts at every
+    # radius 0.14-0.41). Continuous plowing WEDGES (elbow pinned against the table edge
+    # mid-transit -- two-arm workspace is a collision minefield); the periodic RISE phase
+    # un-wedges and each drop re-centres on the watched block's bearing.
+    _POSE = (-0.7, 1.4, 0.6)                     # lift, elbow, wrist -- verified contact pose
+
     def _refill_scripted(self, ctxs, ids):
+        T_RISE, T_DROP, T_SWEEP = 25, 30, 65     # 120 sub-steps (4 s) per full cycle
         for i in ids:
             aim = self._scripted_aim[i]
+            base = ctxs[i].get("parent_base_xy", np.array([0.55, 0.0]))
+            if aim is not None:
+                rel = ctxs[i]["block_xy"][aim[0]] - base
+                center = float(np.clip(np.arctan2(-rel[1], -rel[0]), -0.5, 0.5))
+            else:
+                center = 0.0
+            lift, elbow, wrist = self._POSE
             steps = []
             for t in range(50):
-                if aim is None:
-                    steps.append(np.zeros(6))
-                    continue
-                bidx, direction = aim
-                rel = ctxs[i]["block_xy"][bidx] - np.array([0.62, 0.0])
-                r = float(np.linalg.norm(rel))
-                pan = float(np.arctan2(-rel[1], -rel[0]))
-                f = np.clip((r - 0.16) / 0.14, 0.0, 1.4)
-                lift, elbow = -0.75 - 0.30 * f, 1.15 + 0.30 * f
-                ph = ((self._scripted_t[i] + t) % 90) / 90
-                sw = np.deg2rad(22.0)
-                if ph < 0.25:
-                    q = [pan - direction * sw, lift + 0.35, elbow - 0.2, 0.5, 0.0, 0.5]
-                elif ph < 0.45:
-                    q = [pan - direction * sw, lift, elbow, 0.5, 0.0, 0.3]
-                elif ph < 0.75:
-                    s = (ph - 0.45) / 0.30
-                    q = [pan + direction * sw * (2 * s - 1), lift, elbow, 0.5, 0.0, 0.3]
-                else:
-                    q = [pan + direction * sw, lift + 0.35, elbow - 0.25, 0.5, 0.0, 0.5]
+                ph = (self._scripted_t[i] + t) % (T_RISE + T_DROP + T_SWEEP)
+                if ph < T_RISE:                                   # HOME pose = the calibration's reset
+                    q = [0.0, 0.0, 0.0, 0.0, 0.0, 0.3]            # state: definitionally un-wedged
+                elif ph < T_RISE + T_DROP:                        # drop to depth at the start bearing
+                    q = [center - 0.45, lift, elbow, wrist, 0.0, 0.3]
+                else:                                             # the verified short sweep
+                    s = (ph - T_RISE - T_DROP) / T_SWEEP
+                    q = [center - 0.45 + 0.9 * s, lift, elbow, wrist, 0.0, 0.3]
                 steps.append(np.asarray(q))
             self._scripted_t[i] += 50
             self.queues[i].extend(steps)

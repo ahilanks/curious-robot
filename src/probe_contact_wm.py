@@ -21,14 +21,15 @@ from env.mujoco_env import MujocoSO101Env
 from model.state_encoder import WorldModel, pred_dims_from_args
 from src.train import to_norm_pixel
 
-CKPT = "/root/.cache/huggingface/hub/models--a5ilank--curious-robot/snapshots/c98490b52e309c802faacc77a2177ccf5ba3a822/arr95_hot5b/ckpt_0059000.pt"
+CKPT = os.environ.get("PROBE_CKPT",
+    "/root/.cache/huggingface/hub/models--a5ilank--curious-robot/snapshots/c98490b52e309c802faacc77a2177ccf5ba3a822/arr95_hot5b/ckpt_0059000.pt")
 device = torch.device("cuda")
 ck = torch.load(CKPT, map_location="cpu", weights_only=False)
 a = SimpleNamespace(**ck["args"])
 wm = None  # built after env for n_dof
 
 # ---------- 0) harness anchor on real buffer windows ----------
-z0 = np.load("/workspace/curious-robot/runs/arr95_hot5b/state_latest.npz")
+z0 = np.load(os.environ.get("PROBE_BUFFER", "/workspace/curious-robot/runs/arr95_hot5b/state_latest.npz"))
 n_dof_buf = 6
 Hb = a.history_size
 env0 = MujocoSO101Env(frame_skip=a.frame_skip, action_max=a.action_max, encode_cam=a.wm_cam,
