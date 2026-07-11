@@ -175,6 +175,11 @@ def main(args):
             print(f"[resume] loaded wm+actor+critic+critic_tgt (h_fwd={h_fwd})", flush=True)
         actor_opt = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
         critic_opt = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
+    if args.freeze_encoder:
+        for p_ in wm.encoder.parameters():
+            p_.requires_grad_(False)
+        n_free = sum(p_.numel() for p_ in wm.parameters() if p_.requires_grad)
+        print(f"[freeze] encoder frozen; {n_free/1e6:.1f}M trainable (predictor stack)", flush=True)
     wm_opt = torch.optim.AdamW([p for p in wm.parameters() if p.requires_grad],
                                lr=args.wm_lr, weight_decay=1e-3)
 
@@ -219,6 +224,8 @@ def main(args):
             batch = buf.sample_wm(args.wm_batch_size, H + h_fwd)
             if batch is not None:
                 wm.train()
+                if args.freeze_encoder:
+                    wm.encoder.eval()      # BN running stats would drift even with frozen params
                 last_wm = wm_update(wm, sigreg, wm_opt, batch, H, h_fwd,
                                     args.gamma_wm, args.sigreg_weight, device)
                 wm.eval()
@@ -292,6 +299,12 @@ def parse_args():
                    help="consolidate the WM only: no actor/critic build/load/updates "
                         "(required for goal-conditioned ckpts, whose actor this script "
                         "predates); warm-start policy weights pass through to the ckpt")
+    p.add_argument("--freeze-encoder", action="store_true",
+                   help="predictor-only consolidation (the campaign's canonical recipe): "
+                        "freeze the encoder so offline data can't reorganize latent "
+                        "geometry (measured 2026-07-11: joint training on contact-heavy "
+                        "data compresses contact-step latent motion 31% -- the 'predict "
+                        "by seeing less' shortcut -- and blows up pred/persist 3-5x)")
     p.add_argument("--seed", type=int, default=0)
     # world model (defaults = train.py's except the fine-tune LR; history/dropout
     # default to the warm-start checkpoint's values)

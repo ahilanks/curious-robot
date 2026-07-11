@@ -32,8 +32,9 @@ from src.train import to_norm_pixel
 from src.smoke_child_sweep import ChildPlow, teleport_front
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--ckpts", required=True, help="comma-separated label=path pairs")
+ap.add_argument("--ckpts", default=None, help="comma-separated label=path pairs (omit to collect only)")
 ap.add_argument("--buffer", default=None, help="state_latest.npz for the anchor (first ckpt)")
+ap.add_argument("--args-ckpt", default=None, help="ckpt to read env args from (required for collect-only)")
 ap.add_argument("--eps-walk", type=int, default=12)
 ap.add_argument("--eps-rake", type=int, default=28)
 ap.add_argument("--dec", type=int, default=60)
@@ -43,8 +44,10 @@ args = ap.parse_args()
 os.makedirs(args.out, exist_ok=True)
 device = torch.device("cuda")
 
-ckpts = [kv.split("=", 1) for kv in args.ckpts.split(",")]
-ck0 = torch.load(ckpts[0][1], map_location="cpu", weights_only=False)
+ckpts = [kv.split("=", 1) for kv in args.ckpts.split(",")] if args.ckpts else []
+args_src = args.args_ckpt or (ckpts[0][1] if ckpts else None)
+assert args_src, "--args-ckpt is required when --ckpts is omitted (collect-only)"
+ck0 = torch.load(args_src, map_location="cpu", weights_only=False)
 a = SimpleNamespace(**ck0["args"])
 Hb = a.history_size
 
