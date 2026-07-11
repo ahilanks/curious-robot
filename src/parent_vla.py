@@ -226,10 +226,12 @@ class ParentFleet:
     mode='scripted' runs the privileged keyframe sweep instead (no GPU), same queues."""
 
     def __init__(self, n_envs: int, mode: str = "smolvla", device: str = "cuda",
-                 refill_below: int = 5, log=print):
+                 refill_below: int = 5, rate: float = 0.0, log=print):
         from collections import deque
         self.n, self.mode, self.device = n_envs, mode, device
         self.refill_below = refill_below
+        self.rate = float(rate)                          # rad/substep target slew limit; 0 = off
+        self._last_q = [None] * n_envs                   # rate-limit state (absolute joint targets)
         self.gen = InstructionGen()
         self.queues = [deque() for _ in range(n_envs)]
         self.instr = [""] * n_envs
@@ -298,6 +300,22 @@ class ParentFleet:
     # un-wedges and each drop re-centres on the watched block's bearing.
     _POSE = (-0.7, 1.4, 0.6)                     # lift, elbow, wrist -- verified contact pose
 
+    def _slew(self, i, steps, ctxs):
+        """Rate-limit a keyframe chunk (rad/substep, --parent-rate): each emitted target
+        moves at most self.rate per joint from the previous one, so the guardian glides
+        instead of jumping between keyframes. No-op when rate == 0."""
+        if self.rate <= 0:
+            return steps
+        if self._last_q[i] is None:
+            self._last_q[i] = np.asarray(ctxs[i]["parent_qpos"], np.float64).copy()
+        out = []
+        q = self._last_q[i]
+        for kf in steps:
+            q = q + np.clip(np.asarray(kf) - q, -self.rate, self.rate)
+            out.append(q.copy())
+        self._last_q[i] = q
+        return out
+
     def _refill_scripted(self, ctxs, ids):
         T_RISE, T_DROP, T_SWEEP = 25, 30, 65     # 120 sub-steps (4 s) per full cycle
         for i in ids:
@@ -321,7 +339,7 @@ class ParentFleet:
                     q = [center - 0.45 + 0.9 * s, lift, elbow, wrist, 0.0, 0.3]
                 steps.append(np.asarray(q))
             self._scripted_t[i] += 50
-            self.queues[i].extend(steps)
+            self.queues[i].extend(self._slew(i, steps, ctxs))
 
     # HERD mode (2026-07-11, emergence program): instead of re-novelizing blocks in
     # place, the parent SHEPHERDS out-of-reach blocks toward the child's reachable
@@ -398,7 +416,7 @@ class ParentFleet:
                     q = [center + d * SW, lift + 0.35, elbow - 0.25, wrist, 0.0, 0.5]
                 steps.append(np.asarray(q))
             self._scripted_t[i] += 50
-            self.queues[i].extend(steps)
+            self.queues[i].extend(self._slew(i, steps, ctxs))
 
     def next_blocks(self, env, action_block: int) -> np.ndarray:
         low = [i for i in range(self.n) if len(self.queues[i]) < action_block]

@@ -1246,6 +1246,8 @@ def main(args):
             print("[env] fixed-objects ON: identical deterministic scene for every env & reset "
                   "(variance = arm only)", flush=True)
         env_kwargs["parent_arm"] = bool(args.parent_vla)   # second (parent) arm for the VLA driver
+        if args.parent_vla:
+            env_kwargs["parent_pos"] = (args.parent_base_x, 0.0, 0.02)
     if args.env_backend == "subproc":      # GPU EGL render only in the CUDA-free subproc workers
         env_kwargs["render_backend"] = args.render_backend
         print(f"[render] subproc workers render via {args.render_backend.upper()} "
@@ -1258,7 +1260,8 @@ def main(args):
     parent_fleet = None
     if args.parent_vla:                          # VLA/scripted parent arm ("adult") in every env:
         from src.parent_vla import ParentFleet   # moves blocks where the child looks. Lazy import --
-        parent_fleet = ParentFleet(args.n_envs, mode=args.parent_vla)  # lerobot loads only when used.
+        parent_fleet = ParentFleet(args.n_envs, mode=args.parent_vla,  # lerobot loads only when used.
+                                   rate=args.parent_rate)
 
     wm = WorldModel(n_dof=n_dof, action_block=args.action_block,
                     history_size=H, dropout=args.wm_dropout,
@@ -2967,6 +2970,13 @@ def parse_args():
                         "eps ball instead of stepping over it (step_jump ~6 > ball width 4). 0 = off; spec value 3.0.")
     p.add_argument("--dwell-shrink-min", type=float, default=0.2,
                    help="floor of the terminal action-shrink scale.")
+    p.add_argument("--parent-base-x", type=float, default=0.55,
+                   help="parent (guardian) base mount x (child base at origin). Reach band is "
+                        "~[0.14, 0.41] from the base, so blocks at x < base-0.41 are unreachable "
+                        "-- distance trades collision-free margin against block coverage.")
+    p.add_argument("--parent-rate", type=float, default=0.0,
+                   help="rate-limit the scripted guardian's joint targets (rad/substep); 0 = off "
+                        "(keyframe jumps at full servo speed). ~0.02 = slow, gentle sweeps.")
     p.add_argument("--goal-churn-void", action="store_true",
                    help="arrival accounting counts only CHURN-FREE goal windows: windows where the "
                         "PARENT arm touched an object (goal photo depicts a world that no longer "
