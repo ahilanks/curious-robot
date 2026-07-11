@@ -2061,7 +2061,13 @@ def main(args):
             motion += info["object_motion"]
             if "parent_object_contacts" in info:
                 parent_contacts += info["parent_object_contacts"].astype(np.float32)
-                if args.goal_churn_void:              # parent-attributed only: the child's own touches are not churn
+            if args.goal_churn_void:
+                # ANY object contact spoils the window as a MEASUREMENT (the goal photo's scene no
+                # longer exists -- latent floor 10-20 units regardless of who moved the block); the
+                # window still counts fully as EXPERIENCE. v1 voided parent contacts only and clean
+                # arrival stalled at ~0.75: the child's own bulldozing spoils its goals just the same.
+                churned |= info["object_contacts"] > 0
+                if "parent_object_contacts" in info:
                     churned |= info["parent_object_contacts"] > 0
             tau, qd = info["applied_torque"], info["qvel"]
             energy += np.abs(tau * qd).mean(-1)
