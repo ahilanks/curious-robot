@@ -2486,7 +2486,7 @@ def parse_args():
                         "inproc: envs in this process (sequential or --env-threads); "
                         "hardware: one physical SO-ARM101 via env/hardware_env.py (forces n_envs=1)")
     p.add_argument("--frame-skip", type=int, default=6)
-    p.add_argument("--parent-vla", default="", choices=["", "smolvla", "scripted"],
+    p.add_argument("--parent-vla", default="", choices=["", "smolvla", "scripted", "herd"],
                    help="enable the SECOND (parent) SO-101 and drive it: 'smolvla' = lerobot SmolVLA "
                         "with gaze-aware instructions (moves blocks where the CHILD's wrist cam looks), "
                         "'scripted' = privileged keyframe sweeps (same orchestration, no GPU). The child's "
