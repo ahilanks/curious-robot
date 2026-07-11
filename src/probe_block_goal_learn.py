@@ -20,7 +20,23 @@ from types import SimpleNamespace
 from env.mujoco_env import MujocoSO101Env
 from src.train import encode_obs
 from src.eval_goal_photo import build_wm, act_stack
-from src.probe_planner_visibility import save_state, restore_state
+
+
+# inlined (NOT imported from probe_planner_visibility: that module runs its argparse
+# and its entire probe at import time)
+def save_state(env):
+    return dict(qpos=env.data.qpos.copy(), qvel=env.data.qvel.copy(),
+                ctrl=env.data.ctrl.copy(), prev_ctrl=env._prev_ctrl.copy(),
+                prev_qvel=env._prev_qvel.copy(), prev_obj=env._prev_obj_xpos.copy())
+
+
+def restore_state(env, st):
+    env.data.qpos[:] = st["qpos"]; env.data.qvel[:] = st["qvel"]
+    env.data.ctrl[:] = st["ctrl"]
+    env._prev_ctrl = st["prev_ctrl"].copy()
+    env._prev_qvel = st["prev_qvel"].copy()
+    env._prev_obj_xpos = st["prev_obj"].copy()
+    mujoco.mj_forward(env.model, env.data)
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--ckpts", required=True, help="comma-separated label=path pairs")
@@ -56,24 +72,49 @@ def settle(n_dec=3):
 
 
 # ---------- stage scenes once (checkpoint-independent) ----------
+# VISIBILITY GUARD (2026-07-11): the wrist cam at the staged pose sees only part of the
+# table -- a shift that exits the frame photographs as "block vanished", which is
+# direction-less (5cm and 12.7cm +y shifts produced BITWISE-IDENTICAL goal photos).
+# Per scene we try 4 shift directions and require the goal photo to differ BOTH from
+# the control photo (block visibly moved) AND from a block-removed photo (the TARGET
+# position itself is in frame).
 scenes = []
-for s in range(args.scenes):
+attempt = 0
+while len(scenes) < args.scenes and attempt < args.scenes * 4:
+    attempt += 1
     env.reset()
     teleport([0.25, 0.0])
     settle()
     obs = env._get_obs()
     snap = save_state(env)
     b0 = env.data.xpos[env._object_body_ids[0]][:2].copy()
-    b_goal = b0 + np.array([0.0, args.shift])
-    # goal photo: SAME arm pose, block shifted
-    teleport(b_goal)
-    goal_px = env._get_obs()["image"].copy()
-    restore_state(env, snap)
-    # control photo: same state, no shift
     ctrl_px = obs["image"].copy()
+    teleport([2.0, 2.0])                                  # block far off-table = removed
+    removed_px = env._get_obs()["image"].copy()
+    restore_state(env, snap)
+    chosen = None
+    for dxy in ([args.shift, 0], [-args.shift, 0], [0, args.shift], [0, -args.shift]):
+        b_goal = b0 + np.asarray(dxy)
+        if np.linalg.norm(b_goal) < 0.18 or np.linalg.norm(b_goal) > 0.36:
+            continue                                      # keep the target in the child's reach band
+        teleport(b_goal)
+        gpx = env._get_obs()["image"].copy()
+        restore_state(env, snap)
+        moved_px = int((gpx != ctrl_px).any(-1).sum())
+        target_visible = int((gpx != removed_px).any(-1).sum())
+        if moved_px > 300 and target_visible > 300:
+            chosen = (b_goal, gpx, moved_px, target_visible)
+            break
+    if chosen is None:
+        print(f"[stage] attempt {attempt}: no in-frame shift direction; rerolling scene", flush=True)
+        continue
+    b_goal, goal_px, mp, tv = chosen
     scenes.append(dict(snap=snap, b0=b0, b_goal=b_goal, goal_px=goal_px, ctrl_px=ctrl_px,
                        prop=obs["proprio"].copy()))
-    print(f"[scene {s}] block0 ({b0[0]:+.3f},{b0[1]:+.3f}) -> goal ({b_goal[0]:+.3f},{b_goal[1]:+.3f})", flush=True)
+    np.savez_compressed(os.path.join(args.out, f"scene_{len(scenes)-1}.npz"),
+                        goal_px=goal_px, ctrl_px=ctrl_px)
+    print(f"[scene {len(scenes)-1}] block0 ({b0[0]:+.3f},{b0[1]:+.3f}) -> goal ({b_goal[0]:+.3f},{b_goal[1]:+.3f})  "
+          f"moved_px {mp} target_px {tv}", flush=True)
 
 results = {}
 for label, path in ckpts:
