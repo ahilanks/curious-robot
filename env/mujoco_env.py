@@ -231,9 +231,15 @@ class MujocoSO101Env:
         self.data.ctrl[self._parent_act_ids] = np.clip(
             q_rad, self._parent_ctrl_low, self._parent_ctrl_high)
 
+    # TUCKED rest pose (2026-07-11, user request): all-zeros is an arm extended
+    # horizontally over the table centre -- at reset it physically PRESSES on the
+    # child's reset pose (27 contact points measured). The tuck folds the arm over
+    # its own base (max extent 0.18 m, zero contacts; empirically scanned, pose U2).
+    PARENT_TUCK = np.array([0.0, -1.5, 1.5, 0.0, 0.0, 0.3])
+
     def parent_home(self) -> None:
-        self.data.qpos[self._parent_qpos_adr] = 0.0
-        self.data.ctrl[self._parent_act_ids] = 0.0
+        self.data.qpos[self._parent_qpos_adr] = self.PARENT_TUCK
+        self.data.ctrl[self._parent_act_ids] = self.PARENT_TUCK
 
     def render_parent_view(self) -> np.ndarray:
         """256x256 RGB from the fixed parent_view camera (the parent VLA's scene camera)."""
