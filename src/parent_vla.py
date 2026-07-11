@@ -245,7 +245,7 @@ class ParentFleet:
             log(f"[parent] SmolVLA fleet driver up ({n_envs} envs, radian-native)", flush=True)
         else:
             self.policy = None
-            log(f"[parent] scripted fleet driver up ({n_envs} envs)", flush=True)
+            log(f"[parent] {mode} fleet driver up ({n_envs} envs)", flush=True)
 
     def _instructions_from(self, ctxs, ids):
         for i in ids:
@@ -323,15 +323,96 @@ class ParentFleet:
             self._scripted_t[i] += 50
             self.queues[i].extend(steps)
 
+    # HERD mode (2026-07-11, emergence program): instead of re-novelizing blocks in
+    # place, the parent SHEPHERDS out-of-reach blocks toward the child's reachable
+    # annulus (child fingertip band r~0.21-0.33 at table level, measured in
+    # smoke_child_sweep). Environment design only -- the child is never scripted.
+    # Mechanism: the VERIFIED fleet sweep cycle, byte-identical keyframes, with only
+    # (a) target selection (out-of-child-reach blocks instead of gaze) and (b) sweep
+    # DIRECTION chosen so the arc carries the block toward the inter-robot axis --
+    # blocks at parent-r 0.29-0.41 land on-axis at child-r ~0.21-0.33, inside the
+    # annulus. Radial deep pushes were tried and rejected: extension into a block
+    # pins the arm (contact wedge, unrecoverable within a cycle). Near-axis blocks
+    # (|parent bearing| < 0.15) are excluded -- a through-sweep would carry them
+    # OFF-axis. Envs with no herd candidate fall back to the standard gaze sweep.
+    CHILD_R_MAX = 0.33
+
+    def _instructions_herd(self, ctxs, ids):
+        self._herd_dir = getattr(self, "_herd_dir", [0.0] * self.n)
+        fallback = []
+        for i in ids:
+            base = ctxs[i].get("parent_base_xy", np.array([0.55, 0.0]))
+            bxy = ctxs[i]["block_xy"]
+            cand = []
+            for b in range(len(bxy)):
+                r_child = float(np.linalg.norm(bxy[b]))
+                rel = bxy[b] - base
+                r_par = float(np.linalg.norm(rel))
+                bearing = float(np.arctan2(-rel[1], -rel[0]))   # parent faces -x
+                if r_child > self.CHILD_R_MAX and 0.14 <= r_par <= 0.41 and abs(bearing) >= 0.15:
+                    lands_in = 0.29 <= r_par <= 0.41            # arc endpoint ~ child annulus
+                    cand.append((not lands_in, r_child, b, bearing))
+            if cand:
+                _, _, bidx, bearing = min(cand)
+                self.instr[i] = f"push the {color_word(ctxs[i]['block_rgba'][bidx])} cube toward the other robot"
+                self._scripted_aim[i] = (bidx, +1.0)
+                self._herd_dir[i] = -np.sign(bearing)           # sweep toward the axis
+            else:
+                self._herd_dir[i] = 0.0
+                fallback.append(i)
+        if fallback:
+            self._instructions_from(ctxs, fallback)             # nothing to herd: re-novelize
+
+    def _refill_herd(self, ctxs, ids):
+        """The DEMO driver's radius-adaptive hover-descend-sweep-lift cycle (verified
+        contacts at every r 0.14-0.41), with the sweep direction from _instructions_herd
+        so the arc carries the block toward the axis. The fleet's fixed-depth pose was
+        tried first and misses targets off its band (hit-or-miss across layouts)."""
+        T = 90
+        SW = np.deg2rad(22.0)
+        sweep_ids = [i for i in ids if getattr(self, "_herd_dir", [0.0] * self.n)[i] == 0.0]
+        if sweep_ids:
+            self._refill_scripted(ctxs, sweep_ids)
+        for i in ids:
+            if i in sweep_ids:
+                continue
+            aim = self._scripted_aim[i]
+            base = ctxs[i].get("parent_base_xy", np.array([0.55, 0.0]))
+            rel = ctxs[i]["block_xy"][aim[0]] - base
+            r = float(np.linalg.norm(rel))
+            center = float(np.clip(np.arctan2(-rel[1], -rel[0]), -0.6, 0.6))
+            f = np.clip((r - 0.16) / 0.14, 0.0, 1.4)
+            lift, elbow, wrist = -0.75 - 0.30 * f, 1.15 + 0.30 * f, 0.5
+            d = self._herd_dir[i]
+            steps = []
+            for t in range(50):
+                ph = ((self._scripted_t[i] + t) % T) / T
+                if ph < 0.25:                            # hover above, panned to arc start
+                    q = [center - d * SW, lift + 0.35, elbow - 0.2, wrist, 0.0, 0.5]
+                elif ph < 0.45:                          # descend to contact depth
+                    q = [center - d * SW, lift, elbow, wrist, 0.0, 0.3]
+                elif ph < 0.75:                          # sweep THROUGH the block toward the axis
+                    s = (ph - 0.45) / 0.30
+                    q = [center + d * SW * (2 * s - 1), lift, elbow, wrist, 0.0, 0.3]
+                else:                                    # lift + return
+                    q = [center + d * SW, lift + 0.35, elbow - 0.25, wrist, 0.0, 0.5]
+                steps.append(np.asarray(q))
+            self._scripted_t[i] += 50
+            self.queues[i].extend(steps)
+
     def next_blocks(self, env, action_block: int) -> np.ndarray:
         low = [i for i in range(self.n) if len(self.queues[i]) < action_block]
         if low:
             ctxs = env.parent_context()                  # one worker round-trip for the fleet
-            self._instructions_from(ctxs, low)
-            if self.mode == "smolvla":
-                self._refill_smolvla(ctxs, low)
+            if self.mode == "herd":
+                self._instructions_herd(ctxs, low)
+                self._refill_herd(ctxs, low)
             else:
-                self._refill_scripted(ctxs, low)
+                self._instructions_from(ctxs, low)
+                if self.mode == "smolvla":
+                    self._refill_smolvla(ctxs, low)
+                else:
+                    self._refill_scripted(ctxs, low)
         out = np.zeros((self.n, action_block, 6))
         for i in range(self.n):
             for k in range(action_block):
