@@ -414,17 +414,29 @@ class ReplayBuffer:
                          (the surprise signal SAC's PER uses -> trains the WM where it is
                          worst, i.e. the goal regions).
           'recency'   -- P decays exponentially with how long ago the window was collected
-                         (half-life = 25% of the env's fill), favouring fresh data."""
-        starts = []
+                         (half-life = 25% of the env's fill), favouring fresh data.
+        Cross-stream allocation is LENGTH-PROPORTIONAL and the pooled candidates are
+        SHUFFLED before truncating to `batch` (2026-07-11 fix: the old code filled the
+        batch in stream order and stopped, so with many streams every batch came from
+        the first few -- content-neutral for the online trainer's identical rings, but
+        it silently trained offline consolidation on ONLY the first streams of a mixed
+        buffer). For equal-length rings this reduces to the old per-stream allocation."""
+        stream_meta = []
         for e in range(self.n_envs):
             n = int(self.count[e])
             if n < T + 1:
                 continue
             if n < self.C:
-                lo, hi, head = 0, n - T, -1            # linear region, no wrap
+                stream_meta.append((e, n - T, -1, n))  # linear region, no wrap
             else:
-                lo, hi, head = 0, self.C - T, int(self.head[e])
-            ndraw = 8 * batch // max(self.n_envs, 1) + 4
+                stream_meta.append((e, self.C - T, int(self.head[e]), n))
+        if not stream_meta:
+            return None
+        total_starts = sum(hi + 1 for _, hi, _, _ in stream_meta)
+        starts = []
+        for e, hi, head, n in stream_meta:
+            lo = 0
+            ndraw = int(np.ceil(8 * batch * (hi + 1) / total_starts)) + 4
             if mode == "uniform":
                 cands = np.random.randint(lo, hi + 1, size=ndraw)
             else:
@@ -443,12 +455,11 @@ class ReplayBuffer:
                 if self.is_start[e, s + 1:s + T].any():    # crosses an episode reset
                     continue
                 starts.append((e, s))
-                if len(starts) >= batch:
-                    break
-            if len(starts) >= batch:
-                break
         if len(starts) < max(batch // 4, 1):
             return None
+        if len(starts) > batch:
+            sel = np.random.permutation(len(starts))[:batch]
+            starts = [starts[i] for i in sel]
         e = np.array([p[0] for p in starts]); s = np.array([p[1] for p in starts])
         idx = s[:, None] + np.arange(T)[None, :]
         ee = e[:, None].repeat(T, 1)
