@@ -1499,6 +1499,11 @@ def main(args):
         goal_recent["arrival"] = deque(maxlen=16)
     goal_min_dist = np.full(args.n_envs, np.inf, np.float32)     # min ||z - z*|| since this goal spawned
     goal_mse_env = np.zeros(args.n_envs)                          # current goal's 1-step MSE at (re)selection time
+    # goal-side emergence levers (2026-07-11): churn-void arrival accounting + scene-delta goal channel
+    scene_goal = np.zeros(args.n_envs, bool)      # env pursues a pose-same/world-different goal (excluded from arrival)
+    scene_dist_env = np.zeros(args.n_envs, np.float32)
+    churned = np.zeros(args.n_envs, bool)         # parent touched an object during this env's goal window
+    arrival_valid_frac = 1.0
     hot_ring = deque(maxlen=max(args.goal_hot_window, 1))         # --goal-hot-retarget: fresh-surprise pool (per-step batches)
     hot_last = np.full(args.n_envs, -10**9)                       # --goal-hot-retarget: last retarget step per env
     # reachable-radius curriculum state: the CURRENT goal offset k (mutable). Pure goal-RANGE schedule --
@@ -1570,6 +1575,26 @@ def main(args):
                 for e in env_idx:
                     e = int(e)
                     dist = (z[e].unsqueeze(0) - z_cand).norm(dim=-1)       # (N,) ||z_cand - z_now||
+                    # SCENE-DELTA channel (--goal-scene-frac, 2026-07-11): with prob F pursue a candidate
+                    # whose ARM POSE matches the env's current pose but whose latent is BEYOND the budget d
+                    # -- "same pose, different block world" -- a goal reachable only by changing the scene.
+                    # The child's own experienced states only (same archive); windows are excluded from the
+                    # arrival series (see window close), so unreachably-hard scene goals cannot pin the
+                    # curriculum. This is the door to DELIBERATE block-moving without scripting anything.
+                    scene_goal[e] = False
+                    if args.goal_scene_frac > 0 and np.random.random() < args.goal_scene_frac:
+                        qd_c = np.abs(gprop[:, :n_dof] - cur_prop[e, :n_dof]).max(axis=1)   # (N,) inf-norm pose dist
+                        sm = torch.as_tensor(qd_c < args.goal_scene_qpos_eps, device=device) \
+                            & (dist >= curric_d[0])
+                        if bool(sm.any()):
+                            j = int(torch.where(sm, mse, torch.full_like(mse, -1e30)).argmax())
+                            goal_px_env[e] = gpx[j]
+                            goal_prop_env[e] = gprop[j]
+                            goal_mse_env[e] = float(mse[j])
+                            has_goal[e] = True
+                            scene_goal[e] = True
+                            scene_dist_env[e] = float(dist[j])
+                            continue
                     under = dist < curric_d[0]
                     n_under = int(under.sum())
                     if n_under > 0:
@@ -1835,9 +1860,22 @@ def main(args):
         if args.goal_explore:
             if step % args.goal_update_every == 0:
                 if step > 0 and has_goal.any():      # close out the ending goal windows: arrival = ever inside eps
-                    goal_recent["arrival"].append(
-                        float((goal_min_dist[has_goal] < reach_eps_now(step)).mean()))
+                    # --goal-churn-void / scene channel (2026-07-11): the curriculum's arrival series counts
+                    # only windows the child could actually win -- churned windows (the parent moved an object
+                    # mid-window, so the goal photo depicts a world that no longer exists: latent floor 10-20
+                    # units) and scene-channel windows (deliberately beyond-budget) are excluded. With both
+                    # flags off this reduces exactly to the old accounting.
+                    valid = has_goal.copy()
+                    if args.goal_churn_void:
+                        valid &= ~churned
+                    if args.goal_scene_frac > 0:
+                        valid &= ~scene_goal
+                    arrival_valid_frac = float(valid.sum()) / max(float(has_goal.sum()), 1.0)
+                    if valid.any():
+                        goal_recent["arrival"].append(
+                            float((goal_min_dist[valid] < reach_eps_now(step)).mean()))
                 goal_min_dist[:] = np.inf
+                churned[:] = False
                 refresh_goals(np.arange(args.n_envs))
             with torch.no_grad():
                 if has_goal.any():
@@ -2023,6 +2061,8 @@ def main(args):
             motion += info["object_motion"]
             if "parent_object_contacts" in info:
                 parent_contacts += info["parent_object_contacts"].astype(np.float32)
+                if args.goal_churn_void:              # parent-attributed only: the child's own touches are not churn
+                    churned |= info["parent_object_contacts"] > 0
             tau, qd = info["applied_torque"], info["qvel"]
             energy += np.abs(tau * qd).mean(-1)
             qd_mean += np.abs(qd).mean(-1)
@@ -2304,6 +2344,12 @@ def main(args):
                     d["goal/reach_rate"] = float(np.mean(goal_recent["reach"]))
                 if goal_recent["arrival"]:
                     d["goal/arrival_rate"] = float(np.mean(goal_recent["arrival"]))
+                if args.goal_churn_void:
+                    d["goal/arrival_valid_frac"] = arrival_valid_frac
+                if args.goal_scene_frac > 0:
+                    d["goal/scene_active"] = float(scene_goal[has_goal].mean()) if has_goal.any() else 0.0
+                    if (scene_goal & has_goal).any():
+                        d["goal/scene_dist"] = float(np.mean(scene_dist_env[scene_goal & has_goal]))
                 if args.goal_hot_retarget > 0 and recent["hot_retargets"]:
                     # per-env per-step retarget probability; x n_envs x update_every ~= retargets/window
                     d["goal/hot_retarget_rate"] = float(np.mean(recent["hot_retargets"]))
@@ -2915,6 +2961,22 @@ def parse_args():
                         "eps ball instead of stepping over it (step_jump ~6 > ball width 4). 0 = off; spec value 3.0.")
     p.add_argument("--dwell-shrink-min", type=float, default=0.2,
                    help="floor of the terminal action-shrink scale.")
+    p.add_argument("--goal-churn-void", action="store_true",
+                   help="arrival accounting counts only CHURN-FREE goal windows: windows where the "
+                        "PARENT arm touched an object (goal photo depicts a world that no longer "
+                        "exists; latent floor 10-20 units) are excluded from the curriculum's arrival "
+                        "series. Unpins curric_d under an active guardian (em arms: d sat at 8 for "
+                        "52k steps at arrival ~0.8 < the 0.95 bar). Child-attributed contacts are "
+                        "NOT churn. Off = byte-identical accounting.")
+    p.add_argument("--goal-scene-frac", type=float, default=0.0,
+                   help="probability per goal (re)selection of drawing from the SCENE-DELTA channel: "
+                        "a candidate whose stored arm pose matches the env's current pose "
+                        "(< --goal-scene-qpos-eps inf-norm) but whose latent sits BEYOND curric_d -- "
+                        "'same pose, different block world', reachable only by changing the scene. "
+                        "Highest-MSE such candidate wins; the window is excluded from arrival "
+                        "accounting so unreachably-hard scene goals cannot pin the curriculum.")
+    p.add_argument("--goal-scene-qpos-eps", type=float, default=0.35,
+                   help="scene-channel pose-match tolerance (rad, inf-norm over the 6 joints)")
     p.add_argument("--goal-hot-retarget", type=float, default=0.0,
                    help="highmse_under_d: mid-window retargeting to FRESH surprise. When a state "
                         "collected in the last --goal-hot-window steps (any env) has 1-step WM MSE > "
