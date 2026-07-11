@@ -35,6 +35,7 @@ from src.smoke_child_sweep import ChildPlow, teleport_front
 ap = argparse.ArgumentParser()
 ap.add_argument("--ckpts", required=True, help="comma-separated label=path pairs")
 ap.add_argument("--scenes", type=int, default=6)
+ap.add_argument("--horizon", type=int, default=1, help="plan/score h-decision sequences (deployment: 1)")
 ap.add_argument("--seed", type=int, default=21)
 ap.add_argument("--out", default="runs/probe_planner_vis")
 args = ap.parse_args()
@@ -98,7 +99,20 @@ while len(scenes) < args.scenes and attempt < args.scenes * 3:
         act30 = np.concatenate(subs)
         disp = float(np.linalg.norm(env.data.xpos[env._object_body_ids[0]][:2] - b_before))
         if dec >= Hb and ncon > 0 and disp > 0.002:
-            found = dict(snap=snap, contact_act=act30, goal_px=obs["image"].copy(),
+            seq = [act30]
+            for _ in range(args.horizon - 1):          # continue the plow h-1 more decisions
+                subs2 = []
+                for k in range(a.action_block):
+                    q_kf = plow.keyframe()
+                    qpos = env.data.qpos[:N_DOF].copy()
+                    sub = np.clip((q_kf - qpos) / a.action_max, -1, 1).astype(np.float32)
+                    subs2.append(sub)
+                    obs, info = env.step(sub, render=(k == a.action_block - 1))
+                    plow.observe(int(info["object_contacts"]))
+                    ncon += int(info["object_contacts"])
+                seq.append(np.concatenate(subs2))
+            disp = float(np.linalg.norm(env.data.xpos[env._object_body_ids[0]][:2] - b_before))
+            found = dict(snap=snap, contact_seq=np.stack(seq), goal_px=obs["image"].copy(),
                          goal_disp=disp, goal_ncon=ncon,
                          hist_px=[p.copy() for p in px_hist[-Hb:]],
                          hist_act=[q.copy() for q in (act_hist or [np.zeros(30, np.float32)])[-Hb:]],
@@ -113,17 +127,21 @@ while len(scenes) < args.scenes and attempt < args.scenes * 3:
         found["hist_px"].insert(0, found["hist_px"][0])
 
     # candidates: [true contact, pan-mirrored twin, zeros] + 200 CEM-style samples
-    mirror = found["contact_act"].reshape(a.action_block, N_DOF).copy()
-    mirror[:, 0] *= -1.0
-    cands = [found["contact_act"], mirror.reshape(-1), np.zeros(30, np.float32)]
-    cands += list(rng.normal(0.0, a.cem_init_std, size=(200, 30)).astype(np.float32))
+    H = args.horizon
+    mirror = found["contact_seq"].reshape(H, a.action_block, N_DOF).copy()
+    mirror[:, :, 0] *= -1.0
+    cands = [found["contact_seq"], mirror.reshape(H, 30), np.zeros((H, 30), np.float32)]
+    cands += list(rng.normal(0.0, a.cem_init_std, size=(200, H, 30)).astype(np.float32))
     cands = np.stack(cands)
 
     # execute every candidate from s*, record REAL outcome (checkpoint-independent)
     post_px, post_con, post_bxy = [], [], []
     for ci, c in enumerate(cands):
         restore_state(env, found["snap"])
-        obs, ncon = exec_decision(env, c)
+        ncon = 0
+        for step_act in c:
+            obs, nc = exec_decision(env, step_act)
+            ncon += nc
         b_after = env.data.xpos[env._object_body_ids[0]][:2].copy()
         post_px.append(obs["image"].copy()); post_con.append(ncon); post_bxy.append(b_after)
     # candidate 0 IS the goal generator: its post block xy is the goal block position
@@ -165,15 +183,18 @@ for label, path in ckpts:
         z_hist = encode(wm, sc["hist_px"])                                  # (Hb, D)
         zg = encode(wm, [sc["goal_px"]])[0]                                 # (D,)
         z_post = encode(wm, list(sc["post_px"]))                            # (C, D)
-        acts = torch.as_tensor(sc["cands"], device=device).float()          # (C, 30)
+        acts = torch.as_tensor(sc["cands"], device=device).float()          # (C, H, 30)
         C = acts.shape[0]
         hist_a = torch.as_tensor(np.stack(sc["hist_act"]), device=device).float()  # (Hb, 30)
-        # one-step prediction for every candidate, exactly cem_plan's inner step
-        z0 = z_hist.unsqueeze(0).expand(C, Hb, -1)
-        a_seq = torch.cat([hist_a.unsqueeze(0).expand(C, Hb, -1), acts.unsqueeze(1)], 1)
+        # h-step autoregressive rollout for every candidate, exactly cem_plan's inner loop
+        z_seq = z_hist.unsqueeze(0).expand(C, Hb, -1)
+        a_seq = hist_a.unsqueeze(0).expand(C, Hb, -1)
         with torch.no_grad():
-            znext = wm.predict(z0[:, -Hb:], wm.action_encoder(a_seq[:, -Hb:]))[:, -1]
-        pred_cost = (znext - zg).pow(2).sum(-1).cpu().numpy()
+            for h in range(acts.shape[1]):
+                a_seq = torch.cat([a_seq, acts[:, h:h + 1]], dim=1)
+                znext = wm.predict(z_seq[:, -Hb:], wm.action_encoder(a_seq[:, -Hb:]))[:, -1:]
+                z_seq = torch.cat([z_seq, znext], dim=1)
+        pred_cost = (znext[:, -1] - zg).pow(2).sum(-1).cpu().numpy()
         real_cost = (z_post - zg).pow(2).sum(-1).cpu().numpy()
         rank_pred = int((pred_cost < pred_cost[0]).sum())                   # 0 = best
         rank_real = int((real_cost < real_cost[0]).sum())
@@ -182,14 +203,17 @@ for label, path in ckpts:
         # behavioral: the real planner
         plan = cem_plan(wm, z_hist.unsqueeze(1), hist_a.unsqueeze(1), zg.unsqueeze(0),
                         K=a.cem_samples, iters=a.cem_iters, elite=a.cem_elites,
-                        init_std=a.cem_init_std, horizon=1, device=device,
+                        init_std=a.cem_init_std, horizon=args.horizon, device=device,
                         gamma=a.cem_gamma, mppi_temp=a.cem_mppi_temp,
                         early_stop_tol=a.cem_early_stop,
                         early_stop_min_iters=a.cem_early_stop_min_iters)
         # snapshot carries the FULL qpos/qvel (arm + every block), so restoring onto
         # env2's fresh reset reproduces the staged scene exactly
         env2.reset(); restore_state(env2, sc["snap"])
-        _, plan_ncon = exec_decision(env2, plan[0, 0].float().cpu().numpy())
+        plan_ncon = 0
+        for h in range(plan.shape[1]):
+            _, nc = exec_decision(env2, plan[0, h].float().cpu().numpy())
+            plan_ncon += nc
         b_after = env2.data.xpos[env2._object_body_ids[0]][:2].copy()
         # directional: did the plan move the block TOWARD its goal position?
         gap0 = float(np.linalg.norm(sc["b_star"] - sc["b_goal"]))
