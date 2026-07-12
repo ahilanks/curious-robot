@@ -18,6 +18,8 @@ currently watches -- the "parent plays where the child looks" contract of the se
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 
@@ -245,10 +247,39 @@ class ParentFleet:
             self.cam_keys = [k for k in self.policy.config.input_features if "image" in k]
             self._tok = self.policy.model.vlm_with_expert.processor.tokenizer
             self._max_len = int(getattr(self.policy.config, "tokenizer_max_length", 48))
+            # lerobot 0.4.x keeps normalization OUTSIDE the policy (processor pipelines
+            # saved next to the weights) -- predict_action_chunk is raw-space. For a local
+            # finetuned checkpoint, mirror its pipeline here: MEAN_STD state norm + action
+            # unnorm + the "\n" task suffix smolvla_new_line_processor applied in training.
+            # Hub smolvla_base has no local stats files -> unchanged zero-shot behavior.
+            self._norm, self._task_suffix = None, ""
+            pre_f = os.path.join(model_id, "policy_preprocessor_step_5_normalizer_processor.safetensors")
+            post_f = os.path.join(model_id, "policy_postprocessor_step_0_unnormalizer_processor.safetensors")
+            if os.path.isfile(pre_f) and os.path.isfile(post_f):
+                from safetensors.torch import load_file
+                pre_s, post_s, eps = load_file(pre_f), load_file(post_f), 1e-8
+                self._norm = {"s_mean": pre_s["observation.state.mean"].to(device),
+                              "s_std": pre_s["observation.state.std"].to(device) + eps,
+                              "a_mean": post_s["action.mean"].to(device),
+                              "a_std": post_s["action.std"].to(device) + eps}
+                self._task_suffix = "\n"
+                log("[parent] checkpoint MEAN_STD stats loaded (state norm + action unnorm + task newline)", flush=True)
             log(f"[parent] SmolVLA fleet driver up ({n_envs} envs, radian-native, {model_id})", flush=True)
         else:
             self.policy = None
             log(f"[parent] {mode} fleet driver up ({n_envs} envs)", flush=True)
+
+    def reset_state(self):
+        """Clear per-episode state (action queues, slew reference, instructions, scripted
+        phase) — call at env.reset() in single-env EVAL loops so each episode starts like
+        the demo recorder's fresh fleet. The training fleet persists state by design
+        (async per-env resets)."""
+        from collections import deque
+        self.queues = [deque() for _ in range(self.n)]
+        self._last_q = [None] * self.n
+        self.instr = [""] * self.n
+        self._scripted_t[:] = 0
+        self._scripted_aim = [None] * self.n
 
     def _instructions_from(self, ctxs, ids):
         for i in ids:
@@ -281,16 +312,22 @@ class ParentFleet:
         imgs2 = torch.stack([torch.as_tensor(ctxs[i]["overhead"]).permute(2, 0, 1)
                              for i in ids]).to(self.device).float() / 255.0
         state = torch.stack([torch.as_tensor(ctxs[i]["parent_qpos"]) for i in ids]).to(self.device)
-        enc = self._tok([self.instr[i] for i in ids], max_length=self._max_len,
+        if self._norm is not None:
+            state = (state - self._norm["s_mean"]) / self._norm["s_std"]
+        txts = [self.instr[i] + self._task_suffix for i in ids]
+        enc = self._tok(txts, max_length=self._max_len,
                         truncation=True, padding="max_length", return_tensors="pt")
         batch = {"observation.state": state,
-                 "task": [self.instr[i] for i in ids],
+                 "task": txts,
                  "observation.language.tokens": enc["input_ids"].to(self.device),
                  "observation.language.attention_mask": enc["attention_mask"].to(self.device, dtype=torch.bool)}
         zeros = torch.zeros_like(imgs1)
         for k, key in enumerate(self.cam_keys):
             batch[key] = (imgs1, imgs2, zeros)[min(k, 2)]
-        chunks = self.policy.predict_action_chunk(batch).float().cpu().numpy()  # (B, 50, 6) rad
+        chunks = self.policy.predict_action_chunk(batch).float()          # (B, 50, 6)
+        if self._norm is not None:                                        # normalized units -> rad
+            chunks = chunks * self._norm["a_std"] + self._norm["a_mean"]
+        chunks = chunks.cpu().numpy()
         for j, i in enumerate(ids):
             self.queues[i].extend(chunks[j])
 
