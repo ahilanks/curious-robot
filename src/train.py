@@ -2463,7 +2463,13 @@ def main(args):
         if (args.save_state and args.save_state_every > 0 and step > 0
                 and step % args.save_state_every == 0):
             try:
-                save_state_snapshot(buf, out_dir, step)
+                # upload PERIODIC snapshots too (2026-07-12): previously only the run-END
+                # snapshot uploaded, so any run killed mid-flight lost its buffer forever
+                # (arr95_hot5b's chain buffer died with the container -- hot6 had to start
+                # fresh). The uploader is the same background single-worker thread.
+                save_state_snapshot(buf, out_dir, step,
+                                    repo_id=args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
+                                    run_name=run_name, upload=not args.no_hf)
             except OSError as e:
                 # transient network-volume EIO must not kill a multi-hour run (arr95_hot5 died
                 # at 50k on a MooseFS blip mid-15GB write). The previous state_latest.npz is
