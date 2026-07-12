@@ -1261,7 +1261,7 @@ def main(args):
     if args.parent_vla:                          # VLA/scripted parent arm ("adult") in every env:
         from src.parent_vla import ParentFleet   # moves blocks where the child looks. Lazy import --
         parent_fleet = ParentFleet(args.n_envs, mode=args.parent_vla,  # lerobot loads only when used.
-                                   rate=args.parent_rate)
+                                   rate=args.parent_rate, model_id=args.parent_model)
 
     wm = WorldModel(n_dof=n_dof, action_block=args.action_block,
                     history_size=H, dropout=args.wm_dropout,
@@ -2984,6 +2984,10 @@ def parse_args():
     p.add_argument("--parent-rate", type=float, default=0.0,
                    help="rate-limit the scripted guardian's joint targets (rad/substep); 0 = off "
                         "(keyframe jumps at full servo speed). ~0.02 = slow, gentle sweeps.")
+    p.add_argument("--parent-model", default="lerobot/smolvla_base",
+                   help="SmolVLA policy for --parent-vla smolvla: hub id or local pretrained_model dir "
+                        "(a finetuned checkpoint dir also carries its MEAN_STD stats + task-newline, "
+                        "auto-applied by ParentFleet).")
     p.add_argument("--goal-churn-void", action="store_true",
                    help="arrival accounting counts only CHURN-FREE goal windows: windows where the "
                         "PARENT arm touched an object (goal photo depicts a world that no longer "
