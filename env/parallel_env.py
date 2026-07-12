@@ -51,7 +51,7 @@ class VectorMujocoEnv:
         safety_delta: float = 9.0,
         seed: int = 0,
         threads: int = 0,                # 0 = sequential
-        fixed_objects: bool = False,
+        fixed_objects: bool = True,
         parent_arm: bool = False,
         parent_pos: tuple = (0.55, 0.0, 0.02),
     ):
@@ -315,7 +315,7 @@ class SubprocVectorMujocoEnv:
                  encode_cam: str = "wrist", render_backend: str = "egl",
                  frame_skip: int = 6, action_max: float = 0.3,
                  safety_delta: float = 9.0, seed: int = 0, threads: int = 0,
-                 fixed_objects: bool = False, parent_arm: bool = False,
+                 fixed_objects: bool = True, parent_arm: bool = False,
                  parent_pos: tuple = (0.55, 0.0, 0.02)):
         self.n_envs = n_envs                           # `threads` taken for API parity
         self.wrist_resolution = wrist_resolution
