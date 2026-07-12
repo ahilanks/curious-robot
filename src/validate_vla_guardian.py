@@ -42,9 +42,22 @@ class Wrap:
 
 
 fleet = ParentFleet(1, mode="smolvla", rate=args.rate, model_id=args.model_id)
+
+# settle-disp floor: blocks drift ~cm from spawn during the first steps of every episode
+# (measured 6.2 cm in the first gate run) — one parent-still episode calibrates it so
+# per-episode disp can be read net of settling.
+env.reset()
+_floor0 = {i: env.data.xpos[b][:2].copy() for i, b in enumerate(env._object_body_ids)}
+for _ in range(240):
+    env.step(np.zeros(n_dof, np.float32), render=False)
+settle_disp_cm = 100 * float(sum(np.linalg.norm(env.data.xpos[b][:2] - _floor0[i])
+                                 for i, b in enumerate(env._object_body_ids)))
+print(f"[calib] settle-disp floor (parent still): {settle_disp_cm:.1f} cm", flush=True)
+
 eps = []
 for ep in range(args.episodes):
     env.reset()
+    fleet.reset_state()                              # fresh per-episode state, like the recorder
     child_walk = ep % 2 == 1                         # half the episodes: child gently moving
     walk = np.zeros(n_dof, np.float32)
     block0 = {i: env.data.xpos[b][:2].copy() for i, b in enumerate(env._object_body_ids)}
@@ -72,12 +85,14 @@ for ep in range(args.episodes):
 
 env.close()
 mean_c = float(np.mean([e["contact_frac"] for e in eps]))
+mean_disp = float(np.mean([e["block_disp_cm"] for e in eps]))
 res = {"model_id": args.model_id, "episodes": args.episodes, "substeps": args.substeps,
        "rate": args.rate, "seed": args.seed,
        "mean_contact_frac": mean_c,
-       "mean_block_disp_cm": float(np.mean([e["block_disp_cm"] for e in eps])),
+       "mean_block_disp_cm": mean_disp, "settle_disp_cm": settle_disp_cm,
+       "mean_net_disp_cm": mean_disp - settle_disp_cm,
        "pass_bar_0.05": mean_c > 0.05, "eps": eps}
 json.dump(res, open(args.out, "w"), indent=2)
 print(f"RESULT mean contact/substep {mean_c:.3f} (bar 0.05, zero-shot 0.000) -> "
-      f"{'PASS' if mean_c > 0.05 else 'FAIL'} | mean disp {res['mean_block_disp_cm']:.1f} cm "
-      f"-> {args.out}", flush=True)
+      f"{'PASS' if mean_c > 0.05 else 'FAIL'} | net disp {res['mean_net_disp_cm']:.1f} cm "
+      f"(raw {mean_disp:.1f} - settle {settle_disp_cm:.1f}) -> {args.out}", flush=True)
