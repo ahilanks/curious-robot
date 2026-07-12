@@ -83,7 +83,7 @@ class MujocoSO101Env:
         respawn_z_padding: float = 0.001,
         table_drop_threshold: float = -0.10,
         seed: int = 0,
-        fixed_objects: bool = False,             # place objects deterministically (same layout EVERY env & reset)
+        fixed_objects: bool = True,             # place objects deterministically (same layout EVERY env & reset)
         parent_arm: bool = False,                # attach a second (parent) SO-101 across the table -- a VLA-driven
                                                  # "adult" that moves blocks in the child's view. Child action/obs/
                                                  # safety/contact semantics are UNCHANGED (child ids resolved

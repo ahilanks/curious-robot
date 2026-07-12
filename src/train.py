@@ -2553,11 +2553,12 @@ def parse_args():
                         "'scripted' = privileged keyframe sweeps (same orchestration, no GPU). The child's "
                         "action/obs/safety/contact semantics are unchanged; parent-block contacts are "
                         "logged separately as interact/parent_contacts_per_step. Empty (default) = off.")
-    p.add_argument("--fixed-objects", action="store_true",
-                   help="place all scene objects at an IDENTICAL deterministic layout for every env and "
-                        "every reset (constant-seed positions/sizes/colors/orientations, placed against a "
-                        "fixed arm pose). Collapses scene variance to just the arm -> a much easier "
-                        "(LeWM-cube-like) target for the encoder/WM. Sim only.")
+    p.add_argument("--fixed-objects", action=argparse.BooleanOptionalAction, default=True,
+                   help="DEFAULT ON (user directive 2026-07-12): all scene objects at an IDENTICAL "
+                        "deterministic layout for every env and every reset (constant-seed positions/"
+                        "sizes/colors/orientations). Collapses scene variance to just the arm and what "
+                        "the arms MOVE -- goal photos differ from reality only by displaced blocks. "
+                        "Use --no-fixed-objects for the legacy random re-roll world. Sim only.")
     p.add_argument("--render-backend", choices=("egl", "osmesa"), default="egl",
                    help="offscreen render backend for the CUDA-free subproc env workers. 'egl' (default) = "
                         "GPU offscreen render, ~0.3ms vs osmesa's ~35ms per 224^2 frame (~100x; overhead-cam "
