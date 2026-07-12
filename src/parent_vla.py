@@ -226,7 +226,8 @@ class ParentFleet:
     mode='scripted' runs the privileged keyframe sweep instead (no GPU), same queues."""
 
     def __init__(self, n_envs: int, mode: str = "smolvla", device: str = "cuda",
-                 refill_below: int = 5, rate: float = 0.0, log=print):
+                 refill_below: int = 5, rate: float = 0.0, log=print,
+                 model_id: str = "lerobot/smolvla_base"):
         from collections import deque
         self.n, self.mode, self.device = n_envs, mode, device
         self.refill_below = refill_below
@@ -240,11 +241,11 @@ class ParentFleet:
         self.parent_contact_rate = 0.0                   # for the trainer's metrics window
         if mode == "smolvla":
             from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-            self.policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base").to(device).eval()
+            self.policy = SmolVLAPolicy.from_pretrained(model_id).to(device).eval()
             self.cam_keys = [k for k in self.policy.config.input_features if "image" in k]
             self._tok = self.policy.model.vlm_with_expert.processor.tokenizer
             self._max_len = int(getattr(self.policy.config, "tokenizer_max_length", 48))
-            log(f"[parent] SmolVLA fleet driver up ({n_envs} envs, radian-native)", flush=True)
+            log(f"[parent] SmolVLA fleet driver up ({n_envs} envs, radian-native, {model_id})", flush=True)
         else:
             self.policy = None
             log(f"[parent] {mode} fleet driver up ({n_envs} envs)", flush=True)
