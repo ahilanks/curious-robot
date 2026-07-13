@@ -143,11 +143,14 @@ class MujocoSO101Env:
 
         self._wrist_cam_id = _name_lookup(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam")
         self._overhead_cam_id = _name_lookup(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "overhead")
-        if encode_cam not in ("wrist", "overhead"):
-            raise ValueError(f"encode_cam must be 'wrist' or 'overhead', got {encode_cam!r}")
-        # the camera the WM/encoder sees (rendered at wrist_resolution into obs["image"]); "overhead"
-        # swaps the egocentric wrist view for the fixed worldbody cam without any other plumbing change.
-        self._encode_cam_id = self._overhead_cam_id if encode_cam == "overhead" else self._wrist_cam_id
+        _encode_cams = {"wrist": self._wrist_cam_id, "overhead": self._overhead_cam_id,
+                        "overhead_close": _name_lookup(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "overhead_close")}
+        if encode_cam not in _encode_cams:
+            raise ValueError(f"encode_cam must be one of {tuple(_encode_cams)}, got {encode_cam!r}")
+        # the camera the WM/encoder sees (rendered at wrist_resolution into obs["image"]); "overhead" /
+        # "overhead_close" swap the egocentric wrist view for a fixed worldbody cam (overhead_close =
+        # closer top-down over the block zone -> block-shift-salient) with no other plumbing change.
+        self._encode_cam_id = _encode_cams[encode_cam]
         self.encode_cam = encode_cam
         # end-effector (gripper) body: world xyz -> the honest "is the arm roaming in space"
         # signal. Distal-wrist jitter pans the wrist cam without translating this; pose_step
