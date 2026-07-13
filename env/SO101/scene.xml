@@ -217,6 +217,10 @@
 
     <!-- Overhead camera (security-cam in corner of table, slightly above robot base, angled inward+down). -->
     <camera name="overhead" pos="0.85 0.85 0.40" xyaxes="-0.7071 0.7071 0  -0.198 -0.198 0.960" fovy="75"/>
+    <!-- Closer overhead ENCODER cam (#4 "topdown-tilt"): over the block zone ~(0.26,0), ~75deg down,
+         dist 0.50, fovy 45 -> block-shift-salient view for --wm-cam overhead_close (vs the distant
+         corner 'overhead' logging cam). New encoder lineage; wrist-trained frozen encoder can't transfer. -->
+    <camera name="overhead_close" pos="0.26 -0.1294 0.503" xyaxes="1 0 0  0 0.96593 0.25882" fovy="45"/>
   </worldbody>
 
   <actuator>

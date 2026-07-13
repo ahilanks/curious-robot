@@ -1233,9 +1233,9 @@ def main(args):
               f"rescore_every={args.goal_rescore_every} her_frac={args.her_frac} "
               f"lambda_reach={args.lambda_reach} action_max={args.action_max} "
               f"(deterministic, alpha=0, lambda_safe=0)", flush=True)
-    if args.wm_cam == "overhead":
-        print(f"[wm-cam] encoder/WM input = OVERHEAD (fixed third-person) camera, not the wrist cam "
-              f"(prototype: LeWM-style smoother latent for goal-reaching).", flush=True)
+    if args.wm_cam != "wrist":
+        print(f"[wm-cam] encoder/WM input = {args.wm_cam.upper()} (fixed third-person) camera, not the wrist "
+              f"cam (overhead_close = closer top-down over the block zone -> block-shift-salient latent).", flush=True)
     env_kwargs = dict(n_envs=args.n_envs, frame_skip=args.frame_skip,
                       action_max=args.action_max, encode_cam=args.wm_cam,
                       safety_delta=args.safety_delta, seed=args.seed,
@@ -2567,7 +2567,7 @@ def parse_args():
                         "enumerated, + a flock serialising the first eglInitialize across workers). 'osmesa' = "
                         "CPU offscreen fallback (no GPU / EGL unavailable). Subproc backend only (inproc "
                         "renders in the CUDA main proc -> osmesa).")
-    p.add_argument("--wm-cam", choices=("wrist", "overhead"), default="wrist",
+    p.add_argument("--wm-cam", choices=("wrist", "overhead", "overhead_close"), default="wrist",
                    help="which camera the encoder/WM sees (obs['image']). 'wrist' (default) = egocentric, "
                         "moves with the arm -> latent jumps ~a full random-pair distance per step (breaks "
                         "latent L2 planning). 'overhead' = fixed third-person worldbody cam (LeWM-style), a "
