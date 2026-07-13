@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git check-ignore *)"
+      "Bash(git check-ignore *)",
+      "Bash(git -C /workspace/curious-robot branch -a)",
+      "Bash(git -C /workspace/curious-robot status --short --branch)"
     ]
   }
 }

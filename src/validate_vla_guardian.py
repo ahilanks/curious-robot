@@ -27,7 +27,11 @@ ap.add_argument("--substeps", type=int, default=240, help="per episode (~8s at 3
 ap.add_argument("--rate", type=float, default=0.02)
 ap.add_argument("--seed", type=int, default=123)
 ap.add_argument("--out", default="runs/vla_guardian_validation.json")
+ap.add_argument("--save-video", default="", help="dir for per-episode overhead mp4s (empty = off)")
 args = ap.parse_args()
+if args.save_video:
+    import imageio
+    os.makedirs(args.save_video, exist_ok=True)
 
 env = MujocoSO101Env(frame_skip=6, action_max=0.05, encode_cam="wrist", safety_delta=15.0,
                      seed=args.seed, fixed_objects=True, parent_arm=True,
@@ -62,6 +66,7 @@ for ep in range(args.episodes):
     walk = np.zeros(n_dof, np.float32)
     block0 = {i: env.data.xpos[b][:2].copy() for i, b in enumerate(env._object_body_ids)}
     contact_steps, instrs, ti, tgt_block = 0, [], 0, None
+    frames = []
     for t in range(args.substeps):
         if t % 5 == 0:                               # fleet refills on the decision cadence
             tgt_block = fleet.next_blocks(Wrap(), 5)
@@ -76,6 +81,11 @@ for ep in range(args.episodes):
         else:
             _, info = env.step(np.zeros(n_dof, np.float32), render=False)
         contact_steps += int(info.get("parent_object_contacts", 0) > 0)
+        if args.save_video:
+            frames.append(env.render_overhead())
+    if args.save_video:
+        imageio.mimsave(os.path.join(args.save_video, f"ep_{ep:02d}.mp4"),
+                        frames, fps=30, codec="h264")
     disp_cm = 100 * float(sum(np.linalg.norm(env.data.xpos[b][:2] - block0[i])
                               for i, b in enumerate(env._object_body_ids)))
     eps.append({"contact_frac": contact_steps / args.substeps, "block_disp_cm": disp_cm,
