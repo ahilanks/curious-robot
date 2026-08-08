@@ -25,9 +25,16 @@ from src.eval_goal_photo import build_wm, act_stack
 # inlined (NOT imported from probe_planner_visibility: that module runs its argparse
 # and its entire probe at import time)
 def save_state(env):
+    # MODEL-level object state too: _place_object_safely (reset + respawns) rerolls
+    # cube geom_size/geom_rgba IN THE MODEL, which qpos snapshots don't carry — without
+    # this, every scene staged before the last renders with the wrong sizes/colors on
+    # restore, and d0_ctrl measures that mismatch instead of ~0 (2026-08-08 finding:
+    # only the last-staged scene had a faithful restore).
     return dict(qpos=env.data.qpos.copy(), qvel=env.data.qvel.copy(),
                 ctrl=env.data.ctrl.copy(), prev_ctrl=env._prev_ctrl.copy(),
-                prev_qvel=env._prev_qvel.copy(), prev_obj=env._prev_obj_xpos.copy())
+                prev_qvel=env._prev_qvel.copy(), prev_obj=env._prev_obj_xpos.copy(),
+                obj_size=env.model.geom_size[env._object_geom_ids].copy(),
+                obj_rgba=env.model.geom_rgba[env._object_geom_ids].copy())
 
 
 def restore_state(env, st):
@@ -36,6 +43,8 @@ def restore_state(env, st):
     env._prev_ctrl = st["prev_ctrl"].copy()
     env._prev_qvel = st["prev_qvel"].copy()
     env._prev_obj_xpos = st["prev_obj"].copy()
+    env.model.geom_size[env._object_geom_ids] = st["obj_size"]
+    env.model.geom_rgba[env._object_geom_ids] = st["obj_rgba"]
     mujoco.mj_forward(env.model, env.data)
 
 ap = argparse.ArgumentParser()
