@@ -87,9 +87,18 @@ def settle(n_dec=3):
 # Per scene we try 4 shift directions and require the goal photo to differ BOTH from
 # the control photo (block visibly moved) AND from a block-removed photo (the TARGET
 # position itself is in frame).
+# 2026-08-11: counts use a >10-LSB magnitude threshold, not `!=` -- moving one block
+# perturbs shadow-map/AA sampling GLOBALLY (~2k px of 1-5 LSB speckle per photo pair),
+# so the raw-inequality guard passed even fully out-of-frame shifts; the true cube
+# footprint is >30 LSB. b0_px (start-position visibility vs the removed photo) is
+# logged per scene as an interpretation diagnostic, NOT gated: from the home staging
+# pose the block's START can hide behind the arm while the TARGET is in frame.
+def _diff_px(a, b):
+    return int((np.abs(a.astype(np.int16) - b.astype(np.int16)).max(-1) > 10).sum())
+
 scenes = []
 attempt = 0
-while len(scenes) < args.scenes and attempt < args.scenes * 4:
+while len(scenes) < args.scenes and attempt < args.scenes * 8:
     attempt += 1
     env.reset()
     teleport([0.25, 0.0])
@@ -101,6 +110,7 @@ while len(scenes) < args.scenes and attempt < args.scenes * 4:
     teleport([2.0, 2.0])                                  # block far off-table = removed
     removed_px = env._get_obs()["image"].copy()
     restore_state(env, snap)
+    b0_px = _diff_px(ctrl_px, removed_px)
     chosen = None
     for dxy in ([args.shift, 0], [-args.shift, 0], [0, args.shift], [0, -args.shift]):
         b_goal = b0 + np.asarray(dxy)
@@ -109,8 +119,8 @@ while len(scenes) < args.scenes and attempt < args.scenes * 4:
         teleport(b_goal)
         gpx = env._get_obs()["image"].copy()
         restore_state(env, snap)
-        moved_px = int((gpx != ctrl_px).any(-1).sum())
-        target_visible = int((gpx != removed_px).any(-1).sum())
+        moved_px = _diff_px(gpx, ctrl_px)
+        target_visible = _diff_px(gpx, removed_px)
         if moved_px > 300 and target_visible > 300:
             chosen = (b_goal, gpx, moved_px, target_visible)
             break
@@ -119,11 +129,11 @@ while len(scenes) < args.scenes and attempt < args.scenes * 4:
         continue
     b_goal, goal_px, mp, tv = chosen
     scenes.append(dict(snap=snap, b0=b0, b_goal=b_goal, goal_px=goal_px, ctrl_px=ctrl_px,
-                       prop=obs["proprio"].copy()))
+                       prop=obs["proprio"].copy(), b0_px=b0_px))
     np.savez_compressed(os.path.join(args.out, f"scene_{len(scenes)-1}.npz"),
                         goal_px=goal_px, ctrl_px=ctrl_px)
     print(f"[scene {len(scenes)-1}] block0 ({b0[0]:+.3f},{b0[1]:+.3f}) -> goal ({b_goal[0]:+.3f},{b_goal[1]:+.3f})  "
-          f"moved_px {mp} target_px {tv}", flush=True)
+          f"moved_px {mp} target_px {tv} b0_px {b0_px}", flush=True)
 
 results = {}
 for label, path in ckpts:
@@ -162,6 +172,7 @@ for label, path in ckpts:
             row[cond] = dict(gap0=gap0, min_gap=min_gap, closure_mm=(gap0 - min_gap) * 1000,
                              contacts=ncon, d0=d0)
         row["deliberate_mm"] = row["shift"]["closure_mm"] - row["ctrl"]["closure_mm"]
+        row["b0_px"] = sc["b0_px"]
         rows.append(row)
         print(f"[{label} scene {si}] shift: closure {row['shift']['closure_mm']:+.1f}mm con {row['shift']['contacts']:3d} d0 {row['shift']['d0']:.1f} | "
               f"ctrl: closure {row['ctrl']['closure_mm']:+.1f}mm con {row['ctrl']['contacts']:3d} | "
