@@ -54,6 +54,9 @@ ap.add_argument("--budget", type=int, default=60)
 ap.add_argument("--shift", type=float, default=0.05, help="block goal displacement (m, tangential)")
 ap.add_argument("--seed", type=int, default=41)
 ap.add_argument("--out", default="runs/probe_block_goal")
+ap.add_argument("--horizon", type=int, default=0,
+                help="override the ckpt's cem_horizon at probe time (0 = use ckpt value); "
+                     "planner-mechanics A/B on a fixed head, training untouched")
 ap.add_argument("--stage-pose", choices=("home", "visible"), default="home",
                 help="'home' = reset pose (block start typically occluded on wrist); 'visible' = "
                      "rejection-sample servo-driven staging poses until the block START is in frame "
@@ -160,6 +163,8 @@ results = {}
 for label, path in ckpts:
     ck = torch.load(path, map_location="cpu", weights_only=False)
     wm, a = build_wm(ck, n_dof, device)
+    if args.horizon:
+        a.cem_horizon = args.horizon
     a_dim = n_dof * a.action_block
     H = a.history_size
     rows = []
