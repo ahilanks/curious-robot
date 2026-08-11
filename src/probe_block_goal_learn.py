@@ -54,6 +54,10 @@ ap.add_argument("--budget", type=int, default=60)
 ap.add_argument("--shift", type=float, default=0.05, help="block goal displacement (m, tangential)")
 ap.add_argument("--seed", type=int, default=41)
 ap.add_argument("--out", default="runs/probe_block_goal")
+ap.add_argument("--stage-pose", choices=("home", "visible"), default="home",
+                help="'home' = reset pose (block start typically occluded on wrist); 'visible' = "
+                     "rejection-sample servo-driven staging poses until the block START is in frame "
+                     "(b0_px > 300) as well as the shift target -- measurement-side only")
 args = ap.parse_args()
 os.makedirs(args.out, exist_ok=True)
 device = torch.device("cuda")
@@ -80,6 +84,16 @@ def settle(n_dec=3):
         env.step(np.zeros(n_dof, np.float32), render=False)
 
 
+def drive_to(q_target, n_dec=5):
+    # servo the arm to q_target through physics (target = clip(q + a*action_max, range)),
+    # recomputing the delta each decision -- no qpos teleport, so no interpenetration
+    for _ in range(n_dec):
+        q = env.data.qpos[:n_dof].copy()
+        a = np.clip((q_target - q) / a0.action_max, -1, 1)
+        for _ in range(a0.action_block):
+            env.step(a.astype(np.float32), render=False)
+
+
 # ---------- stage scenes once (checkpoint-independent) ----------
 # VISIBILITY GUARD (2026-07-11): the wrist cam at the staged pose sees only part of the
 # table -- a shift that exits the frame photographs as "block vanished", which is
@@ -98,9 +112,13 @@ def _diff_px(a, b):
 
 scenes = []
 attempt = 0
-while len(scenes) < args.scenes and attempt < args.scenes * 8:
+pose_rng = np.random.default_rng(args.seed)
+jnt_lo, jnt_hi = env.model.jnt_range[:n_dof, 0], env.model.jnt_range[:n_dof, 1]
+while len(scenes) < args.scenes and attempt < args.scenes * (8 if args.stage_pose == "home" else 40):
     attempt += 1
     env.reset()
+    if args.stage_pose == "visible":
+        drive_to(np.clip(pose_rng.normal(0.0, 0.45, n_dof), jnt_lo * 0.85, jnt_hi * 0.85))
     teleport([0.25, 0.0])
     settle()
     obs = env._get_obs()
@@ -111,6 +129,9 @@ while len(scenes) < args.scenes and attempt < args.scenes * 8:
     removed_px = env._get_obs()["image"].copy()
     restore_state(env, snap)
     b0_px = _diff_px(ctrl_px, removed_px)
+    if args.stage_pose == "visible" and b0_px <= 300:
+        print(f"[stage] attempt {attempt}: block start not in frame (b0_px {b0_px}); rerolling", flush=True)
+        continue
     chosen = None
     for dxy in ([args.shift, 0], [-args.shift, 0], [0, args.shift], [0, -args.shift]):
         b_goal = b0 + np.asarray(dxy)
