@@ -1661,6 +1661,13 @@ def main(args):
     prev_qpos_dec = None                                      # last decision's final joint pose (for pose_step travel)
     recent_qpos = deque(maxlen=200)                           # rolling final-pose history -> pose_spread / pose_range
     step_jump_recent = deque(maxlen=400)                      # per-step ||z_t - z_{t+1}|| -> latent temporal locality
+    # --amax-curric: locality-gated amplitude state (fraction of action_max actually applied)
+    amax_frac = [min(1.0, args.amax_curric_start / args.action_max)] if args.amax_curric else [1.0]
+    amax_last_adj = [0]
+    if args.amax_curric:
+        print(f"[amax-curric] ON: start frac {amax_frac[0]:.4f} (eff amax {amax_frac[0]*args.action_max:.3f}), "
+              f"raise while frac_rand<={args.amax_curric_thresh}, lower above "
+              f"{args.amax_curric_thresh + args.amax_curric_band}, x{args.amax_curric_rate}/{args.amax_curric_every} steps", flush=True)
     frac_trig = {"last": 0, "n": 0}                           # --cotrain-frac-thresh trigger state (step of last fire, count)
     dwell_hold_recent = deque(maxlen=400)                     # --dwell-hold-mult: fraction of envs parked per decision
     recent = {k: deque(maxlen=400) for k in
@@ -2009,7 +2016,22 @@ def main(args):
                         held = hg & (gd < args.dwell_hold_mult * eps_now_d)
                         a = torch.where(held.unsqueeze(1), torch.zeros_like(a), a)
                         dwell_hold_recent.append(float(held.float().mean()))
-        if args.action_max_warmup_steps > 0:
+        if args.amax_curric:
+            # locality-gated amplitude: adjust the applied fraction against the LIVE windowed frac_rand
+            if (len(step_jump_recent) == step_jump_recent.maxlen
+                    and step - amax_last_adj[0] >= args.amax_curric_every):
+                fr_now = float(np.mean(step_jump_recent)) / (2 * z_dim) ** 0.5
+                old = amax_frac[0]
+                if fr_now <= args.amax_curric_thresh:
+                    amax_frac[0] = min(1.0, old * args.amax_curric_rate)
+                elif fr_now > args.amax_curric_thresh + args.amax_curric_band:
+                    amax_frac[0] = max(args.amax_curric_start / args.action_max, old / args.amax_curric_rate)
+                if amax_frac[0] != old:
+                    print(f"[amax-curric] step={step} frac_rand={fr_now:.3f} -> frac {old:.4f}->{amax_frac[0]:.4f} "
+                          f"(eff amax {amax_frac[0]*args.action_max:.3f})", flush=True)
+                amax_last_adj[0] = step
+            a = a * amax_frac[0]
+        elif args.action_max_warmup_steps > 0:
             if step < args.action_max_warmup_steps:
                 frac = args.action_max_start_frac + (args.action_max_end_frac - args.action_max_start_frac) \
                        * (step / args.action_max_warmup_steps)
@@ -2383,6 +2405,8 @@ def main(args):
                 d["encoder/step_jump_frac_rand"] = sj / (2 * z_dim) ** 0.5
             if args.cotrain_frac_thresh > 0:
                 d["cotrain/frac_triggers"] = frac_trig["n"]
+            if args.amax_curric:
+                d["explore/eff_action_max"] = amax_frac[0] * args.action_max
             if dwell_hold_recent:
                 d["goal/dwell_hold_frac"] = float(np.mean(dwell_hold_recent))
             for key in ("mse_block", "mse_table", "mse_none"):   # curiosity MSE by contact type
@@ -2612,6 +2636,23 @@ def parse_args():
                         "falls back to a warmup-rollout probe if unavailable")
     # action / actuation (README)
     p.add_argument("--action-block", type=int, default=5)
+    p.add_argument("--amax-curric", action="store_true",
+                   help="LOCALITY-GATED action-amplitude curriculum (2026-08-13, user-designed): start at "
+                        "--amax-curric-start effective amplitude and grow the action-scale fraction "
+                        "multiplicatively while the live windowed frac_rand (step_jump_recent on EXECUTED "
+                        "actions) stays below --amax-curric-thresh; back off above thresh+band. Amplitude is "
+                        "EARNED by prediction quality -- the map's resolution governs the stride. Overrides "
+                        "the time-based action_max_warmup schedule.")
+    p.add_argument("--amax-curric-start", type=float, default=0.05,
+                   help="initial EFFECTIVE amplitude (fraction seeds at start/action_max)")
+    p.add_argument("--amax-curric-thresh", type=float, default=0.2,
+                   help="raise amplitude while windowed frac_rand <= this")
+    p.add_argument("--amax-curric-band", type=float, default=0.05,
+                   help="hold band; lower amplitude when frac_rand > thresh+band")
+    p.add_argument("--amax-curric-rate", type=float, default=1.15,
+                   help="multiplicative fraction step per adjustment")
+    p.add_argument("--amax-curric-every", type=int, default=400,
+                   help="steps between adjustments (matches the frac_rand window)")
     p.add_argument("--action-max", type=float, default=0.3,
                    help="README dq^max: rad of joint delta per unit tanh action")
     # world model (README; the '?' values below are sweepable, not pinned in README)
