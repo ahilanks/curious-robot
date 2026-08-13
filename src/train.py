@@ -1684,6 +1684,8 @@ def main(args):
     video_on = imageio is not None and args.video_every > 0
     wrist_buf = deque(maxlen=args.video_steps)      # train-video clips (per-env frames, tiled)
     over_buf = deque(maxlen=args.video_steps)
+    goal_buf = deque(maxlen=args.video_steps)       # per-env CURRENT goal photo, tiled like train/wrist
+                                                    # (frame changes exactly when that env's goal refreshes)
     probe_px = probe_prop = None                    # fixed diverse probe set for encoder/eff_rank_probe
     probe_buf = []                                  # warmup-rollout fallback if the HF probe is unavailable
     if args.probe_size > 0:                         # prefer the canonical uniform-pose probe cached on HF
@@ -2306,6 +2308,9 @@ def main(args):
                 and step % args.video_every >= args.video_every - args.video_steps:
             wrist_buf.append(tile_frames(obs["image"]))
             over_buf.append(tile_frames(env.render_overhead()))
+            if args.goal_explore:                    # goal panel tile e = the photo env e is pursuing NOW
+                goal_buf.append(tile_frames(np.where(has_goal[:, None, None, None],
+                                                     goal_px_env, 0).astype(np.uint8)))
 
         # --- logging ---
         if step % args.log_every == 0:
@@ -2504,7 +2509,7 @@ def main(args):
         # --- train videos: save the buffered wrist + overhead clips (every video_every) ---
         if video_on and step > 0 and step % args.video_every == 0:
             roll_dir = out_dir / "rollouts"; roll_dir.mkdir(exist_ok=True)
-            for tag, frames in (("wrist", wrist_buf), ("overhead", over_buf)):
+            for tag, frames in (("wrist", wrist_buf), ("overhead", over_buf), ("goal", goal_buf)):
                 if not frames:
                     continue
                 vp = roll_dir / f"train_{tag}_{step:07d}.mp4"
@@ -2515,7 +2520,7 @@ def main(args):
                         vp.unlink(missing_ok=True)   # in W&B now; keep local disk clean
                 except Exception as ex:
                     print(f"[video] {tag} failed (non-fatal): {ex}", flush=True)
-            wrist_buf.clear(); over_buf.clear()
+            wrist_buf.clear(); over_buf.clear(); goal_buf.clear()
 
     # --- final: collected data (frozen / --save-buffer) and/or model checkpoint ---
     if args.frozen_policy or args.save_buffer:
