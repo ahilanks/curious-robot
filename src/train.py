@@ -1501,6 +1501,9 @@ def main(args):
         # inside eps during its window. One entry per goal cycle -> maxlen 16 ~= reach's 400-step window.
         goal_recent["arrival"] = deque(maxlen=16)
     goal_min_dist = np.full(args.n_envs, np.inf, np.float32)     # min ||z - z*|| since this goal spawned
+    goal_since_best = np.zeros(args.n_envs, np.int64)   # --goal-retain: steps since goal_min_dist improved
+    goal_age = np.zeros(args.n_envs, np.int64)          # --goal-retain: pursuit length of the current goal
+    goal_retain_n = {"arrive": 0, "stall": 0, "age": 0}  # cumulative switch reasons (logged)
     goal_mse_env = np.zeros(args.n_envs)                          # current goal's 1-step MSE at (re)selection time
     # goal-side emergence levers (2026-07-11): churn-void arrival accounting + scene-delta goal channel
     scene_goal = np.zeros(args.n_envs, bool)      # env pursues a pose-same/world-different goal (excluded from arrival)
@@ -1870,7 +1873,13 @@ def main(args):
         #     raw goal obs (drift-immune collection); self-goal z* = z where no archive goal yet
         #     (reach is masked for those in sac_update). Log dist/reach over real-goal envs. ---
         if args.goal_explore:
-            if step % args.goal_update_every == 0:
+            if args.goal_retain and step % args.goal_update_every == 0:
+                # retention mode: the cadence only SEEDS goalless envs (refresh_goals no-ops until the
+                # archive/buffer is ready); pursuit windows end per-env on arrival/stall/max-age below
+                if (~has_goal).any():
+                    refresh_goals(np.flatnonzero(~has_goal))
+                churned[:] = False
+            elif step % args.goal_update_every == 0:
                 if step > 0 and has_goal.any():      # close out the ending goal windows: arrival = ever inside eps
                     # --goal-churn-void / scene channel (2026-07-11): the curriculum's arrival series counts
                     # only windows the child could actually win -- churned windows (the parent moved an object
@@ -1899,6 +1908,10 @@ def main(args):
                     zstar_env[nog_t] = z[nog_t]
                 if has_goal.any():
                     gdist = (z - zstar_env).norm(dim=-1).cpu().numpy()       # ||z_t - z*|| per env
+                    if args.goal_retain:             # progress = a new best by >= delta (checked BEFORE the min update)
+                        improved = has_goal & (gdist < goal_min_dist * (1.0 - args.goal_retain_delta))
+                        goal_since_best = np.where(improved, 0, goal_since_best + 1)
+                        goal_age[has_goal] += 1
                     np.minimum(goal_min_dist, np.where(has_goal, gdist, np.inf), out=goal_min_dist)
                     goal_recent["dist"].append(float(gdist[has_goal].mean()))
                     goal_recent["reach"].append(float((gdist[has_goal] < reach_eps_now(step)).mean()))
@@ -1909,6 +1922,25 @@ def main(args):
                     qd = np.abs(cur_prop[:, :n_dof] - goal_prop_env[:, :n_dof]).max(axis=1)   # (n_envs,) max joint err
                     goal_recent["qpos_dist"].append(float(qd[has_goal].mean()))
                     goal_recent["qpos_reach"].append(float((qd[has_goal] < args.goal_success_qpos_eps).mean()))
+            if args.goal_retain and has_goal.any():
+                # per-env pursuit endings: arrival (inside eps NOW), stagnation, or max-age.
+                # arrival stats become per-goal COMPLETION records (feeds the d-curriculum unchanged).
+                eps_now = reach_eps_now(step)
+                arrived = has_goal & (gdist < eps_now) & (goal_age >= args.goal_retain_arrive_hold)
+                stalled = has_goal & (goal_since_best >= args.goal_retain_patience) & ~arrived
+                tooold = has_goal & (goal_age >= args.goal_retain_maxage) & ~arrived & ~stalled
+                switch = arrived | stalled | tooold
+                if switch.any():
+                    goal_retain_n["arrive"] += int(arrived.sum())
+                    goal_retain_n["stall"] += int(stalled.sum())
+                    goal_retain_n["age"] += int(tooold.sum())
+                    idx = np.flatnonzero(switch)
+                    for e in idx:
+                        goal_recent["arrival"].append(float(goal_min_dist[e] < eps_now))
+                    goal_min_dist[idx] = np.inf
+                    goal_since_best[idx] = 0
+                    goal_age[idx] = 0
+                    refresh_goals(idx)
             # --- reachable-radius CURRICULUM: pure goal-RANGE schedule (NOTHING in the loss/architecture;
             #     target stays LATENT goal/reach_rate, never qpos). Start goals INSIDE the planner's ~5-unit
             #     closing radius (small k) and grow k outward (further-back goal = larger reach_gap) once the
@@ -2293,6 +2325,9 @@ def main(args):
                 hist_a[:, e] = 0.0
             if args.goal_explore:                  # draw a fresh goal for each reset env
                 has_goal[done_envs] = False
+                goal_min_dist[done_envs] = np.inf   # retention state must not survive a reset
+                goal_since_best[done_envs] = 0
+                goal_age[done_envs] = 0
                 refresh_goals([int(e) for e in done_envs])
             if run is not None:
                 wlog({"episode/return": float(ep_ret[done_envs].mean()),
@@ -2412,6 +2447,12 @@ def main(args):
                 d["cotrain/frac_triggers"] = frac_trig["n"]
             if args.amax_curric:
                 d["explore/eff_action_max"] = amax_frac[0] * args.action_max
+            if args.goal_retain:
+                d["goal/retain_arrive"] = goal_retain_n["arrive"]
+                d["goal/retain_stall"] = goal_retain_n["stall"]
+                d["goal/retain_age"] = goal_retain_n["age"]
+                if has_goal.any():
+                    d["goal/retain_age_mean"] = float(goal_age[has_goal].mean())
             if dwell_hold_recent:
                 d["goal/dwell_hold_frac"] = float(np.mean(dwell_hold_recent))
             for key in ("mse_block", "mse_table", "mse_none"):   # curiosity MSE by contact type
@@ -2641,6 +2682,22 @@ def parse_args():
                         "falls back to a warmup-rollout probe if unavailable")
     # action / actuation (README)
     p.add_argument("--action-block", type=int, default=5)
+    p.add_argument("--goal-retain", action="store_true",
+                   help="PROGRESS-GATED goal retention (2026-08-13, user-designed): keep each env's current "
+                        "goal while it keeps getting closer (any new best distance, by >= --goal-retain-delta "
+                        "fraction, resets that env's patience); switch only on arrival (inside eps), stagnation "
+                        "(no new best for --goal-retain-patience steps), or --goal-retain-maxage. Replaces the "
+                        "fixed goal_update_every refresh cadence (which still seeds goalless envs and paces "
+                        "archive maintenance). arrival stats become per-goal COMPLETION records.")
+    p.add_argument("--goal-retain-patience", type=int, default=30,
+                   help="steps without a new best distance before the goal is declared stalled")
+    p.add_argument("--goal-retain-delta", type=float, default=0.01,
+                   help="fractional improvement on the best distance required to count as progress")
+    p.add_argument("--goal-retain-maxage", type=int, default=200,
+                   help="hard cap on one goal's pursuit length")
+    p.add_argument("--goal-retain-arrive-hold", type=int, default=10,
+                   help="min pursuit age before an arrival can end the goal -- prevents 1-step churn when "
+                        "shallow-ladder goals spawn already inside the eps ball (d < eps)")
     p.add_argument("--amax-curric", action="store_true",
                    help="LOCALITY-GATED action-amplitude curriculum (2026-08-13, user-designed): start at "
                         "--amax-curric-start effective amplitude and grow the action-scale fraction "
