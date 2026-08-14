@@ -1665,11 +1665,13 @@ def main(args):
     recent_qpos = deque(maxlen=200)                           # rolling final-pose history -> pose_spread / pose_range
     step_jump_recent = deque(maxlen=400)                      # per-step ||z_t - z_{t+1}|| -> latent temporal locality
     # --amax-curric: locality-gated amplitude state (fraction of action_max actually applied)
+    if args.amax_curric_floor is None:
+        args.amax_curric_floor = args.amax_curric_start       # historical behavior: start IS the floor
     amax_frac = [min(1.0, args.amax_curric_start / args.action_max)] if args.amax_curric else [1.0]
     amax_last_adj = [0]
     if args.amax_curric:
         print(f"[amax-curric] ON: start frac {amax_frac[0]:.4f} (eff amax {amax_frac[0]*args.action_max:.3f}), "
-              f"raise while frac_rand<={args.amax_curric_thresh}, lower above "
+              f"floor {args.amax_curric_floor:.3f}, raise while frac_rand<={args.amax_curric_thresh}, lower above "
               f"{args.amax_curric_thresh + args.amax_curric_band}, x{args.amax_curric_rate}/{args.amax_curric_every} steps", flush=True)
     frac_trig = {"last": 0, "n": 0}                           # --cotrain-frac-thresh trigger state (step of last fire, count)
     dwell_hold_recent = deque(maxlen=400)                     # --dwell-hold-mult: fraction of envs parked per decision
@@ -2059,7 +2061,7 @@ def main(args):
                 if fr_now <= args.amax_curric_thresh:
                     amax_frac[0] = min(1.0, old * args.amax_curric_rate)
                 elif fr_now > args.amax_curric_thresh + args.amax_curric_band:
-                    amax_frac[0] = max(args.amax_curric_start / args.action_max, old / args.amax_curric_rate)
+                    amax_frac[0] = max(args.amax_curric_floor / args.action_max, old / args.amax_curric_rate)
                 if amax_frac[0] != old:
                     print(f"[amax-curric] step={step} frac_rand={fr_now:.3f} -> frac {old:.4f}->{amax_frac[0]:.4f} "
                           f"(eff amax {amax_frac[0]*args.action_max:.3f})", flush=True)
@@ -2707,6 +2709,9 @@ def parse_args():
                         "the time-based action_max_warmup schedule.")
     p.add_argument("--amax-curric-start", type=float, default=0.05,
                    help="initial EFFECTIVE amplitude (fraction seeds at start/action_max)")
+    p.add_argument("--amax-curric-floor", type=float, default=None,
+                   help="lowest EFFECTIVE amplitude back-offs may reach (default: --amax-curric-start, "
+                        "the historical behavior). Set below start to let a high-start curriculum descend.")
     p.add_argument("--amax-curric-thresh", type=float, default=0.2,
                    help="raise amplitude while windowed frac_rand <= this")
     p.add_argument("--amax-curric-band", type=float, default=0.05,
