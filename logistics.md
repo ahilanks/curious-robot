@@ -1916,3 +1916,22 @@ Final ascent: d 19 @25650 → 20 @26700 → 21 @27600 → **22 @28650**, every r
 ## 2026-08-15 — ★★★ wr_sleepret2 COMPLETE: 200,000 steps, exit 0, `[done]` — FINAL VERDICT: every pre-registered criterion PASSED, most at historic levels. All 200 ckpts + 15.07GB final state HF-verified ★★★
 
 **The verdict vs the run charter:** (1) **Amplitude well clear of floor — PASS at 10–28×**: equilibrium band 0.5–1.4 (peak 1.407, campaign ceiling, 2.8× the old 0.31 record), floor 0.05 never touched after launch; the from-above discovery + `--amax-curric-floor` worked exactly as designed. (2) **Locality held — PASS**: rail-bounded for 200k steps; every break self-corrected via backoffs; one trigger sleep (@6541) in the entire run; zero erosion spirals. (3) **Ladder — PASS, historic**: d 3→22 (d-max) in 28,650 steps under arrival≥0.95 (July projection: 2.3–5.2M steps); full d=22 ramp re-passed first-attempt; terminal (22, 1.00) era ran ~170k steps clean. (4) **Sleeps: 19/19 converged** (201–550 grad steps, declining trend — the encoder asymptotically stationary). (5) **Contacts: mean ~0.13/step with ZERO decay across 200k** (campaign first), burst record 1.40/step-window. (6) **mse floor: 0.06/0.04–0.06/0.07–0.08** — all-time lows, stable. **The full user-designed stack — locality-gated amplitude + mastery-gated distance + full MSE ramp + progress-gated retention, on the wake/sleep engine — ran 22 hours without a single intervention** (one disk scare handled at 11.8k). Final head: `wr_sleepret2/ckpt_0200000.pt` (HF+local). **PRE-REGISTERED CLOSE-OUT, awaiting user: (A) salience/pursuit probes on the final head (`src/probe_block_goal_learn.py`, 6 scenes seed 41, `--shift 0.10`) — the external validation of what 200k of whole-space mastery bought the BLOCK story; (B) the policy arm — π(a | z_hist, a_hist, z*) on this frozen latent, HER + latent-distance reward, amplitude fixed at equilibrium (~0.9), vs a CEM twin.** GPU idle.
+
+**CANONICAL LAUNCH COMMAND (verbatim, per the 07-02 rule — this block, not prose deltas, is the reproduction source; cross-check: W&B `q1dzgjq4` config / ckpt["args"]):**
+```
+HF_TOKEN=$(cat ~/.cache/huggingface/token) HF_UPLOAD_REPO_ID=a5ilank/curious-robot python src/train.py \
+  --name wr_sleepret2 --total-steps 200000 --start-steps 1000 --env-threads 8 \
+  --wm-cam wrist --no-proprio --sigreg-pertimestep \
+  --init-ckpt runs/wr_sleepret/ckpt_0020000.pt --freeze-encoder \
+  --action-max 5.6 --amax-curric --amax-curric-start 0.4 --amax-curric-floor 0.05 \
+  --cem --cem-horizon 1 --cem-replan-every 1 --cem-init-std 0.3 --deterministic-act --alpha 0.0 \
+  --goal-explore --goal-select highmse_under_d --goal-curriculum --goal-curric-metric arrival \
+  --goal-curric-thresh 0.95 --goal-curric-patience 150 --goal-curric-d-start 10 --goal-curric-d-max 22 \
+  --goal-reach-eps 2.8 --goal-update-every 50 --goal-rescore-every 50 \
+  --goal-retain --goal-retain-patience 200 --goal-retain-delta 0.005 --goal-retain-maxage 500 \
+  --dwell-hold-mult 1.25 --dwell-shrink-start 2.0 --dwell-shrink-min 0.3 \
+  --consolidate-every 70 --consolidate-epochs 1 \
+  --cotrain-every 10000 --cotrain-epochs 30 --cotrain-flatline --cotrain-lr 2e-5 --cotrain-beta 0.02 --cotrain-frac-thresh 0.45 \
+  --buffer-frac 4.0 --lambda-safe 0.0 --safety-delta 15.0
+```
+(Chain prerequisite: `runs/wr_sleepret/ckpt_0020000.pt` = the wr_slpwarm→wr_sleepret lineage, itself ledgered with its own canonical block requirement — slpwarm was the msegate5-style recipe at fixed `--action-max 0.4`, `--total-steps 3000`, no amax-curric.)
