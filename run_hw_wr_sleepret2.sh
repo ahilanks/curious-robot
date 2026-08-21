@@ -54,7 +54,21 @@ STEPS=${2:-2000}
 CKPT=$(python3 -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('a5ilank/curious-robot', 'wr_sleepret2/ckpt_0200000.pt'))")
 DECODER=${DECODER:-runs/decoder_wrs2.pt}
 DEC_ARGS=()
-[ -f "$DECODER" ] && DEC_ARGS=(--decoder "$DECODER") && echo "[launch] decoder's eye: $DECODER"
+if [ -f "$DECODER" ]; then                 # NOT `[ -f ] && ...`: under set -e a missing file would kill the script
+  DEC_ARGS=(--decoder "$DECODER"); echo "[launch] decoder's eye: $DECODER"
+fi
+
+# LEARNER=<name>: near-live GPU split. This side goes INFERENCE-ONLY (--frozen-policy;
+# the server owns every gradient incl. the sleeps — the local consolidate/cotrain flags
+# below are gated out by frozen), streams state to HF every SYNC_EVERY steps (~14 min at
+# 2.4 sps; each upload is the full ring, ~150 KB/step collected), and hot-swaps the
+# server's wm_live.pt between decisions. Server side: src/wm_sleep_server.py --name $LEARNER.
+SPLIT_ARGS=(--no-hf)
+if [ -n "${LEARNER:-}" ]; then
+  SPLIT_ARGS=(--frozen-policy --pull-wm "$LEARNER" --pull-wm-every "${PULL_EVERY:-60}"
+              --save-state-every "${SYNC_EVERY:-2000}")
+  echo "[launch] SPLIT mode: frozen collector, state -> HF every ${SYNC_EVERY:-2000} steps, weights <- $LEARNER/wm_live.pt"
+fi
 echo "[launch] $NAME  steps=$STEPS  ckpt=$CKPT"
 echo "[launch] dashboard: http://localhost:8765"
 
@@ -73,5 +87,5 @@ caffeinate -i python3 src/train.py \
   --cotrain-every 10000 --cotrain-epochs 30 --cotrain-flatline --cotrain-lr 2e-5 --cotrain-beta 0.02 --cotrain-frac-thresh 0.45 \
   --buffer-frac 4.0 \
   --max-episode-steps 100000 --total-steps "$STEPS" \
-  --no-hf \
-  --live-view 8765 "${DEC_ARGS[@]}" 2>&1 | tee "runs/${NAME}_train.log"
+  --live-view 8765 ${DEC_ARGS[@]+"${DEC_ARGS[@]}"} ${SPLIT_ARGS[@]+"${SPLIT_ARGS[@]}"} \
+  2>&1 | tee "runs/${NAME}_train.log"   # bash-3.2-safe empty-array expansion (macOS default shell)
