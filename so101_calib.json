@@ -21,5 +21,7 @@
   "goal_speed": 2400,
   "pace_dt": 0.03,
   "acceleration": 0,
-  "kt": 10.0
+  "kt": 10.0,
+  "current_cap_a": 0.25,
+  "cap_trip_steps": 5
 }

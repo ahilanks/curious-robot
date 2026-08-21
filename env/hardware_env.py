@@ -84,6 +84,33 @@ TAU_MAX = np.array([3.35] * N_DOF, dtype=np.float32)                 # actuator_
 # Per-joint ctrlrange = joint limits used to clip the position target (XML <actuator>).
 JOINT_LOW = np.array([-1.91986, -1.74533, -1.69, -1.65806, -2.74385, -0.17453], np.float32)
 JOINT_HIGH = np.array([1.91986, 1.74533, 1.69, 1.65806, 2.84121, 1.74533], np.float32)
+
+# --- REAL-ARM SAFE ENVELOPE (tighter than the ELECTRICAL limits above) ------------------
+# These are measured properties of THIS arm and were, until 2026-08-01, enforced only in the
+# bench scripts (src/bench_dgain_wide.py, src/bench_pgain_path.py::clip_ref) -- which the
+# training path never imports. An autonomous run through HardwareSO101Env therefore had the
+# FULL electrical range available to it:
+#   * PAN (J1): negative rotation WINDS A CABLE and strains servo 1. The electrical limit is
+#     -1.92 rad; the cable-safe range is a small POSITIVE band. A multi-hour CEM run exploring
+#     J1 < 0 is a mechanical failure waiting to happen.
+#   * DOWN_CAP (J2/J3/J4): positive lift/elbow/wrist pitch the arm TOWARD THE TABLE. Past
+#     these values the arm presses into the surface -- exactly the sustained-current stall the
+#     TorqueGuard would have to cut on.
+# Applied as an UPPER bound (min with JOINT_HIGH), mirroring bench clip_ref() exactly.
+PAN_SAFE = (0.05, 0.70)
+DOWN_CAP = np.array([np.inf, 0.15, 0.30, 0.30, np.inf, np.inf], np.float32)
+HOME = np.array([0.35, 0.00, 0.00, 0.00, 0.00, 0.50], np.float32)   # bench low-tension home
+
+
+def clip_safe(q: np.ndarray) -> np.ndarray:
+    """Clamp joint targets to the real-arm safe envelope. Single source of truth, byte-equal
+    to src/bench_pgain_path.py::clip_ref. SOARM_NO_ENVELOPE=1 falls back to the electrical
+    limits (re-calibration / deliberate envelope measurement ONLY)."""
+    if os.environ.get("SOARM_NO_ENVELOPE"):
+        return np.clip(q, JOINT_LOW, JOINT_HIGH)
+    q = np.clip(q, JOINT_LOW, np.minimum(JOINT_HIGH, DOWN_CAP))
+    q[0] = np.clip(q[0], *PAN_SAFE)
+    return q
 # dt_safe = frame_skip(6) * timestep(0.005) in sim; delta=15 was calibrated to this window.
 DT_SAFE = 0.030
 
@@ -106,7 +133,21 @@ class HardwareSO101Env:
         bus: "ServoBus | None" = None,
         camera: "Camera | None" = None,
         control_dt: float = DT_SAFE,
+        encode_cam: str = "wrist",        # parity with MujocoSO101Env; only "wrist" exists here
     ):
+        # --wm-cam (2026-07-13, commit 00aec1c) added encode_cam to the env kwargs train.py
+        # builds for EVERY backend, but this class never accepted it -- so the hardware backend
+        # has raised TypeError since that commit (caught 2026-08-01 by a mock dry-run; the
+        # overhead-lineage work was all sim, so nobody hit it). The real arm has exactly ONE
+        # camera, the wrist USB cam: accept the kwarg for parity, and refuse a viewpoint that
+        # does not physically exist rather than silently feeding wrist pixels to an
+        # overhead-trained encoder.
+        if encode_cam != "wrist":
+            raise ValueError(
+                f"HardwareSO101Env: encode_cam={encode_cam!r} but the real arm has only the "
+                f"wrist camera. An overhead-trained encoder (--wm-cam {encode_cam}) needs a "
+                f"physical overhead camera wired up as a second Camera source first.")
+        self.encode_cam = encode_cam
         if n_envs != 1:
             raise ValueError(f"HardwareSO101Env is a single physical arm; n_envs must be 1 (got {n_envs})")
         self.n_envs = 1
@@ -171,7 +212,14 @@ class HardwareSO101Env:
     # --- one paced control step ----------------------------------------------
     def _control_step(self, action: np.ndarray) -> tuple[dict, dict]:
         a = np.clip(np.asarray(action, np.float32), -1.0, 1.0)
-        goal = np.clip(self._q + a * self.action_max, JOINT_LOW, JOINT_HIGH).astype(np.float32)   # delta-target, == SOArmAdapter
+        goal = clip_safe(self._q + a * self.action_max)                   # delta-target, == SOArmAdapter
+        # Envelope re-entry is RATE-LIMITED. If the arm sits OUTSIDE the safe envelope when a
+        # run starts (it flops under gravity whenever torque is off — measured 2026-08-01: J3
+        # 1.34, J4 1.22 vs a 0.30 down-cap), the bare clip would put the goal ~1 rad from the
+        # present pose and the paced servo would SNAP toward it. Re-clamp to +/-action_max of
+        # the current pose so re-entry walks in at the ordinary per-step rate.
+        goal = np.clip(goal, self._q - self.action_max,
+                       self._q + self.action_max).astype(np.float32)
 
         t_start = time.perf_counter()
         self.bus.write_goal(goal)                         # servo's internal PD realizes the target
@@ -224,7 +272,17 @@ class HardwareSO101Env:
         return obs, info
 
     # --- async action block (overlaps the trainer's GPU/MPS work) -------------
-    def step_block_async(self, action_blocks: np.ndarray) -> None:
+    def step_block_async(self, action_blocks: np.ndarray,
+                         parent_blocks: np.ndarray | None = None) -> None:
+        # parent_blocks arrived with the VLA guardian (a SECOND simulated SO-101 driving blocks
+        # in the child's view). train.py passes it positionally to every backend, so this class
+        # must accept it or the hardware path dies with a TypeError -- the second half of the
+        # same 2026-08-01 drift that broke encode_cam. There is only one physical arm here, so
+        # a non-None value is a configuration error, not something to silently drop.
+        if parent_blocks is not None:
+            raise ValueError(
+                "HardwareSO101Env: parent_blocks given, but a guardian needs a SECOND physical "
+                "arm. Drop --parent-vla/--parent-model when running --env-backend hardware.")
         ab = np.asarray(action_blocks, np.float32)
         assert ab.ndim == 3 and ab.shape[0] == 1 and ab.shape[2] == N_DOF, \
             f"expected (1, action_block, {N_DOF}), got {ab.shape}"
@@ -302,8 +360,13 @@ def _default_bus() -> "ServoBus":
         SOARM_MOCK=1    dry-run the whole loop with the in-process MockServoBus (no hardware)
         SOARM_PORT      serial port of the TTL bus adapter (e.g. /dev/tty.usbmodemXXXX)
         SOARM_CALIB     path to a JSON of {offsets_ticks:[...6], signs:[...6], vel_scale: float,
-                        p_gain, d_gain, goal_speed, pace_dt, acceleration, kt} (later keys optional)
+                        p_gain, d_gain, goal_speed, pace_dt, acceleration, kt,
+                        current_cap_a, cap_trip_steps} (later keys optional)
         SOARM_NO_PACE=1 disable per-step Goal_Speed pacing (A/B against the legacy race-and-stop)
+        SOARM_NO_CAP=1  disable the TorqueGuard current ceiling — for BENCH scripts that stress
+                        the servos on purpose (bench_dgain_wide drives D to chatter). Never for
+                        a training run: the guard is the only torque protection under
+                        --goal-explore, which zeroes lambda_safe.
         SOARM_DEBUG=N   print both r_safe variants + pacing every N control steps (env-side)
     """
     import json
@@ -322,7 +385,11 @@ def _default_bus() -> "ServoBus":
     if os.environ.get("SOARM_NO_PACE"):
         calib["pace_dt"] = 0.0
         print("[hardware] SOARM_NO_PACE set -> legacy static Goal_Speed (no per-step pacing)", flush=True)
-    return FeetechBus(port=port, **calib)
+    bus = FeetechBus(port=port, **calib)   # SOARM_NO_CAP is honored inside FeetechBus.__init__
+    print(f"[hardware] TorqueGuard {bus.guard.report()}" if bus.guard.enabled
+          else "[hardware] TorqueGuard OFF (SOARM_NO_CAP / current_cap_a<=0) — NO current ceiling",
+          flush=True)
+    return bus
 
 
 def _default_camera(hw: int) -> "Camera":
@@ -330,6 +397,102 @@ def _default_camera(hw: int) -> "Camera":
     if os.environ.get("SOARM_MOCK") or os.environ.get("SOARM_PORT") == "mock":
         return MockCamera(hw=hw)
     return UsbCamera(index=int(os.environ.get("SOARM_CAM", "0")), hw=hw)
+
+
+class TorqueLimitExceeded(RuntimeError):
+    """Sustained over-cap motor current — the arm was fighting something. Raised AFTER
+    torque is disabled, so the caller inherits a limp, safe arm."""
+
+
+class TorqueGuard:
+    """Measured-current ceiling for the servos: a LOUD stop before the firmware's SILENT one.
+
+    WHY THIS EXISTS. The STS3215 firmware has its own overload protection that drops
+    Torque_Enable (reg 40) to 0 without telling anyone — the arm goes limp mid-run and the
+    trainer keeps happily commanding a dead bus (bench 2026-06: D=254 chatter cut torque
+    silently). This guard trips FIRST, at a cap we choose, and fails loudly.
+
+    It is also the ONLY torque-side protection on the goal-reaching recipe: --goal-explore
+    sets lambda_safe=0 (train.py), so r_safe — the one channel that reacts to measured
+    effort — is switched OFF for exactly the runs we most want to put on a real arm.
+
+    TWO TIERS, mirroring the collect_daemon temp gate's debounce (a bare spike is normal
+    on a fast move; SUSTAINED current means the arm is pushing on something that will not
+    move — a joint limit, the table, a wound cable):
+      1. PIN (immediate, per joint, STICKY): a joint over the cap has its goal pinned to
+         its present position — it stops pushing further in; other joints keep working.
+         The pin HOLDS until the joint has been under cap for `pin_release_steps`
+         consecutive steps. Sticky matters: a hard-reset pin releases after ONE clean
+         read, and against a rigid surface that produces a 16 Hz push-pin-release-push
+         hammer (push, current spikes, pin, contact force drops, release, push again...)
+         that can run forever. Held-until-calm converts that into holding at the contact.
+      2. CUT (leaky bucket, whole arm): the pressure score rises 1.0 on any over-cap
+         control step and LEAKS 0.25 per clean step; at `trip_steps` ->
+         disable_torque() + TorqueLimitExceeded. A continuous fight still cuts after
+         exactly `trip_steps` steps (150 ms at the 30 ms cadence); a duty-cycled fight
+         (over cap >~20% of steps, e.g. periodic re-pressing the pin can't fully stop)
+         ratchets up and cuts within a few seconds; sparse spikes from fast legitimate
+         moves leak away to zero. The old CONSECUTIVE counter reset on any single clean
+         step, so any alternating push pattern never accumulated — that was a hole.
+
+    UNITS ARE AMPS, NOT N*m — deliberately. Amps come straight off Present_Current via the
+    datasheet's 6.5 mA/LSB; converting to N*m would route the cap through `kt`, which the
+    FeetechBus docstring still calls a "placeholder ... until bench-calibrated" while
+    so101_calib.json carries 10.0 (STS3215 spec implies ~1.1 N*m/A at the output, so that
+    10.0 is unverified). A safety limit must not inherit an unverified scale factor.
+
+    Pure numpy, no I/O — the escalation logic is exercised directly by the module selftest.
+    """
+
+    LEAK = 0.25                                # bucket decay per clean step (see CUT above)
+
+    def __init__(self, cap_a: float = 1.5, trip_steps: int = 5, n_dof: int = N_DOF,
+                 pin_release_steps: int = 3):
+        self.cap_a = float(cap_a)              # <= 0 disables the guard entirely (bench opt-out)
+        self.trip_steps = int(trip_steps)
+        self.n_dof = int(n_dof)
+        self.pin_release_steps = int(pin_release_steps)
+        self.consec = 0.0                      # leaky pressure score (+1 over-cap step, -LEAK clean)
+        self.pins = 0                          # newly-pinned joint events (cheap health counter)
+        self.over_steps = 0                    # total control steps with any joint over cap
+        self.max_a = 0.0                       # running max |current| seen — tune the cap off THIS
+        self._pinned = np.zeros(self.n_dof, bool)     # sticky per-joint pin state
+        self._under = np.zeros(self.n_dof, np.int64)  # consecutive under-cap steps per joint
+
+    @property
+    def enabled(self) -> bool:
+        return self.cap_a > 0.0
+
+    def update(self, cur_a: np.ndarray) -> np.ndarray:
+        """Feed one control step's per-joint |current| [A]; return the bool mask of joints
+        to pin (sticky — a pinned joint stays pinned until pin_release_steps consecutive
+        under-cap steps). Sets .tripped when the pressure bucket reaches trip_steps."""
+        cur_a = np.abs(np.asarray(cur_a, np.float64))
+        if cur_a.size:
+            self.max_a = max(self.max_a, float(cur_a.max()))
+        if not self.enabled:
+            return np.zeros(self.n_dof, bool)
+        over = cur_a > self.cap_a
+        if over.any():
+            self.consec += 1.0
+            self.over_steps += 1
+        else:
+            self.consec = max(0.0, self.consec - self.LEAK)   # sparse spikes leak away...
+        self._under = np.where(over, 0, self._under + 1)      # ...but >~20% duty ratchets to a cut
+        newly = over & ~self._pinned
+        if newly.any():
+            self.pins += int(newly.sum())
+        self._pinned = over | (self._pinned & (self._under < self.pin_release_steps))
+        return self._pinned.copy()
+
+    @property
+    def tripped(self) -> bool:
+        return self.enabled and self.consec >= self.trip_steps
+
+    def report(self) -> str:
+        return (f"cap={self.cap_a:.2f}A trip_steps={self.trip_steps} | max_seen={self.max_a:.2f}A "
+                f"over_steps={self.over_steps} pins={self.pins} pinned_now={int(self._pinned.sum())} "
+                f"pressure={self.consec:.2f}")
 
 
 class FeetechBus:
@@ -385,7 +548,8 @@ class FeetechBus:
                  offsets_ticks=None, signs=None, vel_scale: float | None = None,
                  p_gain: int = 16, d_gain: int = 32, goal_speed: int = 2000,
                  enable_torque: bool = True, max_step_ticks: int = 300,
-                 pace_dt: float = DT_SAFE, acceleration: int = 0, kt: float = 1.0):
+                 pace_dt: float = DT_SAFE, acceleration: int = 0, kt: float = 1.0,
+                 current_cap_a: float = 1.5, cap_trip_steps: int = 5):
         if offsets_ticks is None or signs is None or vel_scale is None:
             raise RuntimeError(
                 "FeetechBus needs calibration: offsets_ticks[6], signs[6], vel_scale "
@@ -401,6 +565,12 @@ class FeetechBus:
         self.goal_speed = int(goal_speed)            # pacing cap / static speed when pacing off
         self.pace_dt = float(pace_dt)                # 0 disables per-step Goal_Speed pacing
         self.kt = float(kt)                          # N*m per A: Present_Current -> joint torque
+        if os.environ.get("SOARM_NO_CAP"):           # honored HERE, not in _default_bus, so the
+            current_cap_a = 0.0                      # escape hatch also reaches bench scripts, which
+        self.guard = TorqueGuard(cap_a=current_cap_a, trip_steps=cap_trip_steps,   # build the bus direct
+                                 n_dof=len(self.motor_ids))   # measured-current ceiling; see TorqueGuard
+        self._last_cur_a = np.zeros(len(self.motor_ids))      # last |Present_Current| [A], UNCLIPPED
+        self._pin_mask = np.zeros(len(self.motor_ids), bool)  # joints the guard is holding this step
         self._last_pos = None                         # last good Present_Position (set by enable_torque)
         self._last_speeds = None                      # last paced Goal_Speed values (SOARM_DEBUG)
         self._torque = False
@@ -467,6 +637,22 @@ class FeetechBus:
                 cur.append(0)                                # dropped read -> 0 torque for one step (benign)
         pos = np.asarray(pos, np.float64); spd = np.asarray(spd, np.float64)
         cur = np.asarray(cur, np.float64)
+        # TORQUE GUARD: raw |current| in AMPS (datasheet LSB, NOT via kt) -> pin/cut decision
+        # for the NEXT write_goal. One control step (30 ms) of latency is inherent — current
+        # can only be reacted to after it is measured. A dropped read contributes 0 A, which
+        # cannot trip the guard (benign, and consistent with the 0-torque fallback above).
+        self._last_cur_a = np.abs(cur) * self._AMPS_PER_LSB
+        self._pin_mask = self.guard.update(self._last_cur_a)
+        if self.guard.tripped:
+            # End the mechanical fight rather than keep holding into it, THEN fail loudly.
+            # NOTE: the arm goes limp and will settle under gravity — that is the deliberate
+            # trade (a sustained over-cap joint is pushing on something that will not move).
+            self.disable_torque()
+            raise TorqueLimitExceeded(
+                f"sustained over-cap servo current (pressure {self.guard.consec:.1f} >= "
+                f"trip_steps {self.guard.trip_steps}; {self.guard.report()}); "
+                f"per-joint A={np.round(self._last_cur_a, 2).tolist()}. "
+                f"Torque DISABLED (arm limp). Clear the obstruction, then restart.")
         self._last_pos = pos.copy()                          # refresh last-good
         q = (pos - self.offsets) * self._RAD_PER_TICK * self.signs
         qd = spd * self.vel_scale * self.signs
@@ -498,6 +684,12 @@ class FeetechBus:
         if self._last_pos is not None:                       # backstop: no single command may jump more
             ticks = np.clip(ticks, self._last_pos - self.max_step_ticks,   # than max_step_ticks from the
                             self._last_pos + self.max_step_ticks)          # current position
+        if self._last_pos is not None and self._pin_mask.any():
+            # TorqueGuard tier 1: joints over the current cap hold their present position
+            # instead of pushing further in. Self-clears as soon as current drops; the other
+            # joints keep tracking normally, so a brush against the table costs one step of
+            # travel on one joint rather than aborting the run.
+            ticks = np.where(self._pin_mask, self._last_pos, ticks)
         ticks = np.clip(np.round(ticks), 0, 4095).astype(int)   # final guard against out-of-range
         pace = self.pace_dt > 0 and self._last_pos is not None
         if pace:
@@ -727,11 +919,58 @@ def _self_test() -> None:
     assert ps(90.0, DT_SAFE, 2000) == 2000                  # capped at goal_speed
     assert ps(65.0, 0.030, 2000) == 2000                    # action_max 0.1-ish full step -> caps
 
+    # TorqueGuard escalation (pure logic; like the pacing math, the mock never touches the
+    # Present_Current register path, so the decision rules are pinned here directly)
+    quiet = np.full(6, 0.4)
+    spike1 = np.array([0.4, 2.0, 0.4, 0.4, 0.4, 0.4])       # joint 1 over cap
+    g = TorqueGuard(cap_a=1.5, trip_steps=3, n_dof=6, pin_release_steps=3)
+    assert not g.update(quiet).any() and g.consec == 0 and not g.tripped             # quiet
+    m = g.update(spike1)                                                             # one joint over
+    assert m.tolist() == [False, True, False, False, False, False] and g.consec == 1 and g.pins == 1
+    assert not g.tripped, "a single over-cap step must not cut torque (spikes are normal)"
+    # STICKY pin: the joint stays held through pin_release_steps clean reads, then releases;
+    # the pressure bucket LEAKS on clean steps (never hard-resets) so a lone spike still fades.
+    assert g.update(quiet)[1] and g.update(quiet)[1], "pin must hold until proven calm"
+    assert not g.update(quiet).any(), "pin must release after pin_release_steps clean steps"
+    assert 0 < g.consec < 1 and not g.tripped
+    for _ in range(4):
+        g.update(quiet)
+    assert g.consec == 0, "a lone spike must leak away to zero"
+    # DUTY-CYCLED fight (the hole the old consecutive counter had): push-pin-release-push
+    # against a rigid surface alternates over/under forever — the bucket must still cut,
+    # and the sticky pin means the joint is never released mid-hammer (pins stays 1).
+    g = TorqueGuard(cap_a=1.5, trip_steps=3, n_dof=6, pin_release_steps=3)
+    steps_to_trip = 0
+    for k in range(40):
+        g.update(spike1 if k % 2 == 0 else quiet)
+        steps_to_trip += 1
+        if g.tripped:
+            break
+    assert g.tripped, "alternating over/under hammering must eventually cut torque"
+    assert 4 <= steps_to_trip <= 16, f"duty-cycle cut escalated oddly ({steps_to_trip} steps)"
+    assert g.pins == 1, "sticky pin must hold through the hammer (no re-pin churn)"
+    # continuous fight: cut after exactly trip_steps steps (unchanged from the old design)
+    g = TorqueGuard(cap_a=1.5, trip_steps=3, n_dof=6)
+    for i in range(3):
+        g.update(np.full(6, 2.0))
+        assert g.tripped == (i == 2), f"trip must fire exactly at trip_steps (step {i+1})"
+    assert g.max_a >= 2.0 and g.over_steps == 3
+
+    # cap_a <= 0 disables enforcement but STILL tracks max_a — the measure-first mode: run with
+    # the guard off, read max_seen, then set a cap grounded in this arm's real draw.
+    g0 = TorqueGuard(cap_a=0.0, trip_steps=3, n_dof=6)
+    assert not g0.enabled
+    for _ in range(10):
+        assert not g0.update(np.full(6, 99.0)).any()
+    assert not g0.tripped and g0.max_a == 99.0 and g0.over_steps == 0
+
     env.close()
     print(f"[selftest] OK — block of {action_block} steps in {dt*1000:.0f} ms "
           f"(expected >= {action_block*env.dt_safe*1000:.0f} ms), proprio=(1,18), "
           f"{len(_INFO_KEYS)} info keys, torque clipped to +/-3.35, reset is read-only, "
-          f"obs-torque=PD-recompute / reward-torque=measured split verified, pacing math pinned.")
+          f"obs-torque=PD-recompute / reward-torque=measured split verified, pacing math pinned, "
+          f"TorqueGuard sticky-pin/leaky-bucket/cut escalation (incl. duty-cycle hammer) + "
+          f"measure-only mode pinned.")
 
 
 if __name__ == "__main__":
