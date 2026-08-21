@@ -961,14 +961,21 @@ def save_state_snapshot(buf, out_dir, step, repo_id=None, run_name=None, upload=
     the weights remember the dynamics, but highmse_under_d can only propose goals the
     buffer contains."""
     path = out_dir / "state_latest.npz"
+    # Trim the ring to the FILLED extent (2026-08-20): a frozen-mode collector's ring is
+    # pre-sized to the whole run, so snapshotting full arrays uploaded mostly zeros (0.84 GB
+    # for 700 collected frames). Safe with the existing loader: while count < C the data
+    # occupies [0:count) contiguously (head == count), and once any env wraps count == C so
+    # Cu == C and nothing is trimmed — ring order is preserved in both regimes.
+    Cu = min(buf.C, max(int(buf.count.max()), 1))
     d = dict(fmt=np.int64(1), step=np.int64(step), head=buf.head, count=buf.count,
-             pixels=buf.pixels, proprio=buf.proprio, action=buf.action, r=buf.r,
-             done=buf.d, is_start=buf.is_start, prio=buf.prio)
+             pixels=buf.pixels[:, :Cu], proprio=buf.proprio[:, :Cu], action=buf.action[:, :Cu],
+             r=buf.r[:, :Cu], done=buf.d[:, :Cu], is_start=buf.is_start[:, :Cu],
+             prio=buf.prio[:, :Cu])
     if buf.rc is not None:
-        d["rc"] = buf.rc
+        d["rc"] = buf.rc[:, :Cu]
     if buf.goal_explore:
-        d.update(goal_px=buf.goal_px, goal_prop=buf.goal_prop, goal_valid=buf.goal_valid,
-                 ep_id=buf.ep_id, cur_ep=buf.cur_ep)
+        d.update(goal_px=buf.goal_px[:, :Cu], goal_prop=buf.goal_prop[:, :Cu],
+                 goal_valid=buf.goal_valid[:, :Cu], ep_id=buf.ep_id[:, :Cu], cur_ep=buf.cur_ep)
     tmp = path.with_name("state_latest.tmp.npz")
     np.savez(tmp, **d)                                # uncompressed: fast, no long training pause
     tmp.replace(path)                                 # atomic swap: no torn file on crash
@@ -1103,6 +1110,44 @@ def resolve_ckpt(ckpt=None, name="baseline", step=None, hf_repo=None):
         raise SystemExit(f"{target} not found in {repo}; available: {sorted(files)}")
     print(f"[hf] downloading {target} from {repo}", flush=True)
     return hf_hub_download(repo_id=repo, filename=target, token=token)
+
+
+class WMPuller:
+    """--pull-wm: background poller for a sleep server's weights (near-live actor-learner
+    split, 2026-08-20). The GPU side (src/wm_sleep_server.py) consumes this run's periodic
+    state_latest.npz uploads, runs consolidation sleeps, and pushes <name>/wm_live.pt to
+    the same HF repo; this thread notices the new commit, downloads OFF the control loop,
+    and stages the local path. The MAIN loop applies it at a step boundary (a swap must
+    not race the in-flight encode/CEM) behind a probe-MSE sanity gate. Poll/download
+    failures only ever log — the arm never stops for the network."""
+
+    def __init__(self, repo: str, name: str, every_s: float):
+        self.repo, self.path_in_repo = repo, f"{name}/wm_live.pt"
+        self.every_s = max(10.0, float(every_s))
+        self.staged = None                   # local file path ready for the main loop to load
+        self.last_oid = None
+        self.swaps = 0
+
+    def start(self):
+        import threading
+        threading.Thread(target=self._loop, daemon=True, name="wm-pull").start()
+
+    def _loop(self):
+        from huggingface_hub import HfApi, hf_hub_download
+        api = HfApi(token=os.environ.get("HF_TOKEN"))
+        while True:
+            try:
+                info = api.get_paths_info(self.repo, [self.path_in_repo], expand=True)
+                oid = (info[0].last_commit.oid if info and info[0].last_commit else None)
+                if oid and oid != self.last_oid:
+                    p = hf_hub_download(self.repo, self.path_in_repo,
+                                        token=os.environ.get("HF_TOKEN"))  # etag-aware: refetches on change
+                    self.last_oid = oid
+                    self.staged = p
+                    print(f"[pull-wm] staged new weights (commit {oid[:8]})", flush=True)
+            except Exception as e:
+                print(f"[pull-wm] poll failed (will retry): {type(e).__name__}: {e}", flush=True)
+            time.sleep(self.every_s)
 
 
 def load_init_ckpt(args, wm, actor, critic, critic_tgt, device):
@@ -1888,6 +1933,62 @@ def main(args):
     elif args.decoder:
         print("[decoder] ignored: --decoder needs --live-view (it only feeds the dashboard)", flush=True)
 
+    wm_puller = None                                  # --pull-wm: near-live weight sync (split mode)
+    if args.pull_wm:
+        _repo = args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID")
+        if not _repo:
+            print("[pull-wm] disabled: no HF repo (set HF_UPLOAD_REPO_ID or --hf-repo)", flush=True)
+        else:
+            if not args.frozen_policy:
+                print("[pull-wm] WARNING: local gradient updates are ON — they will be clobbered "
+                      "by every server swap. Split mode intends --frozen-policy.", flush=True)
+            wm_puller = WMPuller(_repo, args.pull_wm, args.pull_wm_every)
+            wm_puller.start()
+            print(f"[pull-wm] polling {_repo}/{args.pull_wm}/wm_live.pt every "
+                  f"{wm_puller.every_s:.0f}s (swap at step boundaries, probe-gated)", flush=True)
+
+    def maybe_swap_wm(step):
+        """Apply a staged sleep-server checkpoint at a safe step boundary. Probe gate:
+        one-step prediction MSE on 64 recent buffer transitions (targets encoded with the
+        CURRENT weights — exact when the server keeps the encoder frozen, approximate but
+        catastrophe-catching otherwise) must not blow up vs the current weights."""
+        path, wm_puller.staged = wm_puller.staged, None
+        try:
+            sd = torch.load(path, map_location=device, weights_only=False)["wm"]
+            own = wm.state_dict()
+            keep = {k: v for k, v in sd.items() if k in own and own[k].shape == v.shape}
+            if any(not torch.isfinite(v).all() for v in keep.values()):
+                raise ValueError("non-finite tensors in staged ckpt")
+            old_mse = new_mse = None
+            try:
+                cand = buf.sample_candidates(64)
+                if cand is not None:
+                    spx, sprop, sact, gpx, gprop = cand
+                    with torch.no_grad():
+                        z_src = encode_obs(wm, spx, sprop, device)
+                        z_tgt = encode_obs(wm, gpx, gprop, device)
+                        zc = z_src.unsqueeze(1).repeat(1, H, 1)
+                        ac = torch.as_tensor(sact, device=device).float().unsqueeze(1).repeat(1, H, 1)
+                        old_mse = float((wm.predict(zc, wm.action_encoder(ac))[:, -1] - z_tgt).pow(2).mean())
+                        bak = {k: own[k].clone() for k in keep}
+                        wm.load_state_dict(keep, strict=False)
+                        new_mse = float((wm.predict(zc, wm.action_encoder(ac))[:, -1] - z_tgt).pow(2).mean())
+                    if not np.isfinite(new_mse) or new_mse > max(3.0 * old_mse, old_mse + 0.05):
+                        wm.load_state_dict(bak, strict=False)
+                        print(f"[pull-wm] REJECTED swap at step {step}: probe mse "
+                              f"{old_mse:.4f} -> {new_mse:.4f}", flush=True)
+                        return
+                else:
+                    wm.load_state_dict(keep, strict=False)
+            except Exception:                          # probe machinery failed -> plain gated-by-finiteness swap
+                wm.load_state_dict(keep, strict=False)
+            wm_puller.swaps += 1
+            print(f"[pull-wm] SWAP #{wm_puller.swaps} at step {step}: {len(keep)}/{len(own)} tensors"
+                  + (f", probe mse {old_mse:.4f}->{new_mse:.4f}" if new_mse is not None else ""),
+                  flush=True)
+        except Exception as e:
+            print(f"[pull-wm] swap failed (keeping current weights): {e}", flush=True)
+
     # perf/t_* wall-clock section split (fractions per log window). Async GPU work is
     # attributed at its sync point: plan syncs at a.cpu(), learn at loss.item().
     _tacc = {"goal": 0.0, "plan": 0.0, "learn": 0.0, "env_wait": 0.0, "rest": 0.0}
@@ -1901,6 +2002,8 @@ def main(args):
             _tacc["rest"] += _tnow - _tmark          # tail of the previous iteration (buf.add/reward/log)
         _tmark = _tnow
         cur_px, cur_prop = obs["image"], obs["proprio"]          # o_t (before acting)
+        if wm_puller is not None and wm_puller.staged is not None:
+            maybe_swap_wm(step)                       # apply server weights BEFORE this step's encode
 
         # --- goal-explore: (re)sample goals on the cadence, then RE-ENCODE z* EVERY step from the
         #     raw goal obs (drift-immune collection); self-goal z* = z where no archive goal yet
@@ -3300,6 +3403,16 @@ def parse_args():
                         "'decoder's eye' row to --live-view: decode(z_now), decode(predicted next z "
                         "under the current CEM plan action) = what the plan imagines, decode(z*). "
                         "Diagnostic only — never in any gradient path. Requires --live-view.")
+    p.add_argument("--pull-wm", default="", metavar="NAME",
+                   help="near-live split (hardware): poll the HF repo for NAME/wm_live.pt — pushed "
+                        "by src/wm_sleep_server.py, which consumes this run's periodic "
+                        "--save-state-every uploads — and hot-swap the world model's shape-matching "
+                        "tensors between decisions (probe-MSE sanity gate; rejected swaps keep the "
+                        "current weights). Pair with --frozen-policy: the server owns ALL gradient "
+                        "work, this side is inference-only. Needs HF_UPLOAD_REPO_ID/--hf-repo.")
+    p.add_argument("--pull-wm-every", type=float, default=60.0,
+                   help="--pull-wm poll cadence in seconds (background thread; download and "
+                        "staging happen off the control loop).")
     p.add_argument("--wandb-project", default=None)
     p.add_argument("--no-hf", action="store_true", help="disable HF checkpoint upload")
     p.add_argument("--frozen-policy", action="store_true",
