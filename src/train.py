@@ -1214,17 +1214,21 @@ def main(args):
               f"elites={args.cem_elites} init_std={args.cem_init_std} horizon={args.cem_horizon} "
               f"(open-loop receding, reward=MSE only, SAC OFF)", flush=True)
     if args.goal_explore:
-        if args.env_backend == "hardware":
-            raise SystemExit("[goal-explore] refusing on hardware: dropping dq_max -> action_max=1.0 "
-                             "(full-radian joint deltas) is unsafe on a real arm. Sim only.")
         args.deterministic_act = True       # no stochastic collection (the actor.sample path is unused)
         args.alpha = 0.0                    # kills the entropy terms in sac_update
         args.explore_noise = 0.0           # no collection noise
         args.lambda_safe = 0.0             # drop r_safe entirely
         args.multihead_q = False           # the dense scalar reach reward has no component decomposition
         args.per_priority = "curiosity"    # td-priority would fight the archive's r_cur scoring
-        if args.action_max == 0.3:         # drop the dq_max scaling unless the user explicitly overrode it
-            args.action_max = 1.0
+        if args.action_max == 0.3 and args.env_backend != "hardware":
+            args.action_max = 1.0          # drop the dq_max scaling unless the user explicitly overrode it
+        # HARDWARE CARVE-OUT (2026-08-01): goal-explore used to REFUSE outright on hardware,
+        # because of the 0.3 -> 1.0 coercion right above (full-radian joint deltas on a real
+        # arm). The refusal is lifted so the sim-trained goal-reaching stack can be evaluated
+        # on the SO-101; the coercion is what stays sim-only. This imposes no new ceiling —
+        # it only declines to silently RAISE action_max 3.3x on a physical arm. Pass
+        # --action-max explicitly (the campaign recipe uses 0.05); the pre-existing
+        # "action_max > 0.15 is large for a real arm" warning below still fires.
         if args.goal_update_every <= 0:
             args.goal_update_every = args.max_episode_steps
         if args.goal_rescore_every <= 0:
@@ -1857,6 +1861,33 @@ def main(args):
                   "(Ctrl-C again to force-quit).", flush=True)
         signal.signal(signal.SIGINT, _on_sigint)
 
+    viewer = None                                     # --live-view: localhost goal dashboard (env 0)
+    if args.live_view:
+        try:
+            from src.live_view import LiveViewer
+            viewer = LiveViewer(args.live_view, run_name=run_name)
+            viewer.start()
+        except Exception as e:                        # the dashboard must never block a run
+            print(f"[live-view] disabled (failed to start: {e})", flush=True)
+            viewer = None
+    dec = None                                        # --decoder: post-hoc pixel decoder (diagnostic)
+    if args.decoder and viewer is not None:
+        try:
+            from model.decoder import LatentDecoder
+            _dck = torch.load(args.decoder, map_location=device, weights_only=False)
+            if int(_dck["z_dim"]) != z_dim:
+                raise ValueError(f"decoder z_dim {_dck['z_dim']} != run z_dim {z_dim}")
+            dec = LatentDecoder(z_dim=z_dim).to(device)
+            dec.load_state_dict(_dck["decoder"])
+            dec.eval().requires_grad_(False)
+            print(f"[decoder] loaded {args.decoder} (val_mse {_dck.get('val_mse', float('nan')):.5f}) "
+                  f"-> decoder's-eye row on the dashboard", flush=True)
+        except Exception as e:
+            print(f"[decoder] disabled (failed to load: {e})", flush=True)
+            dec = None
+    elif args.decoder:
+        print("[decoder] ignored: --decoder needs --live-view (it only feeds the dashboard)", flush=True)
+
     # perf/t_* wall-clock section split (fractions per log window). Async GPU work is
     # attributed at its sync point: plan syncs at a.cpu(), learn at loss.item().
     _tacc = {"goal": 0.0, "plan": 0.0, "learn": 0.0, "env_wait": 0.0, "rest": 0.0}
@@ -1971,6 +2002,50 @@ def main(args):
                         curric_k[0] += 1
                         goal_recent["reach"].clear(); goal_recent["arrival"].clear()             # measure the harder (larger-k) stage fresh
                         print(f"[goal-curriculum] step={step} {args.goal_curric_metric}={wr:.2f} -> radius k={curric_k[0]}", flush=True)
+
+        if viewer is not None:
+            # env 0 mirror for the --live-view dashboard. On a retention-switch step gdist was
+            # computed against the OUTGOING goal (the switch block runs after the encode), so the
+            # dist sample belongs to the goal it closes — the viewer stamps min-dist accordingly.
+            _vd = float(gdist[0]) if (args.goal_explore and has_goal[0]) else None
+            _vi = {"buffer": int(buf.total), "goal_mse": float(goal_mse_env[0]),
+                   "goal_age": int(goal_age[0]), "since_best": int(goal_since_best[0]),
+                   "retain_arrive": goal_retain_n["arrive"], "retain_stall": goal_retain_n["stall"],
+                   "retain_age": goal_retain_n["age"],
+                   "curric_d": round(curric_d[0], 2), "curric_pctl": round(curric_pctl[0], 2),
+                   "eff_amax": round(amax_frac[0] * args.action_max, 4)}
+            if archives is not None:
+                _vi["archive"] = int(sum(a.n for a in archives))
+            if goal_recent is not None and len(goal_recent["arrival"]):
+                _vi["arrival"] = round(float(np.mean(goal_recent["arrival"])), 2)
+            _vg = getattr(getattr(env, "bus", None), "guard", None)   # hardware TorqueGuard, if any
+            if _vg is not None and getattr(_vg, "enabled", False):
+                _vi["guard"] = _vg.report()
+            _vdec = None
+            if dec is not None:
+                # decoder's eye (diagnostic): decode z_now, the predictor's one-step output under
+                # the CURRENT plan action (same predict arithmetic as refresh_goals' MSE scoring
+                # = what the plan imagines its next move does), and the goal latent z*.
+                with torch.no_grad():
+                    _zs, _names = [z[0]], ["now"]
+                    if args.cem:
+                        _pa = cem_buf[0, min(int(cem_ptr[0]), cem_H - 1)].unsqueeze(0)  # (1, a_dim)
+                        _zc = z[0:1].unsqueeze(1).repeat(1, H, 1)
+                        _ac = _pa.unsqueeze(1).repeat(1, H, 1)
+                        _zs.append(wm.predict(_zc, wm.action_encoder(_ac))[:, -1][0])
+                        _names.append("plan")
+                    _zs.append(zstar_env[0]); _names.append("goal")
+                    _imgs = dec.to_uint8_hwc(torch.stack(_zs))
+                _vdec = dict(zip(_names, _imgs))
+                _vi["recon_l1"] = round(float(np.abs(
+                    _imgs[0].astype(np.int16) - cur_px[0].astype(np.int16)).mean()), 1)
+            viewer.update(step, cur_px[0], goal_px_env[0] if has_goal[0] else None,
+                          _vd, reach_eps_now(step) if args.goal_explore else 0.0, _vi,
+                          # retention resets goal_age on the switch step (after the increment),
+                          # so age==0 here == a new pursuit window opened even if the re-picked
+                          # goal photo is byte-identical to the outgoing one
+                          switched=bool(args.goal_retain and has_goal[0] and goal_age[0] == 0),
+                          decoded=_vdec)
 
         _tnow = time.perf_counter(); _tacc["goal"] += _tnow - _tmark; _tmark = _tnow
         # --- act: SAC stochastic sample during sim training (the entropy-driven exploration
@@ -3216,6 +3291,15 @@ def parse_args():
     p.add_argument("--buffer-frac", type=float, default=0.1, help="cap = clip(frac*total, 1e3, 5e4)")
     # logging backends (keys from .env)
     p.add_argument("--no-wandb", action="store_true")
+    p.add_argument("--live-view", type=int, default=0, metavar="PORT",
+                   help="serve a live goal dashboard (current goal photo, live wrist frame, ||z-z*|| "
+                        "vs reach eps, goal-switch history with retention reasons) at "
+                        "http://localhost:PORT while the run is live. 0 = off. env 0 only.")
+    p.add_argument("--decoder", default="",
+                   help="path to a post-hoc pixel decoder ckpt (src/train_decoder.py). Adds a "
+                        "'decoder's eye' row to --live-view: decode(z_now), decode(predicted next z "
+                        "under the current CEM plan action) = what the plan imagines, decode(z*). "
+                        "Diagnostic only — never in any gradient path. Requires --live-view.")
     p.add_argument("--wandb-project", default=None)
     p.add_argument("--no-hf", action="store_true", help="disable HF checkpoint upload")
     p.add_argument("--frozen-policy", action="store_true",
