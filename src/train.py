@@ -1918,14 +1918,11 @@ def main(args):
     dec = None                                        # --decoder: post-hoc pixel decoder (diagnostic)
     if args.decoder and viewer is not None:
         try:
-            from model.decoder import LatentDecoder
-            _dck = torch.load(args.decoder, map_location=device, weights_only=False)
-            if int(_dck["z_dim"]) != z_dim:
-                raise ValueError(f"decoder z_dim {_dck['z_dim']} != run z_dim {z_dim}")
-            dec = LatentDecoder(z_dim=z_dim).to(device)
-            dec.load_state_dict(_dck["decoder"])
-            dec.eval().requires_grad_(False)
-            print(f"[decoder] loaded {args.decoder} (val_mse {_dck.get('val_mse', float('nan')):.5f}) "
+            from model.decoder import load_decoder
+            # CHANGED 2026-09-14: arch-aware loader (LeWM transformer decoder or legacy conv)
+            dec, _dck = load_decoder(args.decoder, device, z_dim=z_dim)
+            print(f"[decoder] loaded {args.decoder} ({_dck.get('arch', {}).get('kind', 'conv')}, "
+                  f"val_mse {_dck.get('val_mse', float('nan')):.5f}) "
                   f"-> decoder's-eye row on the dashboard", flush=True)
         except Exception as e:
             print(f"[decoder] disabled (failed to load: {e})", flush=True)
