@@ -2000,3 +2000,30 @@ bash run_decoder.sh wr_sleepret2 200000 3000   # sim frames   -> runs/wr_sleepre
 bash run_sim_decoder_eye.sh [name] [steps]     # frozen wr_sleepret2@200k in MuJoCo + decoder's eye -> runs/<name>/decoder_eye.mp4 (defaults sim_decoder_eye 1500)
 ```
 **Still outstanding:** unchanged from 09-14 (close-out A/B, the lost `--cem-hier`, hardware camera-reopen + persisted curriculum, contact instrumentation) — the hardware decoder step (`runs/decoder_wrs2.pt` on the Mac) is NOT wanted per today's directive.
+
+## 2026-09-15 (later) — ★ HOUSEKEEPING + THE DECODER AS AN INSTRUMENT: val metric fixed (both decoders re-fitted + re-uploaded), the goal archive decoded (48/64 goals have no block), decodability FLAT across the 19 sleeps, open-loop imagination reaches the random-pair diameter by T≈16–32; HANDOFF refreshed ★
+
+**1. Housekeeping.** `train_decoder.evaluate()` now scores EVERY val frame (the old `k=64` cap sliced `val_idx[:batch]` = the first 128 frames = early session only). Re-fitted with the fix (seed-deterministic, same weights) and re-uploaded: `hw_wrs2_c/decoder_lewm.pt` **0.01381** (was logged 0.0094 — the early real frames were easier) and `wr_sleepret2/decoder_lewm.pt` **0.00261** (was 0.00363 — on sim the early frames were HARDER). `.env.example` restored (the 09-14 file, key names only; its working-tree deletion was accidental). `git-filter-repo` installed; **history purge pending the user's explicit go** (rewrites `main` + force-push; every other clone re-clones). The GH token that sat in the public history was auto-revoked by GitHub secret scanning — that is why the 09-15 morning push failed with 401; a fresh fine-grained PAT is in `.env` (gitignored, chmod 600). HANDOFF.md rewritten to today's state (was 08-14).
+
+**2. The goal archive, decoded (`src/viz_goal_archive.py`, NEW).** `ckpt_0200000`'s 64 archived goals ranked by capture score (0.53–3.21), each cell [goal photo | decode(z*)] (+ a 4-tile src→goal variant): **48/64 contain no block** — viewpoint goals (wall/table edges, corners, gripper on a plain background) — so d=22 mastery is largely camera-pose mastery. The 16 block goals are the HIGHEST-surprise ones (ranks 0, 1, 5, 7, 8, 10, 12, 13, 17, …); the top-4 are block close-ups (10.6k / 18.2k / 21.9k / 15.0k block px) with the worst recon (L1 41–53 vs 10.9 mean): the decode marks the object's location but not its colour (#00/#07: a blue-dark smear where the magenta cube is; #12/#28 come out pink). Multi-cube scatter scenes (#13/#17/#25) lose the small cubes entirely. Median latent jump of an archived transition ‖z*−z_src‖ = 16.2 (≈ the random-pair scale — the archive is built from big moves). Outputs: `runs/wr_sleepret2/goal_archive.png` (+`_src.png`, `.json`).
+
+**3. Decodability per checkpoint (`src/decoder_ckpt_sweep.py`, NEW).** Same 19,000/1,000 sim frames, a fresh 3,000-step decoder per encoder; block metrics on the 134 val frames with ≥60 magenta pixels:
+```
+ckpt      val_mse   block_mse   bg_mse   block decoded
+   1000   0.00268   0.15584     0.00205   45%
+  10000   0.00268   0.15285     0.00206   45%
+  30000   0.00276   0.16072     0.00210   35%
+ 100000   0.00268   0.15264     0.00206   39%
+ 200000   0.00260   0.14964     0.00199   50%
+```
+**FLAT.** The sleeps (19, 201–550 grad steps each) consolidated the predictor without changing what the latent keeps of the pixels; the 200k head is marginally best on every column. Block pixels are ~75× harder than background at every checkpoint. Caveat: pixel decodability ≠ probe salience (how far z moves when the block moves) — close-out A measures the latter. Outputs: `runs/wr_sleepret2/sweep/` (sheet, plot, json, per-ckpt decoders; not uploaded).
+
+**4. Open-loop imagination horizon (`viz_decoder_rollout.py --horizon 16 / 32`).** Scale: z_mse is per-dim over 192 dims ⇒ z_mse 0.04 ≈ L2 2.8 = reach eps; z_mse 2.0 ≈ L2 19.6 = the random-pair diameter (08-14). T=16: segments stay z_mse < 0.3 for 8–12 steps (one converges: px L1 11→3.6), one breaks at step 8 (0.96 → 1.6–2.5 = random-pair) when a second object enters view, one climbs steadily to 0.95. T=32: every segment reaches z_mse 1–2 by steps 13–32. **Imagination is within eps for ~2–3 steps, coherent for ~8–12, random by 16–32** — CEM at horizon 1 + replan-every-step is the right regime for this predictor; a horizon-5 planner would plan through noise. Outputs: `runs/wr_sleepret2/rollout_T16.png|gif`, `rollout_T32.png|gif`.
+
+**CANONICAL COMMANDS (GPU box; add to the 09-15 morning block):**
+```
+python src/viz_goal_archive.py --ckpt runs/wr_sleepret2/ckpt_0200000.pt --decoder runs/wr_sleepret2/decoder_lewm.pt --out runs/wr_sleepret2/goal_archive.png [--with-source --cols 4]
+python src/decoder_ckpt_sweep.py --run wr_sleepret2 --steps 1000,10000,30000,100000,200000      # -> runs/wr_sleepret2/sweep/
+python src/viz_decoder_rollout.py --ckpt runs/wr_sleepret2/ckpt_0200000.pt --state runs/wr_sleepret2/state_latest.npz --decoder runs/wr_sleepret2/decoder_lewm.pt --horizon 32 --n 4 --out runs/wr_sleepret2/rollout_T32.png
+```
+**Next (unchanged order):** close-out A (salience/pursuit probes on ckpt_0200000) → close-out B (policy arm vs CEM twin) → `--cem-hier` recovery. Hardware parked.

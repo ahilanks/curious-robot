@@ -175,11 +175,14 @@ def main(a: argparse.Namespace) -> dict:
         opt, lambda s: (s + 1) / warm if s < warm
         else 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, a.steps - warm))))
 
-    def evaluate(k: int = 64) -> float:
+    def evaluate() -> float:
+        """Pixel MSE over EVERY val frame (they stride the whole session). FIXED 2026-09-15: the old
+        `k=64` cap sliced `val_idx[:batch]` = the first 128 frames = the early session only, which
+        read ~30% low (hw_wrs2_c: 0.0094 logged vs 0.0138 over all 345 val frames)."""
         dec.eval()
         with torch.no_grad():
             tot, n = 0.0, 0
-            for i in range(0, min(k, len(val_idx)), a.batch):
+            for i in range(0, len(val_idx), a.batch):
                 idx = val_idx[i:i + a.batch]
                 tot += float(torch.nn.functional.mse_loss(
                     dec(z_all[idx]), frames_to_target(frames[idx], device), reduction="sum"))
