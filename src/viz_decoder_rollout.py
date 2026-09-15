@@ -31,6 +31,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from model.decoder import load_decoder                                    # noqa: E402
 from src.train import to_norm_pixel                                       # noqa: E402
 from src.train_decoder import load_wm, resolve_ckpt_spec, resolve_state   # noqa: E402
+from src.viz_goal_archive import block_mask                                # noqa: E402
 
 
 def sample_segments(st, n: int, length: int, rng: np.random.Generator, tries: int = 10000):
@@ -80,8 +81,15 @@ def main(a: argparse.Namespace) -> dict:
     dec, meta = load_decoder(a.decoder, device, z_dim=wm.z_dim)
     H, T = (a.context or wm.history_size), a.horizon
     st = np.load(resolve_state(a.state, a.hf_repo))
-    segs = sample_segments(st, a.n, H + T, rng)
     px, prop, act = st["pixels"], st["proprio"], st["action"]
+    if a.prefer_blocks:                       # rank many candidate segments by block pixels, keep the top n
+        cands = sample_segments(st, a.n * 40, H + T, rng, tries=40000)
+        score = [int(block_mask(px[e, i:i + H + T]).sum()) for e, i in cands]
+        segs = [cands[j] for j in np.argsort(score)[::-1][:a.n]]
+        print(f"[rollout] --prefer-blocks: {len(cands)} candidates, kept {len(segs)} with "
+              f"{[score[j] for j in np.argsort(score)[::-1][:a.n]]} block px")
+    else:
+        segs = sample_segments(st, a.n, H + T, rng)
 
     rows, table = [], []
     for e, i in segs:
@@ -127,6 +135,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--horizon", type=int, default=8, help="imagined steps T after the context")
     p.add_argument("--context", type=int, default=0, help="context frames H (0 = ckpt history_size)")
     p.add_argument("--n", type=int, default=4, help="segments to render")
+    p.add_argument("--prefer-blocks", action="store_true",
+                   help="pick the n segments (of 40n episode-contiguous candidates) with the most block pixels")
     p.add_argument("--gif", default="", help="optional GIF of the first segment (real | imagined)")
     p.add_argument("--gif-dt", type=float, default=0.4)
     p.add_argument("--seed", type=int, default=0)
