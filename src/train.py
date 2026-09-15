@@ -1910,7 +1910,7 @@ def main(args):
     if args.live_view:
         try:
             from src.live_view import LiveViewer
-            viewer = LiveViewer(args.live_view, run_name=run_name)
+            viewer = LiveViewer(args.live_view, run_name=run_name, record=args.live_view_record)
             viewer.start()
         except Exception as e:                        # the dashboard must never block a run
             print(f"[live-view] disabled (failed to start: {e})", flush=True)
@@ -2771,6 +2771,8 @@ def main(args):
     if _upload_pool is not None:                  # flush background ckpt uploads before exit
         print("[hf] flushing pending background uploads...", flush=True)
         _upload_pool.shutdown(wait=True)
+    if viewer is not None:
+        viewer.close()                            # flush --live-view-record
     env.close()
     if run is not None:
         run.finish()
@@ -3395,6 +3397,10 @@ def parse_args():
                    help="serve a live goal dashboard (current goal photo, live wrist frame, ||z-z*|| "
                         "vs reach eps, goal-switch history with retention reasons) at "
                         "http://localhost:PORT while the run is live. 0 = off. env 0 only.")
+    p.add_argument("--live-view-record", default="", metavar="MP4",
+                   help="with --live-view: also append one strip per decision step [wrist | decode(z now) | "
+                        "decode(plan -> next z) | decode(z*) | goal photo] to this mp4 (env 0) -- the "
+                        "offline twin of the dashboard's decoder's-eye row (needs --decoder for the decodes).")
     p.add_argument("--decoder", default="",
                    help="path to a post-hoc pixel decoder ckpt (src/train_decoder.py). Adds a "
                         "'decoder's eye' row to --live-view: decode(z_now), decode(predicted next z "

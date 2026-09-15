@@ -19,6 +19,8 @@ Open http://localhost:PORT while the run is live.
 from __future__ import annotations
 
 import json
+import atexit
+from pathlib import Path
 import threading
 import time
 from collections import deque
@@ -29,7 +31,7 @@ import numpy as np
 _JPEG_QUALITY = 87
 
 
-def _jpeg(img_rgb: np.ndarray) -> bytes:
+def _jpeg_cv2(img_rgb: np.ndarray) -> bytes:
     import cv2
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR),
                            [int(cv2.IMWRITE_JPEG_QUALITY), _JPEG_QUALITY])
@@ -38,12 +40,31 @@ def _jpeg(img_rgb: np.ndarray) -> bytes:
     return bytes(buf)
 
 
+def _jpeg(img_rgb: np.ndarray) -> bytes:
+    """RGB uint8 -> JPEG bytes. cv2 when installed (the Mac deploy box), else PIL (GPU pods
+    without opencv) -- the dashboard/recorder must not die on the first goal photo."""
+    try:
+        return _jpeg_cv2(img_rgb)
+    except ImportError:
+        import io
+        from PIL import Image
+        bio = io.BytesIO()
+        Image.fromarray(np.ascontiguousarray(img_rgb)).convert("RGB").save(bio, "JPEG", quality=80)
+        return bio.getvalue()
+
+
 class LiveViewer:
     """Shared state between the trainer thread (update/set_phase) and HTTP threads."""
 
-    def __init__(self, port: int, run_name: str = "", max_goals: int = 48):
+    def __init__(self, port: int, run_name: str = "", max_goals: int = 48,
+                 record: str = "", record_fps: int = 15):
         self.port = int(port)
         self.run_name = run_name
+        # --live-view-record: one strip per decision step appended to an mp4 (see _record)
+        self._rec_path, self._rec_fps = (str(record) if record else ""), int(record_fps)
+        self._rec_writer = None
+        self._rec_n = 0
+        self._rec_font = None
         self._lock = threading.Lock()
         self._wrist: np.ndarray | None = None
         self._wrist_id = 0
@@ -112,6 +133,8 @@ class LiveViewer:
                               "dist": (round(float(dist), 3) if dist is not None and np.isfinite(dist) else None),
                               "has_goal": goal_px is not None, **info}
                 self._t_update = time.time()
+            if self._rec_path:                        # outside the lock: encoding must not stall HTTP reads
+                self._record(step, wrist_px, goal_px, decoded, dist, eps, info)
         except Exception as e:                                  # never propagate into the control loop
             print(f"[live-view] update failed (non-fatal): {e}", flush=True)
 
@@ -123,6 +146,66 @@ class LiveViewer:
                 self._t_update = time.time()
         except Exception:
             pass
+
+    # ---- recording (--live-view-record) --------------------------------------------------
+    _REC_TILE = 224
+    _REC_COLS = (("wrist (real)", "wrist"), ("decode(z now)", "now"), ("decode(plan -> next z)", "plan"),
+                 ("decode(z*)", "goal"), ("goal photo", "goal_px"))
+
+    def _record(self, step, wrist_px, goal_px, decoded, dist, eps, info) -> None:
+        """Append one strip [wrist | decode(z now) | decode(plan) | decode(z*) | goal photo] plus a
+        one-line header to the mp4. Missing tiles (no goal yet / no decoder) stay grey so the
+        layout is constant. Never raises."""
+        try:
+            import imageio
+            from PIL import Image, ImageDraw, ImageFont
+            T, HDR = self._REC_TILE, 28
+            tiles = {"wrist": wrist_px, "goal_px": goal_px, **(decoded or {})}
+            strip = Image.new("RGB", (T * len(self._REC_COLS), T + HDR), (24, 24, 24))
+            d = ImageDraw.Draw(strip)
+            if self._rec_font is None:
+                try:
+                    self._rec_font = ImageFont.load_default(size=13)
+                except TypeError:                                  # Pillow < 10.1
+                    self._rec_font = ImageFont.load_default()
+            for i, (title, key) in enumerate(self._REC_COLS):
+                img = tiles.get(key)
+                if img is not None:
+                    im = Image.fromarray(np.ascontiguousarray(img)).convert("RGB")
+                    if im.size != (T, T):
+                        im = im.resize((T, T), Image.BILINEAR)
+                    strip.paste(im, (i * T, HDR))
+                d.text((i * T + 4, 14), title, fill=(230, 230, 230), font=self._rec_font)
+            hdr = f"step {int(step)}"
+            if dist is not None and np.isfinite(dist):
+                hdr += f"   |z-z*| {float(dist):.2f} / eps {float(eps):.2f}"
+            for k, lab in (("recon_l1", "recon L1"), ("curric_d", "d"), ("curric_pctl", "pctl"),
+                           ("eff_amax", "eff amax"), ("arrival", "arrival")):
+                if k in info:
+                    hdr += f"   {lab} {info[k]}"
+            d.text((4, 1), hdr, fill=(255, 255, 255), font=self._rec_font)
+            frame = np.asarray(strip)
+            if self._rec_writer is None:
+                Path(self._rec_path).parent.mkdir(parents=True, exist_ok=True)
+                self._rec_writer = imageio.get_writer(self._rec_path, fps=self._rec_fps, codec="libx264",
+                                                      quality=8, macro_block_size=None)
+                atexit.register(self.close)                        # a killed run still gets a playable file
+                print(f"[live-view] recording {frame.shape[1]}x{frame.shape[0]} @ {self._rec_fps} fps "
+                      f"-> {self._rec_path}", flush=True)
+            self._rec_writer.append_data(frame)
+            self._rec_n += 1
+        except Exception as e:
+            print(f"[live-view] record failed (non-fatal): {e}", flush=True)
+
+    def close(self) -> None:
+        """Finalize the mp4 (idempotent; registered with atexit once recording starts)."""
+        w, self._rec_writer = self._rec_writer, None
+        if w is not None:
+            try:
+                w.close()
+                print(f"[live-view] recorded {self._rec_n} frames -> {self._rec_path}", flush=True)
+            except Exception as e:
+                print(f"[live-view] close failed (non-fatal): {e}", flush=True)
 
     # ---- server ---------------------------------------------------------------------------
     def start(self) -> None:
