@@ -1,4 +1,4 @@
-# HANDOFF — curious-robot campaign state (2026-09-15)
+# HANDOFF — curious-robot campaign state (2026-09-17)
 
 **Read this + the tail of `logistics.md` (the ledger, chronological) to resume. Every claim below has a ledger entry with numbers.**
 
@@ -7,41 +7,53 @@ Emergent block manipulation: a from-scratch agent (SO-101 sim, wrist-cam pixels 
 
 ## Where things stand
 - **Sim campaign: DONE and banked (08-15 ★★★).** `wr_sleepret2` (200k, W&B `q1dzgjq4`): every pre-registered criterion passed — d 3→22 (the full historical ladder target) in 28,650 steps under arrival ≥0.95, then ~170k steps of whole-space consolidation; amplitude equilibrium 0.5–1.4 (floor never touched); 19/19 sleeps converged; contacts ~0.13/step with zero decay. All 200 ckpts + the 15.07 GB final state on HF. **Head = `wr_sleepret2/ckpt_0200000.pt`** (canonical launch block in the 08-15 entry).
+- **09-17: PLANNER EXPERIMENT DONE (★★ ledger 13:35 UTC).** Nine 10k-decision runs from the head, same buffer/goals/curriculum, only the planner flags differing. **Result: `--plan-act-scale` (roll the WM out on the EXECUTED action `plan × amax_frac` instead of the raw plan) is a real, two-seed-replicated improvement of the campaign CEM** — goal distance halves through d 10–16, the arm parks inside the goal ball instead of arriving-and-bouncing, motor saturation drops from ~0.8 to ~0.1–0.3, d=20 arrives 300 decisions earlier. A learned temporal critic (RP1's central idea) is a wash on this latent (it re-learns latent L2: corr 0.87) and hurts without the scale fix; the RP1 plan refiner matches scaled CEM's ladder at 9 world-model rollouts per decision vs 3,600 (2.3× faster wall-clock) but is not more precise; horizon 3 is worse for CEM and catastrophic for the refiner; **no planner variant moves blocks more** (object motion 0.002–0.005 everywhere). **Recommendation: add `--plan-act-scale` to the canonical recipe** (CEM, horizon 1, latent-L2 cost). Figure/tables: HF `rp1x/summary.png`, `rp1x/final_tables.txt`.
+- **09-17: the RP1 paper (arXiv 2608.18669) is reproduced in `rp1/`** on the LeWM backbone (README tables verified by an independent rerun; ledger 2026-09-17 first entry). Standalone; its critic/refiner code is what `src/rp1_planner.py` imports.
 - **Hardware line: PAUSED — user directive 09-15: no hardware deploy.** Five real-arm sessions, ~11k steps (08-20/21 `hw_wrs2_a`/`c`): the stack transfers; the 0.40 cliff refuted on hw; the ladder stalls at pctl 0.20 with a real budget; empty-difficulty-budget warm-up found. Near-live GPU split (`src/wm_sleep_server.py` + `--pull-wm`) built and loop-closed. Resumable via `run_hw_wr_sleepret2.sh`.
-- **Nothing is running.** 09-14/15 were spent on the decoder instrument (below) on a RunPod A100.
+- **Running at handoff time (09-17 ~13:15 UTC):** seed-1 replicates `rp1x_l2_s1` / `rp1x_l2s_s1` (8k decisions, `--no-save-state`); their partial first attempt already replicated the effect. Nothing else.
 
-## The decoder — the campaign's new instrument (09-14/15; diagnostic only, never in a gradient path)
+## Planner flags (09-17, `src/train.py` + `src/rp1_planner.py`)
+- `--plan-act-scale` — the fix above. Off = the campaign convention (candidates evaluated in raw units while the WM is trained on executed, amplitude-scaled actions: 4–14× exaggerated imagination in this lineage).
+- `--plan-cost {latent,value}` — CEM terminal cost: latent-L2 (default) or V(ẑ, z*), an MRN quasimetric critic = cost-to-go in decisions, fitted by n-step TD + hindsight goals on the replay buffer's own frozen-encoder latents (3,000 TD steps at start, 500 every `--vcritic-fit-every 2000`, full re-fit after each sleep). `--vcritic-*` tune it. `src/diag_vcritic.py` measures it against true trajectory offsets.
+- `--planner {cem,rp1}` — `rp1` = the RP1 refiner f(a, v, ∂v/∂a), K=8 residual rounds through the frozen WM, trained pathwise against the critic (`--rp1-*`); implies the value cost; use with `--plan-act-scale` and horizon 1 only (both failure modes ledgered).
+- Read-outs: `src/compare_planner_arms.py`, `src/plot_planner_arms.py`.
+
+## The decoder — the campaign's instrument (09-14/15; diagnostic only, never in a gradient path)
 - `model/decoder.py` = LeWM App. D post-hoc pixel decoder (z → 224² RGB: 196 patch queries cross-attend to the latent, 2.67M). `bash run_decoder.sh <run> <ckpt_step> <steps>` = fit on a run's frames with its FROZEN encoder → HF upload → Fig.-7 rollout sheet. Fitted: `hw_wrs2_c/decoder_lewm.pt` (real frames, val 0.0138) and `wr_sleepret2/decoder_lewm.pt` (sim, val 0.0026); val = ALL val frames since the 09-15 `evaluate()` fix.
-- **What z keeps (the blur finding, real frames):** the latent ≈ a 7×7 colour thumbnail (σ≈16 px blur). Detail survives to the ViT patch tokens (linear readout 0.0008) and dies at the single-[CLS] pooling (0.016); JEPA keeps only what predicts; pixel-MSE turns the gap into blur. Decoder capacity is not the limit (10× params: no gain; 3× steps: −20% then memorising).
-- **In sim:** wall/table geometry decodes sharply; the magenta cube decodes as a blob in the right place (the block IS in z); small / blue / red / black cubes are lost. Block pixels are ~75× harder than background (MSE 0.15 vs 0.002).
-- **Goal archive @200k** (`src/viz_goal_archive.py`): 48/64 archived goals contain no block — viewpoint goals (wall/table edges). The 16 block goals are the highest-surprise ones; the top-4 are block close-ups (10–22k block px) where the decode marks the object but not its colour. d=22 mastery is largely camera-pose mastery.
-- **Checkpoint sweep** (`src/decoder_ckpt_sweep.py`, 1k/10k/30k/100k/200k): decodability FLAT across the 19 sleeps — val 0.0027→0.0026, block-pixel MSE 0.156→0.150, block detected 45%→50%. The sleeps consolidated the predictor without changing what the latent keeps of the pixels.
-- **Open-loop imagination horizon** (`src/viz_decoder_rollout.py --horizon T`): scale note — z_mse is per-dim, so 0.04 ≈ L2 2.8 = reach eps and 2.0 ≈ L2 19.6 = the random-pair diameter. Imagination stays within eps ~2–3 steps, coherent (z_mse < 0.3) ~8–12 steps, at random-pair level by T=16–32 on every segment. CEM at horizon 1 + replan-every-step is the right regime for this predictor.
-- **Decoder's eye in sim:** `bash run_sim_decoder_eye.sh [name] [steps]` = wr_sleepret2@200k FROZEN in MuJoCo (no gradients) + `--live-view-record` mp4: wrist | decode(z now) | decode(plan → next z) | decode(z*) | goal photo. Shows the plan steering toward the goal view. (`--live-view` dashboard works on any box now — PIL fallback for the JPEG path.)
+- **What z keeps (the blur finding, real frames):** the latent ≈ a 7×7 colour thumbnail (σ≈16 px blur). Detail survives to the ViT patch tokens (linear readout 0.0008) and dies at the single-[CLS] pooling (0.016); JEPA keeps only what predicts; pixel-MSE turns the gap into blur. Decoder capacity is not the limit.
+- **In sim:** wall/table geometry decodes sharply; the magenta cube decodes as a blob in the right place; small / blue / red / black cubes are lost. Block pixels are ~75× harder than background.
+- **Goal archive @200k** (`src/viz_goal_archive.py`): 48/64 archived goals contain no block — d=22 mastery is largely camera-pose mastery. **Checkpoint sweep**: decodability FLAT across the 19 sleeps. **Open-loop imagination horizon**: within eps ~2–3 steps, coherent ~8–12, random by T=16–32 — CEM at horizon 1 + replan-every-step is the right regime (re-confirmed 09-17 at the right action scale: horizon 3 is worse).
+- **Decoder's eye in sim:** `bash run_sim_decoder_eye.sh [name] [steps]` (+ `src/cut_decoder_eye.py` for block-visible cuts).
 
 ## Campaign findings (each ★-ledgered)
 - **Wrist + no-cap from scratch has block salience overhead never achieved**: 6/6 scenes, median shift-d0 1.7–3.8 (100mm probes), viewpoint-robust. The acting eye is the salient eye.
-- **No-cap vs cap are complementary phases**: uncapped = contact/salience/data-efficiency winner; capped/fine geometry = mastery-depth winner. The d≈5–6 wall for uncapped ladders is structural, restore-exonerated.
-- **The amplitude curriculum resolves the phase tension dynamically** — amplitude is earned by prediction quality (`--amax-curric`, floor via `--amax-curric-floor`).
-- **The cliff falls on the stationary map** (08-14): the pctl-0.40 cliff that killed msegate at d=7 and d=11 does not exist on the frozen latent; the wake/sleep engine with d-scaled sleep spacing (10k) took the ladder to d-max 22 in 3.5 h (July projection: 30–66 days).
+- **No-cap vs cap are complementary phases**; the d≈5–6 wall for uncapped ladders is structural, restore-exonerated. **The amplitude curriculum resolves the phase tension dynamically** (`--amax-curric`, floor via `--amax-curric-floor`).
+- **The cliff falls on the stationary map** (08-14); the wake/sleep engine with d-scaled sleep spacing took the ladder to d-max 22 in 3.5 h.
 - **Latent units drift**: d/eps are in the current latent's units (d-start 10 for this lineage, not 1).
-- **Pursuit** (moving blocks to match photos): salience solved, direction NOT yet — closures are condition-blind shoves; the bind is WM contact-displacement fidelity + finish-precision. The decoder now adds: the archive's hardest goals are exactly the contact views, and those decode worst.
+- **The planner was imagining 4–14× larger steps than it executed (09-17)**: the WM is trained on `u × amax_frac`, CEM scored raw `u`. Fixing it (`--plan-act-scale`) is the single largest planner improvement since horizon 1; the 07-04 dwell "stay-wall" was a symptom of it.
+- **Temporal reachability ≈ latent proximity on this latent (09-17)**: a hindsight-TD quasimetric critic adds nothing — the campaign's L2 cost is not the pursuit bottleneck.
+- **Pursuit** (moving blocks to match photos): salience solved, direction NOT yet — closures are condition-blind shoves; the bind is WM contact-displacement fidelity + finish-precision, and no planner variant changes object motion (09-17). The archive's hardest goals are exactly the contact views, and those decode worst.
 
 ## Pre-registered next (user-ordered) — all SIM
-1. **Close-out A**: salience/pursuit probes on `ckpt_0200000` (`src/probe_block_goal_learn.py`); the decoder gives a pixel-side second opinion.
-2. **Close-out B — the policy arm**: π(a | z_hist, a_hist, z\*) on the FROZEN mature latent, HER + latent-distance reward, amplitude fixed at equilibrium; twin vs a CEM continuation (`--her-frac` exists).
-3. Recover `--cem-hier` (two-level latent CEM; the 09-13 pod's code was lost, ledger description only).
+1. **Adopt `--plan-act-scale`** in the canonical recipe; a 200k-scale chain with it (does the precision gain compound with sleeps and the amplitude curriculum?).
+2. **Close-out A**: salience/pursuit probes on `ckpt_0200000` (`src/probe_block_goal_learn.py`) — FIRST port `--plan-act-scale` (and the planner flags) into `src/eval_goal_photo.act_stack`, which currently executes the raw CEM plan with no amax_frac (planner-unfaithful for every amax-curric head).
+3. **Close-out B — the policy arm**: π(a | z_hist, a_hist, z*) on the frozen latent, HER + latent-distance reward (the 09-17 critic result says latent distance is an adequate reward here); twin vs the scaled CEM.
+4. Pursuit needs the WM side (contact data / contact-displacement fidelity), not another planner.
+5. Recover `--cem-hier` (two-level latent CEM; code lost 09-13).
 
 ## Probes (the instruments)
-- `src/probe_block_goal_learn.py` — block-shift salience/pursuit: 6 fixed scenes (seed 41), `--shift 0.10`, d0 vs ctrl floors = salience; deliberate closure = pursuit; `--stage-pose visible`, `--horizon N`, `--budget 1`. d0s before 2026-08-08 are inflated ~10× (two instrument bugs, fixed).
-- Decoder tools (above): `run_decoder.sh`, `run_sim_decoder_eye.sh`, `src/viz_decoder_rollout.py`, `src/viz_goal_archive.py`, `src/decoder_ckpt_sweep.py`; `tests/test_decoder.py` (13 CPU checks).
+- `src/probe_block_goal_learn.py` — block-shift salience/pursuit: 6 fixed scenes (seed 41), `--shift 0.10`, d0 vs ctrl floors = salience; deliberate closure = pursuit; `--stage-pose visible`, `--horizon N`, `--budget 1`. d0s before 2026-08-08 are inflated ~10× (two instrument bugs, fixed). NOT yet planner-faithful for amax-curric / act-scale heads (see next-2).
+- Decoder tools: `run_decoder.sh`, `run_sim_decoder_eye.sh`, `src/viz_decoder_rollout.py`, `src/viz_goal_archive.py`, `src/decoder_ckpt_sweep.py`; `tests/test_decoder.py` (13 CPU checks).
+- Planner tools (09-17): `src/diag_vcritic.py`, `src/compare_planner_arms.py`, `src/plot_planner_arms.py`.
 
 ## Ops essentials
-- **Pod bootstrap**: `.env` per `.env.example` (GH/W&B/HF/Pushover keys; gitignored, chmod 600), then `bash setup.sh` (deps, CLIs, hooks, GPU/MuJoCo checks, 60-step smoke). Run everything long in `tmux`.
-- **HF**: `a5ilank/curious-robot` — every run's ckpts + state snapshots (`<run>/ckpt_XXXXXXX.pt`, `<run>/state_latest.npz`), decoders (`<run>/decoder_lewm.pt`). `train_decoder.py` / the viz tools resolve `runs/<run>/...` locally first, else pull from HF.
-- **git push**: `gh` reads `GH_TOKEN` from the environment (`set -a; source .env; set +a`). The token that sat in the public history was auto-revoked by GitHub secret scanning (09-15). **History purge (09-15): `main` rewritten with `git filter-repo --invert-paths --path .env` and force-pushed (`c769033` → `779cdc2`); backup `/workspace/curious-robot-pre-purge.bundle` on the 09-15 pod. Eight feature branches on origin still carry `.env` in their history — user decision 09-15: leave them and the old W&B/Pushover keys as is (closed). Every other clone of `main` must re-clone.** Never print `.env`.
-- **W&B**: entity `ahilan-uc-berkeley-electrical-engineering-computer-sciences`, project `curious-robot`. Run reconstruction: diff ckpt["args"] (or W&B config) vs argparse defaults.
-- **Chains**: `--init-ckpt <ckpt>` (+ `state_latest.npz` beside it for the buffer); `--frozen-policy` = act with the loaded stack, no gradients. Curriculum/controller state is RUNTIME-ONLY — never resume a curriculum run mid-flight.
+- **Pod bootstrap**: `.env` per `.env.example` (GH/W&B/HF/Pushover keys; gitignored, chmod 600), then `bash setup.sh` (deps, CLIs, hooks, GPU/MuJoCo checks, 60-step smoke). Run everything long detached (`setsid nohup … &`, or `tmux`).
+- **`.env` has an empty `WANDB_SILENT=`** — wandb 0.30's pydantic settings reject it (`bool_parsing` crash at `wandb.init`): `export WANDB_SILENT=true` before launching (09-17).
+- **/workspace has a per-pod DISK QUOTA** (~150–250 GB; `df` shows the 615 TB volume, not the quota). A run whose log cannot be written dies with NO traceback. Check `du -sh /workspace/curious-robot` before launching; every run writes a 15 GB `state_latest.npz` at the end (`--no-save-state` for throwaway arms); ≤ 6 concurrent 8-env runs per 80 GB GPU (each ~10–12 GB; the periodic 2,048-frame probe encode needs 1.2 GB headroom).
+- **HF**: `a5ilank/curious-robot` — every run's ckpts + state snapshots (`<run>/ckpt_XXXXXXX.pt`, `<run>/state_latest.npz`), decoders (`<run>/decoder_lewm.pt`), 09-17 planner artifacts under `rp1x/`. The RP1 datasets (`quentinll/lewm-*`, 287 GB extracted) are NOT kept on the pod — re-download per `rp1/README.md` + the ledger's 09-17 setup notes if re-running `rp1/`.
+- **git push**: `set -a; . ./.env; set +a` then `git -c credential.helper= push "https://x-access-token:${GH_TOKEN}@github.com/ahilanks/curious-robot.git" main` (never `push -u` a token URL). History purge of `.env` on `main` done 09-15 (`c769033` → `779cdc2`); user decision: leave the 8 stale feature branches and old keys as is. Never print `.env`.
+- **W&B**: entity `ahilan-uc-berkeley-electrical-engineering-computer-sciences`, project `curious-robot`; read via `wandb.Api()` (with `WANDB_SILENT=true`), never the web UI. Run reconstruction: diff ckpt["args"] (or W&B config) vs argparse defaults.
+- **Chains**: `--init-ckpt <ckpt>` (+ `state_latest.npz` beside it for the buffer); `--frozen-policy` = act with the loaded stack, no gradients. Curriculum/controller state is RUNTIME-ONLY — never resume a curriculum run mid-flight. `--buffer-frac` × `--total-steps` = the buffer cap (clip 1e3–5e4): use 5.0 for 10k runs / 6.25 for 8k to keep the whole 50k restored buffer.
 - **Disk**: a 200k run's state is 15 GB; ≥45G headroom for 100k runs. Verify-on-HF before deleting local artifacts.
 
 ## Parked-but-alive threads
@@ -49,3 +61,4 @@ Emergent block manipulation: a from-scratch agent (SO-101 sim, wrist-cam pixels 
 - γ pure-steps chain: `wr_nocap3` @ lineage 75k, E1 fired (first directedness), banked, resumable.
 - Gated-uncapped heads: `arr95_nocap`/`2`/`2b` + fresh/fresh60 (the wall evidence), all on HF.
 - Overhead lineage (oh_*): closed at 100k.
+- `rp1/` — the RP1 reproduction (tables verified 09-17; per-domain results committed under `rp1/runs/`).
