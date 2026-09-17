@@ -40,14 +40,18 @@ def build_wm(ckpt, n_dof, device):
     return wm, a
 
 
-def act_stack(wm, a, hist_z, hist_a, z, zstar, device):
-    """One decision of the EXACT training act path (train.py CEM branch + dwell)."""
+def act_stack(wm, a, hist_z, hist_a, z, zstar, device, amax_frac=1.0):
+    """One decision of the EXACT training act path (train.py CEM branch + dwell).
+    amax_frac (2026-09-17): the run's amplitude-curriculum fraction at the probed step — the loop
+    executes clamp(plan) * amax_frac, and a `--plan-act-scale` head also rolls the WM out on
+    plan * amax_frac. 1.0 = the pre-09-17 probe behaviour (raw plan executed)."""
+    act_scale = amax_frac if getattr(a, "plan_act_scale", False) else 1.0
     plan = cem_plan(wm, hist_z, hist_a, zstar, a.cem_samples, a.cem_iters, a.cem_elites,
                     a.cem_init_std, a.cem_horizon, device, gamma=a.cem_gamma,
                     min_std=a.cem_min_std, mppi_temp=a.cem_mppi_temp,
                     early_stop_tol=a.cem_early_stop,
-                    early_stop_min_iters=a.cem_early_stop_min_iters)
-    act = plan[:, 0].clamp(-1.0, 1.0)
+                    early_stop_min_iters=a.cem_early_stop_min_iters, act_scale=act_scale)
+    act = plan[:, 0].clamp(-1.0, 1.0) * amax_frac
     gd = (z - zstar).norm(dim=-1)
     eps = a.goal_reach_eps
     if a.dwell_shrink_start > 0:

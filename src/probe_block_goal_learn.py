@@ -57,6 +57,10 @@ ap.add_argument("--out", default="runs/probe_block_goal")
 ap.add_argument("--horizon", type=int, default=0,
                 help="override the ckpt's cem_horizon at probe time (0 = use ckpt value); "
                      "planner-mechanics A/B on a fixed head, training untouched")
+ap.add_argument("--amax-frac", default="",
+                help="comma-separated label=frac: the run's amplitude-curriculum fraction (eff amax / action_max) "
+                     "at the probed ckpt, so the probe executes clamp(plan)*frac like the loop (and a "
+                     "--plan-act-scale head rolls the WM out at that scale). Missing label = 1.0 (raw plan).")
 ap.add_argument("--stage-pose", choices=("home", "visible"), default="home",
                 help="'home' = reset pose (block start typically occluded on wrist); 'visible' = "
                      "rejection-sample servo-driven staging poses until the block START is in frame "
@@ -66,6 +70,7 @@ os.makedirs(args.out, exist_ok=True)
 device = torch.device("cuda")
 
 ckpts = [kv.split("=", 1) for kv in args.ckpts.split(",")]
+amax_frac = {kv.split("=")[0]: float(kv.split("=")[1]) for kv in args.amax_frac.split(",") if kv}
 ck0 = torch.load(ckpts[0][1], map_location="cpu", weights_only=False)
 a0 = SimpleNamespace(**ck0["args"])
 
@@ -181,7 +186,7 @@ for label, path in ckpts:
             min_gap, ncon, d_at_min = gap0, 0, None
             d0 = float((z - zstar).norm(dim=-1)[0])
             for t in range(args.budget):
-                act, gd = act_stack(wm, a, hist_z, hist_a, z, zstar, device)
+                act, gd = act_stack(wm, a, hist_z, hist_a, z, zstar, device, amax_frac=amax_frac.get(label, 1.0))
                 hist_a = torch.cat([hist_a[1:], act.unsqueeze(0)], 0)
                 subs = act[0].detach().cpu().numpy().reshape(a.action_block, n_dof)
                 nc = 0
@@ -212,6 +217,7 @@ for label, path in ckpts:
         shift_d0=float(np.median([r["shift"]["d0"] for r in rows])),
         scenes=rows)
     results[label] = agg
+    agg["amax_frac"] = amax_frac.get(label, 1.0)
     print(f"[{label}] MEDIANS: shift closure {agg['shift_closure_mm']:+.1f}mm (contacts {agg['shift_contacts']:.0f}) "
           f"vs ctrl {agg['ctrl_closure_mm']:+.1f}mm (contacts {agg['ctrl_contacts']:.0f}) -> "
           f"DELIBERATE {agg['deliberate_mm']:+.1f}mm  [goal shift {args.shift*1000:.0f}mm, d0 {agg['shift_d0']:.1f}]", flush=True)
