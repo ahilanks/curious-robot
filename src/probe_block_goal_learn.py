@@ -65,6 +65,8 @@ ap.add_argument("--no-dwell", action="store_true",
                 help="probe-time override: disable the dwell HOLD/SHRINK mechanics (a block-shift goal photo sits "
                      "~1.2 latent units away, INSIDE the hold radius 1.25*eps, so with dwell on the stack parks "
                      "and cannot pursue by construction; 2026-09-17)")
+ap.add_argument("--eps", type=float, default=0.0,
+                help="probe-time override of goal_reach_eps (dwell shrink/hold radii scale with it); 0 = ckpt value")
 ap.add_argument("--stage-pose", choices=("home", "visible"), default="home",
                 help="'home' = reset pose (block start typically occluded on wrist); 'visible' = "
                      "rejection-sample servo-driven staging poses until the block START is in frame "
@@ -176,6 +178,8 @@ for label, path in ckpts:
         a.cem_horizon = args.horizon
     if args.no_dwell:
         a.dwell_hold_mult = 0.0; a.dwell_shrink_start = 0.0
+    if args.eps > 0:
+        a.goal_reach_eps = args.eps
     a_dim = n_dof * a.action_block
     H = a.history_size
     rows = []
