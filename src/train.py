@@ -521,7 +521,8 @@ def score_obs_mse(wm, gpx, gprop, spx, sprop, sact, device, H):
 
 @torch.no_grad()
 def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, device, diag=None, gamma=0.0,
-             min_std=0.0, mppi_temp=0.0, early_stop_tol=0.0, early_stop_min_iters=12, mu0=None, cost_fn=None):
+             min_std=0.0, mppi_temp=0.0, early_stop_tol=0.0, early_stop_min_iters=12, mu0=None, cost_fn=None,
+             act_scale=1.0):
     """CEM planner in LATENT space -- a faithful port of LeWM's stable_worldmodel.solver.CEMSolver
     (+ JEPA.rollout/criterion). Per replan: sample H-step action SEQUENCES from a per-step Gaussian,
     FORCE candidate 0 = the current mean (LeWM's candidates[:,0]=mean), roll each AUTOREGRESSIVELY
@@ -556,7 +557,7 @@ def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, dev
         for it in range(iters):
             seq = mu.unsqueeze(1) + std.unsqueeze(1) * torch.randn(n, K, T, a_dim, device=device)
             seq[:, 0] = mu                                            # LeWM: force candidate 0 = current mean
-            sf = seq.reshape(n * K, T, a_dim)
+            sf = seq.reshape(n * K, T, a_dim) * act_scale                 # --plan-act-scale: WM sees executed units
             z_seq, a_seq = z0, a0                                         # (n*K, Hb, .) growing rollout buffers
             step_costs = []                                              # per-rollout-step ||z_{t+h+1} - z*||^2
             for h in range(T):                                           # autoregressive WM rollout
@@ -1493,6 +1494,8 @@ def main(args):
             with torch.no_grad():
                 return encode_obs(wm, px, pr, device).float().cpu().numpy()
         planner_models = PlannerModels(args, z_dim, a_dim, max(args.cem_horizon, 1), H, device)
+        if args.plan_act_scale:                      # the loop's amax_frac starts at this value (defined later)
+            planner_models.act_scale = min(1.0, args.amax_curric_start / args.action_max) if args.amax_curric else 1.0
         if buf.total >= 4 * args.vcritic_batch:
             planner_models.fit(buf, wm, encode_rows, 0, full=True)
         else:
@@ -2216,6 +2219,9 @@ def main(args):
                         seed = cem_buf[rt].clamp(-1.0, 1.0) * args.cem_warm_decay
                         mu0 = torch.where(warm[:, None, None], seed,
                                           torch.zeros_like(seed))
+                    act_scale_now = float(amax_frac[0]) if (args.plan_act_scale and args.amax_curric) else 1.0
+                    if planner_models is not None:
+                        planner_models.act_scale = act_scale_now       # also used by the periodic fits
                     if args.planner == "rp1" and planner_models is not None and planner_models.trainer is not None:
                         # RP1 arm: K refinement rounds against the critic through the frozen WM (9 rollouts)
                         cem_buf[rt] = planner_models.plan(wm, hist_z[:, rt], hist_a[:, rt], zstar_env[rt],
@@ -2231,7 +2237,8 @@ def main(args):
                                                mu0=mu0,
                                                cost_fn=(planner_models.value_cost()
                                                         if (planner_models is not None and planner_models.trainer is not None)
-                                                        else None))
+                                                        else None),
+                                               act_scale=act_scale_now)
                     cem_ptr[ridx] = 0
                 a = cem_buf[torch.arange(args.n_envs, device=device),
                             torch.as_tensor(cem_ptr, device=device)].clamp(-1.0, 1.0)  # safety: bound to trained range
@@ -3460,6 +3467,12 @@ def parse_args():
     p.add_argument("--rp1-lr", type=float, default=1e-4)
     p.add_argument("--rp1-live-critic", action=argparse.BooleanOptionalAction, default=True,
                    help="co-train the critic (EMA teacher) during refiner fits, as in RP1.")
+    p.add_argument("--plan-act-scale", action="store_true",
+                   help="roll the WM out on the EXECUTED action (plan * amax_frac) instead of the raw plan. "
+                        "The WM is trained on executed (amplitude-scaled) actions, so without this the planner "
+                        "imagines steps 1/amax_frac (4-14x in the wr lineage) larger than it executes and the "
+                        "gradient-based refiner drives its plan into the clip (found 2026-09-17). Off = the "
+                        "campaign's cem_plan convention.")
     p.add_argument("--gamma", type=float, default=0.9)
     p.add_argument("--tau", type=float, default=0.005, help="Polyak rate (SAC-style target critic)")
     p.add_argument("--actor-lr", type=float, default=3e-4)

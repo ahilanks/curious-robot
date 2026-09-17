@@ -124,7 +124,7 @@ class BufferLatentCache:
 
 
 # --------------------------------------------------------------------------- WM rollout
-def wm_rollout(wm, hist_z, hist_a, plan, Hb):
+def wm_rollout(wm, hist_z, hist_a, plan, Hb, act_scale=1.0):
     """Autoregressive rollout of a (B, T, A) plan from the last Hb real latents/actions, exactly the
     cem_plan recipe (eager predict, fp32, differentiable w.r.t. plan). hist_z (Hb,B,D), hist_a (Hb,B,A).
     Returns the terminal latent (B, D)."""
@@ -132,7 +132,7 @@ def wm_rollout(wm, hist_z, hist_a, plan, Hb):
     z_seq = hist_z.transpose(0, 1)                       # (B, Hb, D)
     a_seq = hist_a.transpose(0, 1)                       # (B, Hb, A)
     for h in range(plan.shape[1]):
-        a_seq = torch.cat([a_seq, plan[:, h:h + 1]], dim=1)
+        a_seq = torch.cat([a_seq, plan[:, h:h + 1] * act_scale], dim=1)   # act_scale: executed units (--plan-act-scale)
         znext = predict(z_seq[:, -Hb:], wm.action_encoder(a_seq[:, -Hb:]))[:, -1:]
         z_seq = torch.cat([z_seq, znext], dim=1)
     return z_seq[:, -1]
@@ -167,6 +167,7 @@ class PlannerModels:
         self.ropt = torch.optim.Adam(self.refiner.parameters(), lr=args.rp1_lr) if self.refiner is not None else None
         self.rng = np.random.default_rng(args.seed + 7)
         self.n_fits, self.last_fit_step, self.stats = 0, -1, {}
+        self.act_scale = 1.0        # --plan-act-scale: the WM sees plan * amax_frac (what is executed); set by the loop
 
     # planning-time critic = the EMA teacher (RP1: the actor's teacher)
     @property
@@ -222,7 +223,7 @@ class PlannerModels:
         plans, values = [x], []
         for k in range(a.rp1_K):
             with torch.enable_grad():
-                v = V(wm_rollout(wm, hist_z, hist_a, x, self.Hb), zg)
+                v = V(wm_rollout(wm, hist_z, hist_a, x, self.Hb, self.act_scale), zg)
                 (g,) = torch.autograd.grad(v.sum(), x, retain_graph=train)
             values.append(v if train else v.detach())
             delta = self.refiner(x.flatten(1), v.detach(), g.detach().flatten(1))
@@ -230,7 +231,7 @@ class PlannerModels:
             x = xn if train else xn.detach().requires_grad_(True)
             plans.append(x)
         with (torch.enable_grad() if train else torch.no_grad()):
-            vK = V(wm_rollout(wm, hist_z, hist_a, x, self.Hb), zg)
+            vK = V(wm_rollout(wm, hist_z, hist_a, x, self.Hb, self.act_scale), zg)
         values.append(vK)
         return plans, values
 
