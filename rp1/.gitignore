@@ -1,0 +1,7 @@
+.venv/
+downloads/
+swm_home/
+runs/cache/
+runs/smoke/
+*.log
+__pycache__/
