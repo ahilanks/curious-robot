@@ -61,6 +61,10 @@ ap.add_argument("--amax-frac", default="",
                 help="comma-separated label=frac: the run's amplitude-curriculum fraction (eff amax / action_max) "
                      "at the probed ckpt, so the probe executes clamp(plan)*frac like the loop (and a "
                      "--plan-act-scale head rolls the WM out at that scale). Missing label = 1.0 (raw plan).")
+ap.add_argument("--no-dwell", action="store_true",
+                help="probe-time override: disable the dwell HOLD/SHRINK mechanics (a block-shift goal photo sits "
+                     "~1.2 latent units away, INSIDE the hold radius 1.25*eps, so with dwell on the stack parks "
+                     "and cannot pursue by construction; 2026-09-17)")
 ap.add_argument("--stage-pose", choices=("home", "visible"), default="home",
                 help="'home' = reset pose (block start typically occluded on wrist); 'visible' = "
                      "rejection-sample servo-driven staging poses until the block START is in frame "
@@ -170,6 +174,8 @@ for label, path in ckpts:
     wm, a = build_wm(ck, n_dof, device)
     if args.horizon:
         a.cem_horizon = args.horizon
+    if args.no_dwell:
+        a.dwell_hold_mult = 0.0; a.dwell_shrink_start = 0.0
     a_dim = n_dof * a.action_block
     H = a.history_size
     rows = []
