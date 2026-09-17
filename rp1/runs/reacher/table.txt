@@ -1,0 +1,22 @@
+
+== reacher h=25 tau=0.1   (runs = eval seeds x planner seeds; eps = episodes)
+   planner        ours    sd runs   eps |  paper
+   noop            2.3   0.7    6   300 |    -  
+   cem/latent     98.7   0.9    6   300 |   98.7
+   cem/value      98.0   1.2    6   300 |   97.3
+   mppi/latent    63.7   3.9    6   300 |   63.7
+   mppi/value     84.0   3.8    6   300 |   74.0
+   adam/latent    90.0   4.2    6   300 |   94.0
+   adam/value     89.7   3.5    6   300 |   88.0
+   rp1            97.9   2.1   36  1800 |   98.7
+
+== reacher h=25 tau=0.05   (runs = eval seeds x planner seeds; eps = episodes)
+   planner        ours    sd runs   eps |  paper
+   noop            0.7   0.9    6   300 |    -  
+   cem/latent     81.3   6.7    6   300 |   80.3
+   cem/value      83.0   6.0    6   300 |   82.0
+   mppi/latent    43.3   4.7    6   300 |   39.3
+   mppi/value     61.3   1.9    6   300 |   42.0
+   adam/latent    61.7  10.5    6   300 |   66.0
+   adam/value     67.0   6.2    6   300 |   64.7
+   rp1            86.6   5.5   36  1800 |   88.7

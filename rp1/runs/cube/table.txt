@@ -1,0 +1,22 @@
+
+== cube h=25   (runs = eval seeds x planner seeds; eps = episodes)
+   planner        ours    sd runs   eps |  paper |   hard  paper
+   noop           53.3   3.8    3   150 |   56.0 |    -      -  
+   cem/latent     75.3   3.4    3   150 |   74.0 |   47.1   40.9
+   cem/value      81.3   0.9    3   150 |   84.0 |   60.0   63.6
+   mppi/latent    61.3   0.9    3   150 |   56.7 |   17.1    1.6
+   mppi/value     69.3   2.5    3   150 |   63.3 |   34.3   16.6
+   adam/latent    75.3   1.9    3   150 |   74.0 |   47.1   40.9
+   adam/value     76.0   2.8    3   150 |   74.7 |   48.6   42.5
+   rp1            86.0   2.8    9   450 |   89.1 |   70.0   75.2
+
+== cube h=100   (runs = eval seeds x planner seeds; eps = episodes)
+   planner        ours    sd runs   eps |  paper |   hard  paper
+   noop           44.0   4.9    3   150 |   45.3 |    -      -  
+   cem/latent     64.7   2.5    3   150 |   58.0 |   36.9   23.2
+   cem/value      74.7   3.4    3   150 |   76.7 |   54.8   57.4
+   mppi/latent    49.3   3.8    3   150 |   46.7 |    9.5    2.5
+   mppi/value     58.7   1.9    3   150 |   52.0 |   26.2   12.2
+   adam/latent    56.0   4.3    3   150 |   57.3 |   21.4   21.9
+   adam/value     67.3   3.4    3   150 |   68.7 |   41.7   42.7
+   rp1            77.8   4.0    9   450 |   82.4 |   60.3   67.8

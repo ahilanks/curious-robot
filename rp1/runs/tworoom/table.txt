@@ -1,0 +1,22 @@
+
+== tworoom h=25   (runs = eval seeds x planner seeds; eps = episodes)
+   planner        ours    sd runs   eps |  paper
+   noop            4.0   3.3    3   150 |    -  
+   cem/latent     84.7   4.1    3   150 |   84.0
+   cem/value     100.0   0.0    3   150 |  100.0
+   mppi/latent    70.0   4.3    3   150 |   70.7
+   mppi/value     96.0   4.3    3   150 |   87.3
+   adam/latent    92.7   0.9    3   150 |   94.7
+   adam/value     97.3   0.9    3   150 |   96.7
+   rp1            99.3   0.9    9   450 |  100.0
+
+== tworoom h=100   (runs = eval seeds x planner seeds; eps = episodes)
+   planner        ours    sd runs   eps |  paper
+   noop            0.0   0.0    3   150 |    -  
+   cem/latent     14.7   0.9    3   150 |   13.3
+   cem/value      94.7   3.4    3   150 |   94.7
+   mppi/latent    20.0   1.6    3   150 |   20.0
+   mppi/value     77.3   1.9    3   150 |   64.0
+   adam/latent    26.7   0.9    3   150 |   24.0
+   adam/value     85.3   2.5    3   150 |   83.3
+   rp1            97.6   4.1    9   450 |   94.2
