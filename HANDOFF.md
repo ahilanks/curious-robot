@@ -36,7 +36,7 @@ Emergent block manipulation: a from-scratch agent (SO-101 sim, wrist-cam pixels 
 
 ## Pre-registered next (user-ordered) — all SIM
 1. **Adopt `--plan-act-scale`** in the canonical recipe; a 200k-scale chain with it (does the precision gain compound with sleeps and the amplitude curriculum?).
-2. **Close-out A**: salience/pursuit probes on `ckpt_0200000` (`src/probe_block_goal_learn.py`) — FIRST port `--plan-act-scale` (and the planner flags) into `src/eval_goal_photo.act_stack`, which currently executes the raw CEM plan with no amax_frac (planner-unfaithful for every amax-curric head).
+2. **Close-out A / pursuit at scale**: the probe is now planner-faithful (`--amax-frac`, `--eps`, `--no-dwell`; 09-17). Run 100+ scenes at eps 0.5 on `rp1x_l2s@10k` vs `rp1x_l2@10k` vs the 200k head to settle the weak 36-scene trend, then build the goal-type-aware arrival scale (eps/hold set by goal kind, or a hold gated on qpos stationarity) into the loop.
 3. **Close-out B — the policy arm**: π(a | z_hist, a_hist, z*) on the frozen latent, HER + latent-distance reward (the 09-17 critic result says latent distance is an adequate reward here); twin vs the scaled CEM.
 4. Pursuit needs the WM side (contact data / contact-displacement fidelity), not another planner.
 5. Recover `--cem-hier` (two-level latent CEM; code lost 09-13).
