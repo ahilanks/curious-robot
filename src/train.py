@@ -39,6 +39,7 @@ from lewm.module import SIGReg                       # noqa: E402
 from model.state_encoder import WorldModel, pred_dims_from_args  # noqa: E402
 from src.probe import load_probe_hf                  # noqa: E402
 from src.goal_explore import GoalArchive             # noqa: E402  (--goal-explore goal archive)
+from src.rp1_planner import PlannerModels            # noqa: E402  (--plan-cost value / --planner rp1)
 # Env backends are imported lazily in main() so the `hardware` backend does not require mujoco.
 
 try:
@@ -520,7 +521,7 @@ def score_obs_mse(wm, gpx, gprop, spx, sprop, sact, device, H):
 
 @torch.no_grad()
 def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, device, diag=None, gamma=0.0,
-             min_std=0.0, mppi_temp=0.0, early_stop_tol=0.0, early_stop_min_iters=12, mu0=None):
+             min_std=0.0, mppi_temp=0.0, early_stop_tol=0.0, early_stop_min_iters=12, mu0=None, cost_fn=None):
     """CEM planner in LATENT space -- a faithful port of LeWM's stable_worldmodel.solver.CEMSolver
     (+ JEPA.rollout/criterion). Per replan: sample H-step action SEQUENCES from a per-step Gaussian,
     FORCE candidate 0 = the current mean (LeWM's candidates[:,0]=mean), roll each AUTOREGRESSIVELY
@@ -562,7 +563,10 @@ def cem_plan(wm, hist_z, hist_a, z_goal, K, iters, elite, init_std, horizon, dev
                 a_seq = torch.cat([a_seq, sf[:, h:h + 1]], dim=1)        # apply candidate action a_{t+h}
                 znext = predict(z_seq[:, -Hb:], wm.action_encoder(a_seq[:, -Hb:]))[:, -1:]
                 z_seq = torch.cat([z_seq, znext], dim=1)                 # append predicted z_{t+h+1}
-                step_costs.append((znext[:, -1] - zg).pow(2).sum(-1))    # (n*K,) running cost at step h+1
+                if cost_fn is None:
+                    step_costs.append((znext[:, -1] - zg).pow(2).sum(-1))    # (n*K,) running cost at step h+1
+                else:                                                        # --plan-cost value: V(z_hat, z*)
+                    step_costs.append(cost_fn(znext[:, -1], zg))
             # cost = discounted running sum sum_h gamma^(T-1-h) ||z_h - z*||^2 (terminal weight 1).
             # gamma=0 -> terminal-only, BYTE-IDENTICAL to the LeWM objective; gamma in (0,1] shapes the
             # path so CEM gets gradient toward the goal even when the H-step endpoint is out of reach.
@@ -1474,6 +1478,28 @@ def main(args):
             except Exception as _ex:
                 print(f"[state] restore failed ({_ex}) -> starting empty", flush=True)
 
+    # --- RP1 three-arm experiment: value critic (+ RP1 refiner) fitted on the buffer's own latents ---
+    planner_models, plan_diag, pm_full = None, {}, [False]
+    if args.planner == "rp1":
+        args.plan_cost = "value"
+    if args.plan_cost == "value":
+        if not args.cem:
+            raise SystemExit("--plan-cost value / --planner rp1 require --cem")
+        if not args.freeze_encoder:
+            print("[planner] WARNING: --plan-cost value without --freeze-encoder: the critic reads a moving latent",
+                  flush=True)
+
+        def encode_rows(px, pr):
+            with torch.no_grad():
+                return encode_obs(wm, px, pr, device).float().cpu().numpy()
+        planner_models = PlannerModels(args, z_dim, a_dim, max(args.cem_horizon, 1), H, device)
+        if buf.total >= 4 * args.vcritic_batch:
+            planner_models.fit(buf, wm, encode_rows, 0, full=True)
+        else:
+            print(f"[planner] buffer holds {buf.total} transitions: first fit deferred to step "
+                  f"{args.vcritic_fit_every}", flush=True)
+            pm_full[0] = True
+
     run_name = args.name
     out_dir = Path(args.out_dir) if args.out_dir else Path("runs") / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2190,14 +2216,22 @@ def main(args):
                         seed = cem_buf[rt].clamp(-1.0, 1.0) * args.cem_warm_decay
                         mu0 = torch.where(warm[:, None, None], seed,
                                           torch.zeros_like(seed))
-                    cem_buf[rt] = cem_plan(wm, hist_z[:, rt], hist_a[:, rt], zstar_env[rt],
-                                           args.cem_samples, args.cem_iters, args.cem_elites,
-                                           args.cem_init_std, args.cem_horizon, device, diag=cem_diag,
-                                           gamma=args.cem_gamma, min_std=args.cem_min_std,
-                                           mppi_temp=args.cem_mppi_temp,
-                                           early_stop_tol=args.cem_early_stop,
-                                           early_stop_min_iters=args.cem_early_stop_min_iters,
-                                           mu0=mu0)
+                    if args.planner == "rp1" and planner_models is not None and planner_models.trainer is not None:
+                        # RP1 arm: K refinement rounds against the critic through the frozen WM (9 rollouts)
+                        cem_buf[rt] = planner_models.plan(wm, hist_z[:, rt], hist_a[:, rt], zstar_env[rt],
+                                                          diag=plan_diag)
+                    else:
+                        cem_buf[rt] = cem_plan(wm, hist_z[:, rt], hist_a[:, rt], zstar_env[rt],
+                                               args.cem_samples, args.cem_iters, args.cem_elites,
+                                               args.cem_init_std, args.cem_horizon, device, diag=cem_diag,
+                                               gamma=args.cem_gamma, min_std=args.cem_min_std,
+                                               mppi_temp=args.cem_mppi_temp,
+                                               early_stop_tol=args.cem_early_stop,
+                                               early_stop_min_iters=args.cem_early_stop_min_iters,
+                                               mu0=mu0,
+                                               cost_fn=(planner_models.value_cost()
+                                                        if (planner_models is not None and planner_models.trainer is not None)
+                                                        else None))
                     cem_ptr[ridx] = 0
                 a = cem_buf[torch.arange(args.n_envs, device=device),
                             torch.as_tensor(cem_ptr, device=device)].clamp(-1.0, 1.0)  # safety: bound to trained range
@@ -2263,6 +2297,7 @@ def main(args):
             h_fwd = learner_updates(step, h_fwd)
             if args.cotrain_every > 0 and step > 0 and step % args.cotrain_every == 0:
                 cotrain_encoder_phase(step, h_fwd)   # time-phased CEM-directed encoder co-train (offline cycle)
+                pm_full[0] = True                    # latent moved -> FULL critic/refiner re-fit at the next fit
             if (args.cotrain_frac_thresh > 0 and step > 0
                     and len(step_jump_recent) == step_jump_recent.maxlen
                     and step - frac_trig["last"] >= args.cotrain_frac_cooldown):
@@ -2271,8 +2306,14 @@ def main(args):
                     print(f"[cotrain-trigger] frac_rand {frac_now:.3f} > {args.cotrain_frac_thresh} at step "
                           f"{step} -> pause CEM, co-train phase #{frac_trig['n'] + 1}", flush=True)
                     cotrain_encoder_phase(step, h_fwd)
+                    pm_full[0] = True
                     frac_trig["last"], frac_trig["n"] = step, frac_trig["n"] + 1
                     step_jump_recent.clear()                 # measure post-sleep locality on fresh data only
+        if (planner_models is not None and step > 0 and step % args.vcritic_fit_every == 0
+                and buf.total >= 4 * args.vcritic_batch):
+            # periodic critic/refiner re-fit on the grown cache (FULL after a sleep or a deferred first fit)
+            planner_models.fit(buf, wm, encode_rows, step, full=pm_full[0])
+            pm_full[0] = False
         _tnow = time.perf_counter(); _tacc["learn"] += _tnow - _tmark; _tmark = _tnow
         obs, sub_infos = env.step_block_wait()
         _tnow = time.perf_counter(); _tacc["env_wait"] += _tnow - _tmark; _tmark = _tnow
@@ -2574,6 +2615,12 @@ def main(args):
                 d["cem/min_cand_to_goal"] = cem_diag.get("min_cand_to_goal", float("nan"))  # best CONVERGED candidate->goal dist
                 d["cem/endpoint_disp"] = cem_diag.get("endpoint_disp", float("nan"))        # mean converged endpoint move from z_now
                 d["cem/iters_used"] = cem_diag.get("iters_used", float("nan"))              # CEM iterations after early-stop (30 = never stopped)
+            if planner_models is not None:      # RP1 three-arm experiment: critic / refiner fit stats + act-time values
+                d.update(planner_models.stats)
+                d["plan/n_fits"] = planner_models.n_fits
+                for _k in ("v0", "vK", "sat"):
+                    if _k in plan_diag:
+                        d[f"plan/{_k}"] = plan_diag[_k]
             if args.goal_explore:
                 d["goal/archive_size"] = sum(a.n for a in archives)        # total across buffer(s)
                 _ms = [a.mean_score() for a in archives if a.n]
@@ -2701,6 +2748,8 @@ def main(args):
                      "h_fwd": h_fwd, "args": vars(args)}
             if archives is not None:
                 state["goal_archive"] = [a.state_dict() for a in archives]
+            if planner_models is not None:
+                state["planner"] = planner_models.state_dict()
             save_and_upload(state, out_dir, step,
                             args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
                             run_name, not args.no_hf, args.keep_local_ckpts,
@@ -2752,6 +2801,8 @@ def main(args):
                  "h_fwd": h_fwd, "args": vars(args)}
         if archives is not None:
             state["goal_archive"] = [a.state_dict() for a in archives]
+        if planner_models is not None:
+            state["planner"] = planner_models.state_dict()
         save_and_upload(state, out_dir, args.total_steps,
                         args.hf_repo or os.environ.get("HF_UPLOAD_REPO_ID"),
                         run_name, not args.no_hf, args.keep_local_ckpts)
@@ -3378,6 +3429,37 @@ def parse_args():
                         "mean over ALL candidates (information-theoretic / path-integral update) instead of CEM's "
                         "hard top-k elites. Lower temp -> greedier (more model exploitation); higher -> softer. "
                         "0 (default) = LeWM hard-elite CEM. Tests whether soft selection exploits WM error less.")
+    # --- RP1 three-arm experiment (2026-09-17; src/rp1_planner.py, critic/refiner code from rp1/) ---
+    p.add_argument("--plan-cost", choices=("latent", "value"), default="latent",
+                   help="terminal cost the planner minimises: 'latent' = ||z_hat - z*||^2 (campaign baseline); "
+                        "'value' = V(z_hat, z*), a goal-conditioned quasimetric critic (RP1 App. B.1) = temporal "
+                        "cost-to-go in DECISIONS, trained by n-step TD + hindsight goals on the replay buffer's "
+                        "own frozen-encoder latents (no external data).")
+    p.add_argument("--planner", choices=("cem", "rp1"), default="cem",
+                   help="'cem' = the CEM search (--cem-*); 'rp1' = the RP1 plan refiner: K residual rounds "
+                        "a <- clip(a + f(a, v, dv/da)) through the frozen WM against the critic, trained pathwise "
+                        "on the buffer cache (RP1 App. B.2). Implies --plan-cost value. 9 WM rollouts/decision.")
+    p.add_argument("--vcritic-fit-every", type=int, default=2000,
+                   help="decisions between critic/refiner re-fits on the (grown) buffer cache; a FULL re-fit "
+                        "also follows every encoder sleep (the latent moved).")
+    p.add_argument("--vcritic-fit-steps", type=int, default=3000, help="TD steps of a FULL critic fit (start / post-sleep).")
+    p.add_argument("--vcritic-refit-steps", type=int, default=500, help="TD steps of a periodic critic re-fit.")
+    p.add_argument("--vcritic-gamma", type=float, default=0.98)
+    p.add_argument("--vcritic-expectile", type=float, default=0.1, help="expectile of the asymmetric Huber TD loss.")
+    p.add_argument("--vcritic-nstep", type=int, default=10, help="n-step bootstrap horizon (decisions).")
+    p.add_argument("--vcritic-max-delta", type=int, default=12, help="hindsight-goal cap for the refiner (decisions).")
+    p.add_argument("--vcritic-cross-prob", type=float, default=0.3, help="cross-episode goal probability.")
+    p.add_argument("--vcritic-lr", type=float, default=1e-3)
+    p.add_argument("--vcritic-batch", type=int, default=1024)
+    p.add_argument("--rp1-K", type=int, default=8, help="refinement rounds per decision.")
+    p.add_argument("--rp1-amax", type=float, default=1.0, help="plan clip range (the executable [-1,1] range).")
+    p.add_argument("--rp1-lambda-mean", type=float, default=0.1, help="weight of the mean intermediate value in J.")
+    p.add_argument("--rp1-fit-steps", type=int, default=1000, help="refiner steps of a FULL fit.")
+    p.add_argument("--rp1-refit-steps", type=int, default=200, help="refiner steps of a periodic re-fit.")
+    p.add_argument("--rp1-batch", type=int, default=128)
+    p.add_argument("--rp1-lr", type=float, default=1e-4)
+    p.add_argument("--rp1-live-critic", action=argparse.BooleanOptionalAction, default=True,
+                   help="co-train the critic (EMA teacher) during refiner fits, as in RP1.")
     p.add_argument("--gamma", type=float, default=0.9)
     p.add_argument("--tau", type=float, default=0.005, help="Polyak rate (SAC-style target critic)")
     p.add_argument("--actor-lr", type=float, default=3e-4)
