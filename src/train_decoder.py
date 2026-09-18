@@ -38,7 +38,7 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from model.state_encoder import WorldModel, pred_dims_from_args   # noqa: E402
+from model.state_encoder import WorldModel, pred_dims_from_args, touch_kwargs_from_args  # noqa: E402
 from model.decoder import LatentDecoder, ConvLatentDecoder, load_decoder  # noqa: E402
 from src.train import to_norm_pixel, resolve_ckpt                 # noqa: E402
 
@@ -87,7 +87,7 @@ def load_wm(ckpt_path: str, device) -> WorldModel:
                     history_size=int(get("history_size", 3) or 3),
                     dropout=float(get("wm_dropout", 0.1) or 0.1),
                     use_proprio=not bool(get("no_proprio", False)),
-                    **pred_dims_from_args(ck_args)).to(device)
+                    **touch_kwargs_from_args(ck_args), **pred_dims_from_args(ck_args)).to(device)
     wm.load_state_dict(ck["wm"])
     wm.eval().requires_grad_(False)
     return wm

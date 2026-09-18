@@ -36,7 +36,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from lewm.module import SIGReg                       # noqa: E402
-from model.state_encoder import WorldModel, pred_dims_from_args  # noqa: E402
+from model.state_encoder import WorldModel, pred_dims_from_args, touch_kwargs_from_args  # noqa: E402
 from src.probe import load_probe_hf                  # noqa: E402
 from src.goal_explore import GoalArchive             # noqa: E402  (--goal-explore goal archive)
 from src.rp1_planner import PlannerModels            # noqa: E402  (--plan-cost value / --planner rp1)
@@ -1317,10 +1317,16 @@ def main(args):
         parent_fleet = ParentFleet(args.n_envs, mode=args.parent_vla,  # lerobot loads only when used.
                                    rate=args.parent_rate, model_id=args.parent_model)
 
+    if args.touch_input != "none" and args.no_torque_obs:
+        raise SystemExit("--touch-input effort reads the u^app slice that --no-torque-obs zeroes")
     wm = WorldModel(n_dof=n_dof, action_block=args.action_block,
                     history_size=H, dropout=args.wm_dropout,
                     use_proprio=not args.no_proprio,
+                    **touch_kwargs_from_args(args), touch_norm=getattr(env, "tau_max", None),
                     **pred_dims_from_args(args)).to(device)
+    if args.touch_input != "none":
+        print(f"[touch] encoder fuses '{args.touch_input}' (scale {args.touch_scale}) into the CLS before the projector; "
+              f"touch_norm {wm.encoder.touch_norm.tolist()}", flush=True)
     if args.wm_grad_checkpoint:  # off by default: ViT-tiny encode activations are sub-GB vs 80GB free,
         try:                     # so recompute-on-backward is pure slowdown here (the H_fwd rollout is in latent space)
             wm.encoder.vit.gradient_checkpointing_enable()
@@ -3153,6 +3159,12 @@ def parse_args():
     p.add_argument("--knn-k", type=int, default=12, help="k for the k-NN state-entropy estimate")
     p.add_argument("--knn-buffer", type=int, default=4096,
                    help="size of the recent-latent ring buffer the k-NN reward measures novelty against")
+    p.add_argument("--touch-input", choices=("none", "effort"), default="none",
+                   help="TOUCH BRANCH in the pixels-only encoder (2026-09-18): 'effort' = the 6 applied joint efforts "
+                        "u^app / tau_max, embedded (LeWM Embedder) and added to the ViT CLS before the projector, "
+                        "fused = cls + touch_scale * emb(touch) -- the lewm/jepa_touch.py design ported. The latent "
+                        "then carries the arm's load (table / block contact shows as effort deviations).")
+    p.add_argument("--touch-scale", type=float, default=1.0, help="--touch-input: multiplier on the touch embedding (LeWM-Cube sweep: 0.1-1 equal, 10 worse)")
     p.add_argument("--no-torque-obs", action="store_true",
                    help="zero the u^app slice of proprio (obs -> [q, qd, 0]); shapes unchanged so old ckpts "
                         "load. Removes the obs channel that is ~96%% saturated sign-bit on hw and the main "

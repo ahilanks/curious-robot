@@ -23,7 +23,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from env.parallel_env import SubprocVectorMujocoEnv                    # noqa: E402
-from model.state_encoder import WorldModel, pred_dims_from_args        # noqa: E402
+from model.state_encoder import WorldModel, pred_dims_from_args, touch_kwargs_from_args  # noqa: E402
 from src.train import cem_plan, encode_obs, scrub_torque_obs           # noqa: E402
 
 
@@ -32,7 +32,7 @@ def build_wm(ckpt, n_dof, device):
     wm = WorldModel(n_dof=n_dof, action_block=a.action_block,
                     history_size=a.history_size, dropout=a.wm_dropout,
                     use_proprio=not a.no_proprio,
-                    **pred_dims_from_args(a)).to(device)
+                    **touch_kwargs_from_args(a), **pred_dims_from_args(a)).to(device)
     wm.load_state_dict(ckpt["wm"])
     wm.eval()
     for p in wm.parameters():
