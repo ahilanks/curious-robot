@@ -1,0 +1,11 @@
+# LeWM sweep artifacts (per-pod, never committed): venv, datasets/checkpoints, logs, W&B, hydra outputs
+.venv/
+swm_home/
+downloads/
+runs/
+wandb/
+outputs/
+multirun/
+lightning_logs/
+__pycache__/
+wandb_resume.json
