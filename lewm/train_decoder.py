@@ -126,6 +126,8 @@ def recalibrate_bn(model, h5_path, device, n_batches: int = 30, batch: int = 64,
         a_dim = act_all.shape[-1]
         ok = ~np.isnan(act_all).any(1)
         a_mean, a_std = act_all[ok].mean(0), act_all[ok].std(0, ddof=1)
+        key = touch_key(model)
+        tstats = column_stats(f, key) if key else None
         eps_ok = np.where(ep_len >= (H + 1) * fs)[0]
         for _ in range(n_batches):
             wins = sorted((int(rng.choice(eps_ok)), 0) for _ in range(batch))
@@ -134,7 +136,11 @@ def recalibrate_bn(model, h5_path, device, n_batches: int = 30, batch: int = 64,
             ac = np.stack([act_all[ep_off[e] + s: ep_off[e] + s + (H + 1) * fs].reshape(H + 1, fs * a_dim) for e, s in wins])
             ac = np.nan_to_num((ac - np.tile(a_mean, fs)) / np.tile(a_std, fs))
             x = preprocess(resize_u8(fr.reshape(-1, *fr.shape[2:]), img_size), device, img_size).reshape(batch, H + 1, 3, img_size, img_size)
-            out = model.encode({"pixels": x, "action": torch.as_tensor(ac, device=device).float()})
+            info = {"pixels": x, "action": torch.as_tensor(ac, device=device).float()}
+            if key:
+                tch = read_col_rows(f, key, [slice(ep_off[e] + s, ep_off[e] + s + H * fs + 1, fs) for e, s in wins], tstats)
+                info[key] = torch.as_tensor(tch.reshape(batch, -1, tch.shape[-1])[:, :H + 1], device=device).float()
+            out = model.encode(info)
             model.predict(out["emb"][:, :H], out["act_emb"][:, :H])      # pred_proj's BatchNorm sees predictions
     for m in bns:
         m.eval()
@@ -161,13 +167,42 @@ def resize_u8(px_u8: np.ndarray, img_size: int = 224) -> np.ndarray:
     return (x.clamp(0, 1) * 255).round().byte().permute(0, 2, 3, 1).numpy()
 
 
+def touch_key(model):
+    """The h5 column a JEPATouch model fuses into its encoder (None for plain LeWM)."""
+    return getattr(model, "touch_key", None)
+
+
+def column_stats(h5, key):
+    """(mean, std) of an h5 column as the trainer's get_column_normalizer computes them (NaN rows dropped, unbiased std)."""
+    col = h5[key][:].astype(np.float32).reshape(len(h5[key]), -1)
+    ok = ~np.isnan(col).any(1)
+    return col[ok].mean(0), col[ok].std(0, ddof=1)
+
+
+def read_col_rows(h5, key, rows_or_slices, stats=None):
+    """h5[key] for a list of slices / index arrays -> (N, k) float32, optionally z-scored with `stats`."""
+    parts = [np.asarray(h5[key][r]).reshape(-1, np.prod(h5[key].shape[1:], dtype=int)) for r in rows_or_slices]
+    x = np.concatenate(parts).astype(np.float32)
+    if stats is not None:
+        x = (x - stats[0]) / stats[1]
+    return np.nan_to_num(x)
+
+
 @torch.no_grad()
-def encode_frames(model, px_u8: np.ndarray, device, batch: int = 128, img_size: int = 224) -> torch.Tensor:
-    """-> (N, D) latents = JEPA.encode(...)['emb'] (projector output) for single frames."""
+def encode_frames(model, px_u8: np.ndarray, device, batch: int = 128, img_size: int = 224,
+                  touch: np.ndarray | None = None) -> torch.Tensor:
+    """-> (N, D) latents = JEPA.encode(...)['emb'] (projector output) for single frames.
+    `touch` (N, k), already z-scored, is required for a JEPATouch model (its encoder input)."""
+    key = touch_key(model)
+    if key is not None and touch is None:
+        raise ValueError(f"model fuses '{key}' into its encoder: pass touch=")
     zs = []
     for i in range(0, len(px_u8), batch):
         x = preprocess(px_u8[i:i + batch], device, img_size).unsqueeze(1)          # (B, 1, 3, H, W)
-        out = model.encode({"pixels": x})
+        info = {"pixels": x}
+        if key is not None:
+            info[key] = torch.as_tensor(touch[i:i + batch], device=device).float().unsqueeze(1)   # (B, 1, k)
+        out = model.encode(info)
         zs.append(out["emb"][:, 0].float().cpu())
     return torch.cat(zs)
 
@@ -190,6 +225,51 @@ def sample_blocks(n_rows: int, n_blocks: int, block: int, rng, exclude=()) -> np
 def read_blocks(h5, starts: np.ndarray, block: int) -> np.ndarray:
     px = h5["pixels"]
     return np.concatenate([px[s:s + block] for s in starts])
+
+
+def cube_mask(u8: np.ndarray, dilate: int = 2) -> np.ndarray:
+    """(N,H,W,3) uint8 -> (N,H,W) bool: the red cube's pixels (R high, G/B low; the purple gripper has B high),
+    dilated `dilate` px inside each frame so the decoder's blur is scored too."""
+    from scipy.ndimage import binary_dilation
+    r, g, b = (u8[..., c].astype(np.int16) for c in range(3))
+    m = (r > 120) & (g < 90) & (b < 90) & (r - g > 60)
+    if dilate:
+        st = np.zeros((3, 3, 3), bool); st[1] = True
+        m = binary_dilation(m, structure=st, iterations=dilate)
+    return m
+
+
+def masked_mse(dec_u8: np.ndarray, real_u8: np.ndarray, mask: np.ndarray, min_px: int = 30) -> tuple[float, float, int]:
+    """-> (mse inside the mask, mse outside, frames used): pixel MSE in [0,1] units over frames with >= min_px masked px."""
+    err = ((dec_u8.astype(np.float32) - real_u8.astype(np.float32)) / 255.0) ** 2   # (N,H,W,3)
+    keep = mask.reshape(len(mask), -1).sum(1) >= min_px
+    if keep.sum() == 0:
+        return float("nan"), float(err.mean()), 0
+    e, m = err[keep], mask[keep][..., None]
+    return float(e[np.broadcast_to(m, e.shape)].mean()), float(e[~np.broadcast_to(m, e.shape)].mean()), int(keep.sum())
+
+
+def linear_probe_r2(z_fit: torch.Tensor, y_fit: np.ndarray, z_val: torch.Tensor, y_val: np.ndarray, ridge: float = 1e-2,
+                    val_mask: np.ndarray | None = None) -> float:
+    """Ridge readout z -> y fitted on the fit frames, pooled R^2 on the val frames. LeWM Sec. 6-style
+    physical-quantity probing: a linear map, so it measures what the latent holds linearly, not what a decoder can dig out."""
+    z_fit, z_val = z_fit.double().cpu(), z_val.double().cpu()
+    yf, yv = torch.as_tensor(y_fit, dtype=torch.double), torch.as_tensor(y_val, dtype=torch.double)
+    mu, sd = z_fit.mean(0, keepdim=True), z_fit.std(0, keepdim=True) + 1e-6
+    X = torch.cat([(z_fit - mu) / sd, torch.ones(len(z_fit), 1, dtype=torch.double)], 1)
+    Xv = torch.cat([(z_val - mu) / sd, torch.ones(len(z_val), 1, dtype=torch.double)], 1)
+    I = torch.eye(X.shape[1], dtype=torch.double); I[-1, -1] = 0
+    W = torch.linalg.solve(X.T @ X + ridge * len(X) * I, X.T @ yf)
+    pred = Xv @ W
+    if val_mask is not None:                       # score on a subset of the val frames (fit unchanged)
+        keep = torch.as_tensor(np.asarray(val_mask, bool))
+        if int(keep.sum()) < 20:
+            return float("nan")
+        yv, pred = yv[keep], pred[keep]
+    # POOLED R^2 over the target dims (1 - sum SSres / sum SStot): a per-target mean blows up on a target with
+    # ~zero variance in the scored subset (the cube's height is constant while it sits on the table)
+    ss_res = ((yv - pred) ** 2).sum(); ss_tot = ((yv - yv.mean(0, keepdim=True)) ** 2).sum()
+    return float(1 - ss_res / ss_tot.clamp_min(1e-12))
 
 
 def latent_stats(z: torch.Tensor) -> dict:
@@ -233,13 +313,32 @@ def main(a: argparse.Namespace) -> dict:
         t0 = time.time()
         val_u8 = read_blocks(f, val_starts, a.block)
         fit_u8 = read_blocks(f, fit_starts, a.block)
+        sl_val, sl_fit = [slice(s, s + a.block) for s in val_starts], [slice(s, s + a.block) for s in fit_starts]
+        key = touch_key(model)
+        tstats = column_stats(f, key) if key else None
+        touch_val = read_col_rows(f, key, sl_val, tstats) if key else None
+        touch_fit = read_col_rows(f, key, sl_fit, tstats) if key else None
+        probes = {}
+        for name, col in (("block", a.probe_block_col), ("effector", a.probe_effector_col)):
+            if col in f:
+                probes[name] = (read_col_rows(f, col, sl_fit), read_col_rows(f, col, sl_val))
     print(f"[decoder] {h5_path}: {n_rows} rows of {raw_shape}; fit {len(fit_u8)} / val {len(val_u8)} frames "
-          f"in {len(fit_starts)}+{len(val_starts)} blocks of {a.block} (read {time.time() - t0:.0f}s)", flush=True)
+          f"in {len(fit_starts)}+{len(val_starts)} blocks of {a.block} (read {time.time() - t0:.0f}s)"
+          + (f"; touch input '{key}' (mean {tstats[0][0]:.3f} std {tstats[1][0]:.3f})" if key else ""), flush=True)
     fit_u8, val_u8 = resize_u8(fit_u8, a.img_size), resize_u8(val_u8, a.img_size)
 
     t0 = time.time()
-    z_fit = encode_frames(model, fit_u8, device, a.encode_batch, a.img_size).to(device)
-    z_val = encode_frames(model, val_u8, device, a.encode_batch, a.img_size).to(device)
+    z_fit = encode_frames(model, fit_u8, device, a.encode_batch, a.img_size, touch=touch_fit).to(device)
+    z_val = encode_frames(model, val_u8, device, a.encode_batch, a.img_size, touch=touch_val).to(device)
+    probe_r2 = {n: linear_probe_r2(z_fit, yf, z_val, yv) for n, (yf, yv) in probes.items()}
+    if "block" in probes and "effector" in probes:
+        # the cube's position when it is NOT in the gripper (>= --far-m from the effector): the frames where the
+        # latent has to see the cube itself rather than infer it from the arm
+        far = np.linalg.norm(probes["block"][1] - probes["effector"][1], axis=1) >= a.far_m
+        probe_r2["block_far"] = linear_probe_r2(z_fit, probes["block"][0], z_val, probes["block"][1], val_mask=far)
+        probe_r2["n_far"] = int(far.sum())
+    if probe_r2:
+        print("[decoder] linear probe R^2 (val): " + "  ".join(f"{n} {v:.3f}" for n, v in probe_r2.items()), flush=True)
     stats = latent_stats(z_val.cpu())
     print(f"[decoder] encoded {len(z_fit) + len(z_val)} frames in {time.time() - t0:.0f}s; val latent: "
           f"z_std {stats['z_std']:.3f} eff_rank {stats['eff_rank']:.1f}/{stats['dim']} rankme {stats['rankme']:.1f} "
@@ -287,12 +386,18 @@ def main(a: argparse.Namespace) -> dict:
                   f"({(time.time() - t0) / step * 1000:.0f} ms/step)", flush=True)
     vmse = evaluate()
     dec.eval()
+    with torch.no_grad():
+        rec_val = np.concatenate([dec.to_uint8_hwc(z_val[i:i + a.batch]) for i in range(0, len(z_val), a.batch)])
+    cube_mse, bg_mse, cube_frames = masked_mse(rec_val, val_u8, cube_mask(val_u8))
+    print(f"[decoder] cube-pixel val MSE {cube_mse:.4f} vs background {bg_mse:.4f} over {cube_frames} frames with a visible cube", flush=True)
     torch.save({"decoder": dec.state_dict(), "z_dim": int(z_fit.shape[1]), "arch": dec.config(), "val_mse": vmse,
                 "steps": a.steps, "n_frames": int(len(z_fit)), "run": a.run, "epoch": epoch, "weights": str(wpath),
                 "dataset": str(h5_path), "seed": a.seed, "bn_recal": not a.no_bn_recal}, out_pt)
     meta = dict(run=a.run, epoch=epoch, weights=str(wpath), dataset=str(h5_path), val_mse=vmse, steps=a.steps,
                 n_fit=int(len(z_fit)), n_val=int(len(z_val)), block=a.block, seed=a.seed, img_size=a.img_size,
-                bn_recal=not a.no_bn_recal, bn_batches=a.bn_batches,
+                bn_recal=not a.no_bn_recal, bn_batches=a.bn_batches, touch_key=key,
+                cube_mse=cube_mse, bg_mse=bg_mse, cube_frames=cube_frames,
+                probe_r2={n: float(v) for n, v in probe_r2.items()},
                 fit_starts=fit_starts.tolist(), val_starts=val_starts.tolist(), latent=stats, decoder=out_pt.name)
     out_pt.with_suffix(".json").write_text(json.dumps(meta, indent=1))
 
@@ -330,6 +435,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0, help="frame sampling seed: keep it FIXED across a sweep")
     p.add_argument("--no-bn-recal", action="store_true", help="use the checkpoint's BatchNorm running stats as saved")
     p.add_argument("--bn-batches", type=int, default=30, help="windows batches (x64) for the BatchNorm re-estimation")
+    p.add_argument("--probe-block-col", default="privileged_block_0_pos", help="h5 column for the object-position linear probe")
+    p.add_argument("--probe-effector-col", default="proprio_effector_pos", help="h5 column for the end-effector linear probe")
+    p.add_argument("--far-m", type=float, default=0.05, help="cube-to-effector distance (m) defining the 'cube not in hand' probe subset")
     p.add_argument("--device", default=None)
     return p.parse_args(argv)
 

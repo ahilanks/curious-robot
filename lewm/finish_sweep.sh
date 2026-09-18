@@ -30,5 +30,5 @@ fail=0
 for p in "${pids[@]:-}"; do [ -n "$p" ] && { wait "$p" || fail=1; }; done
 for R in $RUNS; do grep -v "$FILTER" "runs/${R}_decoder.log" | grep "val latent\|val mse" || true; done
 [ "$fail" = 1 ] && { echo "[finish] a decoder fit FAILED (see runs/*_decoder.log)"; exit 1; }
-.venv/bin/python -u compare_sigreg.py --runs $RUNS "${EP_ARG[@]}" --out "${OUT:-runs/sigreg_sweep}" 2>&1 \
+.venv/bin/python -u compare_sigreg.py --runs $RUNS "${EP_ARG[@]}" --out "${OUT:-runs/sigreg_sweep}" ${X:+--x $X} 2>&1 \
   | grep -v "$FILTER" | tee "runs/compare${EPOCH:+_ep$EPOCH}.log"
