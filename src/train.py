@@ -201,6 +201,9 @@ class ReplayBuffer:
         self.d = np.zeros(s, np.float32)
         self.is_start = np.zeros(s, bool)
         self.prio = np.zeros(s, np.float64)
+        # --goal-score lp: per-transition EMA of the re-measured one-step WM error phi(x) (NaN = never
+        # re-scored). Learning progress LP(x) = |phi(x) - EMA phi(x)| at re-scoring time; slot reuse resets it.
+        self.ema_err = np.full(s, np.nan, np.float32)
         self.head = np.zeros(n_envs, np.int64)
         self.count = np.zeros(n_envs, np.int64)
         # frozen-encoder LATENT CACHE for consolidation (sps: the burst's cost is dominated by
@@ -223,6 +226,7 @@ class ReplayBuffer:
             goal_px=None, goal_prop=None, goal_valid=None):
         for e in range(self.n_envs):
             i = self.head[e]
+            self.ema_err[e, i] = np.nan                  # fresh transition: no error history yet
             self.pixels[e, i] = pixels[e]
             self.proprio[e, i] = proprio[e]
             self.action[e, i] = action[e]
@@ -347,10 +351,11 @@ class ReplayBuffer:
             px[slot] = self.pixels[e, gi]; pr[slot] = self.proprio[e, gi]; valid[slot] = True
         return px, pr, valid
 
-    def sample_candidates(self, n):
+    def sample_candidates(self, n, return_idx=False):
         """--goal-select highmse_under_d: up to n WITHIN-episode transitions (source o_t, action a_t,
         outcome o_{t+1}) as MSE-buffer goal candidates -- re-scored by the CURRENT WM and filtered by
-        latent distance to z_now in refresh_goals. Returns (spx, sprop, sact, gpx, gprop) numpy, or None."""
+        latent distance to z_now in refresh_goals. Returns (spx, sprop, sact, gpx, gprop) numpy, or None
+        (return_idx: the (e, i) index arrays instead)."""
         vp = self._valid_pairs()
         if vp is None:
             return None
@@ -362,8 +367,22 @@ class ReplayBuffer:
             return None
         sel = np.random.choice(len(e_all), size=min(int(n), len(e_all)), replace=False)
         e, i, ni = e_all[sel], i_all[sel], ni_all[sel]
+        if return_idx:
+            return e, i
         return (self.pixels[e, i], self.proprio[e, i], self.action[e, i],
                 self.pixels[e, ni], self.proprio[e, ni])
+
+    def candidates_at(self, e, i):
+        """(spx, sprop, sact, gpx, gprop) for explicit transition indices (the --goal-score lp sticky pool)."""
+        ni = (i + 1) % self.C
+        return (self.pixels[e, i], self.proprio[e, i], self.action[e, i],
+                self.pixels[e, ni], self.proprio[e, ni])
+
+    def pair_valid(self, e, i, ep):
+        """Still the same transition as when it was tracked (slot not reused, successor in-episode)?"""
+        ni = (i + 1) % self.C
+        return (self.ep_id[e, i] == ep) & (self.ep_id[e, ni] == ep) & (i < self.count[e]) \
+            & ~((self.count[e] == self.C) & (i == (self.head[e] - 1) % self.C))
 
     def sample_sac(self, batch, per_alpha, per_beta, her_frac=0.0):
         vp = self._valid_pairs()
@@ -1398,7 +1417,8 @@ def main(args):
     # unlike the co-trained latent z which would drift the target out from under the predictor.
     # At lambda_rnd==0 these are unused (no reward term, no training) so the default path is untouched.
     rnd_target = rnd_pred = rnd_opt = rnd_img_rms = rnd_prop_rms = None
-    if args.lambda_rnd:
+    rnd_on = bool(args.lambda_rnd) or args.goal_score == "rnd"     # --goal-score rnd: nets + training, no reward term
+    if rnd_on:
         rnd_target = RNDObsNet(prop_dim, args.rnd_out_dim, args.rnd_hidden).to(device)
         for p in rnd_target.parameters():
             p.requires_grad_(False)
@@ -1487,6 +1507,17 @@ def main(args):
 
     # --- RP1 three-arm experiment: value critic (+ RP1 refiner) fitted on the buffer's own latents ---
     planner_models, plan_diag, pm_full = None, {}, [False]
+    # from-scratch RP1 (2026-09-20): the critic/refiner (and the V goal budget) are used only while the LIVE
+    # windowed latent locality is below --plan-gate-frac (else CEM + latent L2, the canonical planner), and are
+    # tripped off until the next FULL re-fit when the refiner's plans score WORSE than the zero plan by its own
+    # critic for a --rp1-trip-frac fraction of a --rp1-trip-window window (the 09-17 OOD-exploitation signature).
+    plan_gate = {"open": True, "tripped": False, "use_rp1": deque(maxlen=400)}
+    trip_ring = deque(maxlen=max(args.rp1_trip_window, 1))
+
+    def planner_live():
+        """critic/refiner (and V budget) usable this step: fitted/restored, locality gate open, not tripped."""
+        return (planner_models is not None and planner_models.ready and plan_gate["open"]
+                and not plan_gate["tripped"])
     if args.planner == "rp1":
         args.plan_cost = "value"
     if args.plan_cost == "value":
@@ -1502,6 +1533,13 @@ def main(args):
         planner_models = PlannerModels(args, z_dim, a_dim, max(args.cem_horizon, 1), H, device)
         if args.plan_act_scale:                      # the loop's amax_frac starts at this value (defined later)
             planner_models.act_scale = min(1.0, args.amax_curric_start / args.action_max) if args.amax_curric else 1.0
+        if args.init_ckpt:                           # chained stage: carry the critic/teacher/refiner over (same frozen encoder)
+            _ick = torch.load(resolve_ckpt(args.init_ckpt, args.resume_name or args.name, args.resume_step, args.hf_repo),
+                              map_location="cpu", weights_only=False)
+            if "planner" in _ick:
+                planner_models.load_state_dict(_ick["planner"])
+                print(f"[planner] restored critic/teacher/refiner from {args.init_ckpt} ({planner_models.n_fits} fits)", flush=True)
+            del _ick
         if buf.total >= 4 * args.vcritic_batch:
             planner_models.fit(buf, wm, encode_rows, 0, full=True)
         else:
@@ -1601,6 +1639,14 @@ def main(args):
     curric_k = [args.goal_curric_start if (args.goal_curriculum and args.goal_curric_start > 0)
                 else args.goal_future_k]
     curric_d = [float(args.goal_curric_d_start)]    # --goal-select highmse_under_d latent-distance budget (grown like curric_k)
+    goal_budget_used = ["latent"]                    # --goal-budget: metric actually used at the last refresh (value needs a live critic)
+    lp_pool = {"e": np.zeros(0, np.int64), "i": np.zeros(0, np.int64), "ep": np.zeros(0, np.int64)}   # --goal-score lp sticky pool
+    goal_score_stats = {}                            # --goal-score: last-refresh score summary for the log
+
+    def rnd_prop_in(prop):
+        """RND proprio input: zeroed under --no-proprio so novelty is pixels-only (the pixels-only premise)."""
+        return np.zeros_like(prop) if args.no_proprio else prop
+    under_frac_recent = deque(maxlen=200)            # fraction of sampled candidates under the budget (scale-mismatch tell)
     # NESTED MSE-DIFFICULTY curriculum (--goal-mse-curric): the CURRENT target MSE percentile (mutable). Within a
     # fixed d it RISES from --goal-mse-pctl-start (LOW MSE = easy, WM-predictable, reliably reachable) toward
     # --goal-mse-pctl-max (HIGH MSE = surprising, the objective) by --goal-mse-pctl-step each time windowed reach
@@ -1651,9 +1697,31 @@ def main(args):
             # (same metric as score_obs_mse / curiosity_reward), and for each env pursue the HIGHEST-MSE
             # candidate whose goal latent is within the curriculum distance budget curric_d of z_now
             # (fallback: nearest). Encoder frozen => ||z_cand - z_now|| is a stable reachability metric.
-            cand = buf.sample_candidates(args.goal_cand_n)
-            if cand is None:
-                return
+            if args.goal_score == "lp":
+                # STICKY candidate pool: keep tracked transitions across refreshes (dropping reused slots and
+                # a --goal-lp-turnover fraction each time, refilled with fresh samples) so every candidate is
+                # re-scored every refresh and its EMA error is a real time series -> LP = |phi - EMA phi|.
+                if lp_pool["e"].size:
+                    ok = buf.pair_valid(lp_pool["e"], lp_pool["i"], lp_pool["ep"])
+                    keep = ok & (np.random.rand(ok.size) >= args.goal_lp_turnover)
+                    lp_pool["e"], lp_pool["i"], lp_pool["ep"] = lp_pool["e"][keep], lp_pool["i"][keep], lp_pool["ep"][keep]
+                need = args.goal_cand_n - lp_pool["e"].size
+                if need > 0:
+                    fresh = buf.sample_candidates(need * 2, return_idx=True)
+                    if fresh is not None:
+                        fe, fi = fresh
+                        new = ~np.isin(fe * buf.C + fi, lp_pool["e"] * buf.C + lp_pool["i"])
+                        fe, fi = fe[new][:need], fi[new][:need]
+                        lp_pool["e"] = np.concatenate([lp_pool["e"], fe]); lp_pool["i"] = np.concatenate([lp_pool["i"], fi])
+                        lp_pool["ep"] = np.concatenate([lp_pool["ep"], buf.ep_id[fe, fi]])
+                if lp_pool["e"].size == 0:
+                    return
+                ce, ci = lp_pool["e"], lp_pool["i"]
+                cand = buf.candidates_at(ce, ci)
+            else:
+                cand = buf.sample_candidates(args.goal_cand_n)
+                if cand is None:
+                    return
             spx, sprop, sact, gpx, gprop = cand
             with torch.no_grad():
                 z_src = encode_obs(wm, spx, sprop, device)                 # (N, D)
@@ -1661,10 +1729,34 @@ def main(args):
                 z_ctx = z_src.unsqueeze(1).repeat(1, H, 1)                # (N, H, D)
                 ac = torch.as_tensor(sact, device=device).float().unsqueeze(1).repeat(1, H, 1)
                 pred = wm.predict(z_ctx, wm.action_encoder(ac))[:, -1]     # (N, D) one-step pred
-                mse = (pred - z_cand).pow(2).mean(-1)                      # (N,) current-WM MSE
-                for e in env_idx:
+                mse = (pred - z_cand).pow(2).mean(-1)                      # (N,) current-WM MSE = phi(x)
+                if args.goal_score == "rnd":
+                    # novelty of the GOAL obs under the frozen random target (raw pixels [+ proprio])
+                    ri, rp = to_rnd_obs(gpx, rnd_prop_in(gprop), rnd_img_rms, rnd_prop_rms, device)
+                    score = rnd_novelty_reward(rnd_pred, rnd_target, ri, rp)
+                elif args.goal_score == "lp":
+                    phi = mse.cpu().numpy().astype(np.float32)
+                    ema = buf.ema_err[ce, ci]
+                    seen = ~np.isnan(ema)
+                    lp = np.where(seen, np.abs(phi - np.where(seen, ema, 0.0)), 0.0)    # LP(x) = |phi - EMA phi|
+                    buf.ema_err[ce, ci] = np.where(seen, ema + args.goal_lp_alpha * (phi - np.where(seen, ema, 0.0)), phi)
+                    score = torch.as_tensor(lp, device=device)
+                    goal_score_stats["lp_seen_frac"] = float(seen.mean()); goal_score_stats["lp_mean"] = float(lp[seen].mean()) if seen.any() else 0.0
+                    goal_score_stats["lp_pool"] = int(ce.size)
+                else:
+                    score = mse
+                goal_score_stats["score_mean"] = float(score.mean()); goal_score_stats["score_max"] = float(score.max())
+                goal_score_stats["score_mse_corr"] = float(np.corrcoef(score.cpu().numpy(), mse.cpu().numpy())[0, 1]) if score.numel() > 2 else 0.0
+                mse = score                                                # the selection score from here on
+                use_v = args.goal_budget == "value" and planner_live()
+                vmat = (planner_models.budget_dist(z[torch.as_tensor(np.asarray(env_idx), device=device)], z_cand)
+                        if use_v else None)                                 # (len(env_idx), N) V(z_now, z_cand)
+                goal_budget_used[0] = "value" if use_v else "latent"
+                for ii, e in enumerate(env_idx):
                     e = int(e)
-                    dist = (z[e].unsqueeze(0) - z_cand).norm(dim=-1)       # (N,) ||z_cand - z_now||
+                    # budget metric: ||z_cand - z_now|| (latent) or V(z_now, z_cand) in decisions (--goal-budget value)
+                    dist = vmat[ii] if use_v else (z[e].unsqueeze(0) - z_cand).norm(dim=-1)   # (N,)
+                    under_frac_recent.append(float((dist < curric_d[0]).float().mean()))
                     # SCENE-DELTA channel (--goal-scene-frac, 2026-07-11): with prob F pursue a candidate
                     # whose ARM POSE matches the env's current pose but whose latent is BEYOND the budget d
                     # -- "same pose, different block world" -- a goal reachable only by changing the scene.
@@ -1865,12 +1957,12 @@ def main(args):
         #     SAC updates, on the RAW next-obs of a fresh PER batch. The trunk sac_update is a
         #     module-level fn with no RND in scope, so we draw our own buf.sample_sac batch here and
         #     train against b["px_n"]/b["prop_n"] (the next-obs raw pixels/proprio the buffer stores). ---
-        if args.lambda_rnd and step >= args.start_steps and buf.total >= args.batch_size:
+        if rnd_on and step >= args.start_steps and buf.total >= args.batch_size:
             rnd_upd += 1
             if rnd_upd % args.rnd_train_every == 0:
                 b = buf.sample_sac(args.batch_size, args.per_alpha, per_beta=1.0)
                 if b is not None:
-                    ri, rp = to_rnd_obs(b["px_n"], b["prop_n"], rnd_img_rms, rnd_prop_rms, device)
+                    ri, rp = to_rnd_obs(b["px_n"], rnd_prop_in(b["prop_n"]), rnd_img_rms, rnd_prop_rms, device)
                     err = (rnd_pred(ri, rp) - rnd_target(ri, rp)).pow(2).mean(-1)   # (B,) per-sample RND error
                     # scale each sample's loss by err/MSE (its novelty vs the batch-mean predictor MSE),
                     # stop-grad so it's a pure weight (avg 1): focuses predictor capacity on currently-novel
@@ -2228,10 +2320,20 @@ def main(args):
                     act_scale_now = float(amax_frac[0]) if (args.plan_act_scale and args.amax_curric) else 1.0
                     if planner_models is not None:
                         planner_models.act_scale = act_scale_now       # also used by the periodic fits
-                    if args.planner == "rp1" and planner_models is not None and planner_models.trainer is not None:
+                    _live = planner_live()
+                    plan_gate["use_rp1"].append(float(args.planner == "rp1" and _live))
+                    if args.planner == "rp1" and _live:
                         # RP1 arm: K refinement rounds against the critic through the frozen WM (9 rollouts)
                         cem_buf[rt] = planner_models.plan(wm, hist_z[:, rt], hist_a[:, rt], zstar_env[rt],
                                                           diag=plan_diag)
+                        if args.rp1_trip_frac > 0:
+                            trip_ring.append(float(plan_diag["vK"] > plan_diag["v0"]))
+                            if (len(trip_ring) == trip_ring.maxlen
+                                    and float(np.mean(trip_ring)) > args.rp1_trip_frac):
+                                plan_gate["tripped"] = True; trip_ring.clear()
+                                print(f"[plan-trip] step={step} refined plan worse than zero plan (vK > v0) in "
+                                      f">{args.rp1_trip_frac:.0%} of the last {args.rp1_trip_window} decisions -> "
+                                      f"CEM + latent L2 until the next FULL re-fit", flush=True)
                     else:
                         cem_buf[rt] = cem_plan(wm, hist_z[:, rt], hist_a[:, rt], zstar_env[rt],
                                                args.cem_samples, args.cem_iters, args.cem_elites,
@@ -2242,8 +2344,7 @@ def main(args):
                                                early_stop_min_iters=args.cem_early_stop_min_iters,
                                                mu0=mu0,
                                                cost_fn=(planner_models.value_cost()
-                                                        if (planner_models is not None and planner_models.trainer is not None)
-                                                        else None),
+                                                        if (args.planner != "rp1" and _live) else None),
                                                act_scale=act_scale_now)
                     cem_ptr[ridx] = 0
                 a = cem_buf[torch.arange(args.n_envs, device=device),
@@ -2274,6 +2375,16 @@ def main(args):
                         held = hg & (gd < args.dwell_hold_mult * eps_now_d)
                         a = torch.where(held.unsqueeze(1), torch.zeros_like(a), a)
                         dwell_hold_recent.append(float(held.float().mean()))
+        if planner_models is not None and args.plan_gate_frac > 0:
+            # locality gate for the critic/refiner: open only when the LIVE windowed frac_rand is below the gate
+            # (the window is cleared after a triggered sleep -> closed until it refills on post-sleep data)
+            _full = len(step_jump_recent) == step_jump_recent.maxlen
+            _open = _full and float(np.mean(step_jump_recent)) / (2 * z_dim) ** 0.5 < args.plan_gate_frac
+            if _open != plan_gate["open"]:
+                print(f"[plan-gate] step={step} locality gate {'OPEN' if _open else 'CLOSED'}"
+                      + (f" (frac_rand {float(np.mean(step_jump_recent)) / (2 * z_dim) ** 0.5:.3f})" if _full else " (window refilling)"),
+                      flush=True)
+            plan_gate["open"] = _open
         if args.amax_curric:
             # locality-gated amplitude: adjust the applied fraction against the LIVE windowed frac_rand
             if (len(step_jump_recent) == step_jump_recent.maxlen
@@ -2322,10 +2433,13 @@ def main(args):
                     pm_full[0] = True
                     frac_trig["last"], frac_trig["n"] = step, frac_trig["n"] + 1
                     step_jump_recent.clear()                 # measure post-sleep locality on fresh data only
-        if (planner_models is not None and step > 0 and step % args.vcritic_fit_every == 0
-                and buf.total >= 4 * args.vcritic_batch):
-            # periodic critic/refiner re-fit on the grown cache (FULL after a sleep or a deferred first fit)
+        if (planner_models is not None and step > 0 and buf.total >= 4 * args.vcritic_batch
+                and (step % args.vcritic_fit_every == 0 or pm_full[0])):
+            # periodic critic/refiner re-fit on the grown cache; FULL right after a sleep (the latent moved --
+            # do not act on stale critic/refiner for up to fit_every decisions) or for a deferred first fit
             planner_models.fit(buf, wm, encode_rows, step, full=pm_full[0])
+            if pm_full[0]:
+                plan_gate["tripped"] = False; trip_ring.clear()
             pm_full[0] = False
         _tnow = time.perf_counter(); _tacc["learn"] += _tnow - _tmark; _tmark = _tnow
         obs, sub_infos = env.step_block_wait()
@@ -2442,13 +2556,13 @@ def main(args):
         safe_term = args.lambda_safe * r_safe
         # --- intrinsic exploration bonuses (COMPOSABLE; each added iff its weight != 0, so the
         #     default reward is byte-identical to before) ---
-        if args.lambda_rnd:                                   # RND novelty over the raw next-obs (frozen target)
-            rnd_img, rnd_prop = to_rnd_obs(obs["image"], obs["proprio"],
+        if rnd_on:                                            # RND novelty over the raw next-obs (frozen target)
+            rnd_img, rnd_prop = to_rnd_obs(obs["image"], rnd_prop_in(obs["proprio"]),
                                            rnd_img_rms, rnd_prop_rms, device, update=True)
             r_rnd = rnd_novelty_reward(rnd_pred, rnd_target, rnd_img, rnd_prop).cpu().numpy()
             # scale the raw error into log1p's active range (obs-RND error ~5e-3 sits in log1p's
             # linear dead-zone) so symlog actually compresses and lambda_rnd stays O(10..20).
-            rnd_term = args.lambda_rnd * np.log1p(args.rnd_reward_scale * r_rnd)
+            rnd_term = args.lambda_rnd * np.log1p(args.rnd_reward_scale * r_rnd)   # 0 under --goal-score rnd alone
         else:
             r_rnd = np.zeros_like(r_cur); rnd_term = np.zeros_like(r_cur)
         if args.lambda_knn:                                   # k-NN coverage / state-entropy (alt to RND)
@@ -2489,7 +2603,10 @@ def main(args):
             if has_goal.any():
                 ring_z = torch.cat([t[2] for t in hot_ring], 0)                  # (W*n_envs, D)
                 ring_mse = np.concatenate([t[3] for t in hot_ring], 0)           # (W*n_envs,)
-                dmat = torch.cdist(z_next, ring_z).cpu().numpy()                 # (n_envs, W*n_envs)
+                if args.goal_budget == "value" and planner_live():                # same budget metric as refresh_goals
+                    dmat = planner_models.budget_dist(z_next, ring_z).cpu().numpy()
+                else:
+                    dmat = torch.cdist(z_next, ring_z).cpu().numpy()             # (n_envs, W*n_envs)
                 ok = (dmat < float(curric_d[0])) & (dmat > 1e-3)                 # within budget d, not self
                 for e in range(args.n_envs):
                     if not has_goal[e] or step - hot_last[e] < args.goal_hot_cooldown:
@@ -2628,9 +2745,15 @@ def main(args):
                 d["cem/min_cand_to_goal"] = cem_diag.get("min_cand_to_goal", float("nan"))  # best CONVERGED candidate->goal dist
                 d["cem/endpoint_disp"] = cem_diag.get("endpoint_disp", float("nan"))        # mean converged endpoint move from z_now
                 d["cem/iters_used"] = cem_diag.get("iters_used", float("nan"))              # CEM iterations after early-stop (30 = never stopped)
+            for _k, _v in goal_score_stats.items():
+                d[f"goal/{_k}"] = _v
             if planner_models is not None:      # RP1 three-arm experiment: critic / refiner fit stats + act-time values
                 d.update(planner_models.stats)
                 d["plan/n_fits"] = planner_models.n_fits
+                d["plan/gate_open"] = float(plan_gate["open"]); d["plan/tripped"] = float(plan_gate["tripped"])
+                d["plan/use_rp1"] = float(np.mean(plan_gate["use_rp1"])) if plan_gate["use_rp1"] else 0.0
+                d["plan/trip_ring"] = float(np.mean(trip_ring)) if trip_ring else 0.0
+                d["goal/budget_value"] = float(goal_budget_used[0] == "value")
                 for _k in ("v0", "vK", "sat"):
                     if _k in plan_diag:
                         d[f"plan/{_k}"] = plan_diag[_k]
@@ -2665,6 +2788,8 @@ def main(args):
                     d["goal/curric_k"] = curric_k[0]              # current reachable-radius curriculum offset
                     if args.goal_select == "highmse_under_d":
                         d["goal/curric_d"] = curric_d[0]          # current MSE-buffer latent-distance budget
+                        if under_frac_recent:
+                            d["goal/under_frac"] = float(np.mean(under_frac_recent))   # candidates under the budget (scale tell)
                         if args.goal_mse_curric:
                             d["goal/curric_mse_pctl"] = curric_pctl[0]   # nested MSE-difficulty target percentile (rises within d)
                 if goal_recent["qpos_dist"]:                       # joint-space (physical) ground-truth
@@ -3479,6 +3604,28 @@ def parse_args():
     p.add_argument("--rp1-lr", type=float, default=1e-4)
     p.add_argument("--rp1-live-critic", action=argparse.BooleanOptionalAction, default=True,
                    help="co-train the critic (EMA teacher) during refiner fits, as in RP1.")
+    p.add_argument("--goal-score", choices=("mse", "rnd", "lp"), default="mse",
+                   help="highmse_under_d candidate SCORE (2026-09-20): 'mse' = current-WM one-step error phi(x) "
+                        "(campaign); 'rnd' = RND novelty of the goal obs (raw pixels, proprio zeroed under "
+                        "--no-proprio; the --lambda-rnd nets, trained every update, no reward term); 'lp' = "
+                        "learning progress |phi(x) - EMA phi(x)| over successive re-scorings of a STICKY candidate "
+                        "pool (per-transition EMA in the buffer). The nested percentile curriculum ranks by this score.")
+    p.add_argument("--goal-lp-alpha", type=float, default=0.3, help="--goal-score lp: EMA rate of phi per re-scoring.")
+    p.add_argument("--goal-lp-turnover", type=float, default=0.1,
+                   help="--goal-score lp: fraction of the sticky pool replaced by fresh transitions each refresh.")
+    p.add_argument("--goal-budget", choices=("latent", "value"), default="latent",
+                   help="highmse_under_d budget metric: 'latent' = ||z_cand - z_now|| < d (campaign); 'value' = "
+                        "V(z_now, z_cand) < d, the planner critic's temporal cost-to-go in DECISIONS (unit-free "
+                        "across sleeps; RP1's time-on-trajectory goal variable). Falls back to latent until the "
+                        "critic is fitted / while the locality gate is closed. Arrival stays latent-L2 (never V).")
+    p.add_argument("--plan-gate-frac", type=float, default=0.0,
+                   help="critic/refiner (+ value budget) used only while the live windowed frac_rand is below this "
+                        "(else CEM + latent L2). 0 = no gate. The amax curriculum earns amplitude below 0.2; the "
+                        "sleep trigger fires above --cotrain-frac-thresh.")
+    p.add_argument("--rp1-trip-window", type=int, default=200, help="decisions in the vK>v0 tripwire window.")
+    p.add_argument("--rp1-trip-frac", type=float, default=0.0,
+                   help="if the refined plan scores worse than the zero plan (vK > v0) in more than this fraction of "
+                        "the window, fall back to CEM + latent L2 until the next FULL re-fit. 0 = off.")
     p.add_argument("--plan-act-scale", action="store_true",
                    help="roll the WM out on the EXECUTED action (plan * amax_frac) instead of the raw plan. "
                         "The WM is trained on executed (amplitude-scaled) actions, so without this the planner "

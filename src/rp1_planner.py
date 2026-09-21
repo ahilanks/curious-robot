@@ -168,11 +168,35 @@ class PlannerModels:
         self.rng = np.random.default_rng(args.seed + 7)
         self.n_fits, self.last_fit_step, self.stats = 0, -1, {}
         self.act_scale = 1.0        # --plan-act-scale: the WM sees plan * amax_frac (what is executed); set by the loop
+        self.teacher = None         # EMA teacher restored from an --init-ckpt (valid until the first fit re-creates it)
+        # --goal-budget value: V is reported in L2-EQUIVALENT units, V / v_scale with v_scale = (cross-episode mean V) /
+        # (cross-episode mean L2) measured at every FULL fit, so the ladder's numbers keep their meaning at both ends
+        # (d-max 22 ~ the full space for either metric) and re-calibrate whenever the encoder/critic move. Found
+        # 2026-09-20: raw V is ~1.7x L2 at the cross-episode scale and ~5 at one decision -> a raw-V budget of d=4
+        # admitted 1.5% of candidates (vs 6-11% under L2) and the ladder climbed on trivially-near goals.
+        self.v_scale = 1.0
 
     # planning-time critic = the EMA teacher (RP1: the actor's teacher)
     @property
     def V(self):
-        return self.trainer.target if self.trainer is not None else self.critic
+        if self.trainer is not None:
+            return self.trainer.target
+        return self.teacher if self.teacher is not None else self.critic
+
+    @property
+    def ready(self):
+        """Critic (and refiner) usable for planning / goal budgets: fitted here or restored from a chained ckpt."""
+        return self.trainer is not None or self.teacher is not None
+
+    @torch.no_grad()
+    def budget_dist(self, z_now, z_cand):
+        """--goal-budget value: V(z_now, z_cand) for every (row of z_now) x (row of z_cand) -> (n, N), the
+        temporal cost-to-go in decisions that replaces ||z_cand - z_now|| as the curriculum budget metric."""
+        V = self.V
+        n, N = z_now.shape[0], z_cand.shape[0]
+        zi = z_now.float().unsqueeze(1).expand(n, N, -1).reshape(n * N, -1)
+        zg = z_cand.float().unsqueeze(0).expand(n, N, -1).reshape(n * N, -1)
+        return V(zi, zg).view(n, N) / self.v_scale
 
     def value_cost(self):
         """cost_fn(z_hat (N,D), z_goal (N,D)) -> (N,) for cem_plan(--plan-cost value)."""
@@ -206,6 +230,8 @@ class PlannerModels:
         self.stats = {"fit/cache_rows": cache.rows, "fit/cache_eps": cache.n_ep, "fit/encoded": cache.n_encoded,
                       "fit/critic_steps": n_c, "fit/refiner_steps": n_r, "fit/seconds": time.time() - t0,
                       **{f"vcritic/{k}": v for k, v in ci.items()}, **{f"rp1/{k}": v for k, v in ri.items()}}
+        if full:
+            self.stats.update(self.critic_diag(cache))
         self.n_fits += 1; self.last_fit_step = step
         print(f"[planner-fit #{self.n_fits}] step={step} {'FULL' if full else 'refit'}: cache {cache.rows} rows / "
               f"{cache.n_ep} eps ({cache.n_encoded} encoded); critic {n_c} steps"
@@ -213,6 +239,42 @@ class PlannerModels:
               + (f"; refiner {n_r} steps J {ri['J']:.3f} v0 {ri['v0']:.2f} -> vK {ri['vK']:.2f}" if ri else "")
               + f"; {time.time() - t0:.0f}s", flush=True)
         return self.stats
+
+    @torch.no_grad()
+    def critic_diag(self, cache, pairs=8000, dmax=40):
+        """diag_vcritic.py's headline numbers on the fitted cache (logged after every FULL fit, i.e. per sleep):
+        Spearman(V, true offset d) vs Spearman(L2, d) on in-episode pairs, V-vs-L2 rank agreement, and the
+        cross-episode (unrelated-state) means of both. A critic that never separates from L2 is dead weight."""
+        ok = np.flatnonzero(cache.ep_len > 3)
+        if ok.size == 0:
+            return {}
+        rng = self.rng
+        e = rng.choice(ok, pairs)
+        dm = np.minimum(dmax, cache.ep_len[e] - 2)
+        d = (rng.random(pairs) * dm).astype(np.int64) + 1
+        t = (rng.random(pairs) * (cache.ep_len[e] - 1 - d)).astype(np.int64)
+        i, j = cache.ep_off[e] + t, cache.ep_off[e] + t + d
+        zi, zj = cache.z[torch.as_tensor(i, device=self.device)], cache.z[torch.as_tensor(j, device=self.device)]
+        v = self.V(zi, zj).cpu().numpy(); l = (zi - zj).norm(dim=-1).cpu().numpy()
+        e1, e2 = rng.choice(cache.n_ep, pairs), rng.choice(cache.n_ep, pairs)
+        i = cache.ep_off[e1] + (rng.random(pairs) * cache.ep_len[e1]).astype(np.int64)
+        j = cache.ep_off[e2] + (rng.random(pairs) * cache.ep_len[e2]).astype(np.int64)
+        zi, zj = cache.z[torch.as_tensor(i, device=self.device)], cache.z[torch.as_tensor(j, device=self.device)]
+        vx = self.V(zi, zj).cpu().numpy(); lx = (zi - zj).norm(dim=-1).cpu().numpy()
+
+        def spearman(a, b):
+            ra, rb = np.argsort(np.argsort(a)).astype(np.float64), np.argsort(np.argsort(b)).astype(np.float64)
+            ra -= ra.mean(); rb -= rb.mean()
+            return float((ra * rb).sum() / max(np.sqrt((ra * ra).sum() * (rb * rb).sum()), 1e-12))
+        self.v_scale = float(vx.mean()) / max(float(lx.mean()), 1e-6)
+        out = {"vdiag/v_scale": self.v_scale,
+               "vdiag/spearman_v_d": spearman(v, d), "vdiag/spearman_l2_d": spearman(l, d),
+               "vdiag/spearman_v_l2": spearman(v, l), "vdiag/v_in_ep": float(v.mean()), "vdiag/l2_in_ep": float(l.mean()),
+               "vdiag/v_cross": float(vx.mean()), "vdiag/l2_cross": float(lx.mean())}
+        print(f"[vdiag] Spearman(., d): V {out['vdiag/spearman_v_d']:.3f}  L2 {out['vdiag/spearman_l2_d']:.3f}  "
+              f"(V vs L2 {out['vdiag/spearman_v_l2']:.3f}); in-ep V {v.mean():.2f} L2 {l.mean():.2f}; "
+              f"cross V {vx.mean():.2f} L2 {lx.mean():.2f}; v_scale {self.v_scale:.3f}", flush=True)
+        return out
 
     def _plan_rounds(self, wm, hist_z, hist_a, zg, train):
         """K refinement rounds (RP1Planner.plan). Returns plans [a_0..a_K], values [v_0..v_K]."""
@@ -267,8 +329,23 @@ class PlannerModels:
         return plans[-1].detach()
 
     # ---- checkpointing --------------------------------------------------------------------------------
+    def load_state_dict(self, sd):
+        """Restore critic / EMA teacher / refiner from a chained checkpoint (same frozen encoder at the stage
+        boundary -> the weights stay valid until the first fit here re-creates the trainer around them)."""
+        self.critic.load_state_dict(sd["critic"])
+        if "critic_teacher" in sd:
+            import copy
+            self.teacher = copy.deepcopy(self.critic)
+            self.teacher.load_state_dict(sd["critic_teacher"])
+            for p in self.teacher.parameters():
+                p.requires_grad_(False)
+        if self.refiner is not None and "refiner" in sd:
+            self.refiner.load_state_dict(sd["refiner"])
+        self.n_fits = int(sd.get("n_fits", 0))
+        self.v_scale = float(sd.get("v_scale", 1.0))
+
     def state_dict(self):
-        sd = {"critic": self.critic.state_dict(), "n_fits": self.n_fits}
+        sd = {"critic": self.critic.state_dict(), "n_fits": self.n_fits, "v_scale": self.v_scale}
         if self.trainer is not None:
             sd["critic_teacher"] = self.trainer.target.state_dict()
         if self.refiner is not None:
