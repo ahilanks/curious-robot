@@ -13,12 +13,17 @@ set -euo pipefail
 cd "$(dirname "$0")"
 set -a; source .env; set +a
 export WANDB_SILENT=true MUJOCO_GL="${MUJOCO_GL:-egl}"
-ARM=${ARM:?set ARM=cs or ARM=rp}
+ARM=${ARM:?set ARM=cs, rp, lp, rl or rr}
 case "$ARM" in
   cs) PLAN=(--plan-act-scale) ;;
   rp) PLAN=(--plan-act-scale --planner rp1 --goal-budget value --plan-gate-frac 0.35 --rp1-trip-frac 0.5
             --vcritic-fit-every 2000) ;;
-  *) echo "ARM must be cs or rp"; exit 1 ;;
+  lp) PLAN=(--plan-act-scale --goal-score lp) ;;      # learning-progress goals (2026-09-21): cs recipe + LP score
+  rl) PLAN=(--plan-act-scale --planner rp1 --goal-budget value --plan-gate-frac 0.35 --rp1-trip-frac 0.5
+            --vcritic-fit-every 2000 --goal-score lp) ;;                       # RP1 planner + LP goals
+  rr) PLAN=(--plan-act-scale --planner rp1 --goal-budget value --plan-gate-frac 0.35 --rp1-trip-frac 0.5
+            --vcritic-fit-every 2000 --goal-score rnd --rnd-train-every 200) ;;  # RP1 planner + RND goals (slow predictor)
+  *) echo "ARM must be cs, rp, lp, rl or rr"; exit 1 ;;
 esac
 COMMON=(--env-threads 8 --wm-cam wrist --no-proprio --sigreg-pertimestep
   --cem --cem-horizon 1 --cem-replan-every 1 --deterministic-act --alpha 0.0
@@ -30,6 +35,7 @@ COMMON=(--env-threads 8 --wm-cam wrist --no-proprio --sigreg-pertimestep
   --buffer-frac 4.0 --lambda-safe 0.0 --safety-delta 15.0)
 mkdir -p runs/chains
 STAGE_FROM=${STAGE_FROM:-1}
+STAGE_TO=${STAGE_TO:-2}
 if [ ! -f runs/wr_slpwarm/ckpt_0003000.pt ]; then
   python -c "import os; from huggingface_hub import hf_hub_download; hf_hub_download(os.environ['HF_UPLOAD_REPO_ID'],'wr_slpwarm/ckpt_0003000.pt',local_dir='runs')"
 fi
@@ -44,7 +50,7 @@ if [ "$STAGE_FROM" -le 1 ]; then
     --cotrain-every 3000 --cotrain-epochs 30 --cotrain-flatline --cotrain-lr 2e-5 --cotrain-beta 0.02 --cotrain-frac-thresh 0.45 \
     --keep-local-ckpts --no-save-state 2>&1 | tee runs/chains/${ARM}_sleepret.log | grep -E "$FILT" | grep -v Warning
 fi
-if [ "$STAGE_FROM" -le 2 ]; then
+if [ "$STAGE_FROM" -le 2 ] && [ "$STAGE_TO" -ge 2 ]; then
   echo "[chain/$ARM] stage 2: ${ARM}_sleepret2 (200k, init ${ARM}_sleepret@20000)  $(date -u +%FT%TZ)"
   python src/train.py --name ${ARM}_sleepret2 --total-steps 200000 --start-steps 1000 "${COMMON[@]}" "${PLAN[@]}" \
     --init-ckpt runs/${ARM}_sleepret/ckpt_0020000.pt --freeze-encoder \
