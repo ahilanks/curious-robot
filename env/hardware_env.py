@@ -719,16 +719,24 @@ class UsbCamera:
     the old post-wait grab, the control loop just stops paying for it.
     SOARM_SYNC_CAM=1 restores the legacy blocking grab (A/B escape hatch).
 
-    Failure semantics match the old loud-fail: transient misses are retried silently
-    (a single miss killed a 24/7 collector run on 2026-06-06), but ~3 s of consecutive
-    misses marks the camera dead and the next read() raises."""
+    Failure semantics (hardened 2026-08-20 after hw_wrs2_c died at step 3100 to a
+    transient USB dropout): transient misses are retried silently (a single miss killed
+    a 24/7 collector run on 2026-06-06); ~3 s of consecutive misses triggers a device
+    REOPEN — USB re-enumeration after a cable strain takes 1-2 s, so giving up at 3 s
+    turned routine blips into run-killers. read() serves the last good frame through
+    the outage (keep-last-good, same doctrine as dropped servo reads; the planner runs
+    on a briefly-frozen view, bounded by envelope/pacing/TorqueGuard). Only after
+    _REOPEN_TRIES failed reopens (~30 s blind) does the camera go dead and read()
+    raise — the arm must not run blind indefinitely."""
 
-    _DEAD_AFTER_MISSES = 30           # ~3 s at the 0.1 s retry cadence -> loud failure
+    _DEAD_AFTER_MISSES = 30           # ~3 s at the 0.1 s retry cadence -> reopen cycle
+    _REOPEN_TRIES = 6                 # ~5 s per attempt -> ~30 s max blind before loud failure
 
     def __init__(self, index: int = 0, hw: int = 224):
         import cv2
         self._cv2 = cv2
         self.hw = hw
+        self.index = index                  # kept for reopen-on-dropout
         self.cap = cv2.VideoCapture(index)
         if not self.cap.isOpened():
             raise RuntimeError(f"UsbCamera: could not open video index {index}")
@@ -753,18 +761,39 @@ class UsbCamera:
                     raise RuntimeError(self._dead or "UsbCamera: no frame within 5 s of open")
 
     def _grab_loop(self) -> None:
-        misses = 0
+        misses = reopens = 0
         while not self._stop:
             ok, frame = self.cap.read()     # cap.read() allocates a fresh array per frame
             if not ok:
                 misses += 1
                 if misses >= self._DEAD_AFTER_MISSES:
-                    with self._lock:
-                        self._dead = "UsbCamera: frame grab failed (grab thread gave up)"
-                    return
+                    # sustained stall: REOPEN the device (USB re-enumeration after a cable
+                    # strain takes 1-2 s; a hard give-up here killed hw_wrs2_c @3100)
+                    if reopens >= self._REOPEN_TRIES:
+                        with self._lock:
+                            self._dead = (f"UsbCamera: frame grab failed "
+                                          f"({reopens} reopen attempts, ~30 s blind)")
+                        return
+                    reopens += 1
+                    print(f"[camera] grab stalled ~3 s -> reopen {reopens}/{self._REOPEN_TRIES} "
+                          f"(serving last good frame meanwhile)", flush=True)
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    time.sleep(4.0)
+                    try:
+                        self.cap = self._cv2.VideoCapture(self.index)
+                    except Exception:
+                        pass
+                    misses = 0
+                    continue
                 time.sleep(0.1)
                 continue
             misses = 0
+            if reopens:
+                print(f"[camera] recovered after reopen attempt {reopens}", flush=True)
+                reopens = 0
             with self._lock:
                 self._latest = frame
 
