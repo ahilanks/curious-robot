@@ -117,8 +117,11 @@ ensure_claude_cli() {
 
 ensure_pushover_hook() {
     # Pushover phone/laptop notifications for Claude Code (done responding / needs input).
-    # Credentials come from .env (PUSHOVER_TOKEN / PUSHOVER_USER, loaded above). The hook
-    # is always wired; notifications stay off until those two vars are set.
+    # Credentials come from .env (loaded above): the app token as PUSHOVER_APPLICATION_KEY or
+    # PUSHOVER_TOKEN, the user key as PUSHOVER_KEY or PUSHOVER_USER. The hook is always
+    # wired; notifications stay off until both are set.
+    PUSHOVER_TOKEN="${PUSHOVER_TOKEN:-${PUSHOVER_APPLICATION_KEY:-}}"
+    PUSHOVER_USER="${PUSHOVER_USER:-${PUSHOVER_KEY:-}}"
     local cdir="${HOME}/.claude"
     mkdir -p "${cdir}/hooks"
 
@@ -230,7 +233,7 @@ ENV_EOF
         chmod 600 "${cdir}/pushover.env"
         echo "  Pushover credentials -> ~/.claude/pushover.env"
     else
-        echo "  PUSHOVER_TOKEN/PUSHOVER_USER not in .env -- hook installed, notifications off"
+        echo "  PUSHOVER_APPLICATION_KEY/PUSHOVER_KEY not in .env -- hook installed, notifications off"
     fi
 
     local settings="${cdir}/settings.json"

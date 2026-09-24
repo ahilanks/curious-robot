@@ -19,6 +19,8 @@ dependencies = [
     "python-dotenv>=1.0",    # load WANDB_*/HF_* from .env
     "imageio>=2.34",         # rollout videos
     "imageio-ffmpeg>=0.4",
+    "scikit-learn>=1.3",     # rp1/rp1/wm.py -- imported by src/train.py via src/rp1_planner.py
+    "matplotlib>=3.8",       # plots (toy/plot_curiosity.py, src/plot_*.py, probes)
 ]
 
 [project.optional-dependencies]
