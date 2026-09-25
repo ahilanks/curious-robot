@@ -1,16 +1,19 @@
-"""PPO on an intrinsic reward in the point-push toy: what does each curiosity signal make the agent do?
+"""PPO on an intrinsic reward in the point-push toy or Push-T: what does each curiosity signal make the agent do?
 
     python toy/run_curiosity.py --signal {none,pred,lp,ln,count} [--tv] [--seed 0] [--iters 300]
+    python toy/run_curiosity.py --env pusht --start {fixed,random} --signal pred --save-replay 32 --wm-replay 5000000
 
-One PPO iteration = one synchronous episode in every env from the fixed start (agent bottom-left,
-block in the centre). No task reward and no entropy bonus: the intrinsic reward is the only
+One PPO iteration = one synchronous episode in every env from the start distribution (point-push:
+the fixed start, agent bottom-left, block in the centre; Push-T: --start). No task reward and no entropy bonus: the intrinsic reward is the only
 drive. It is divided by a running std of its discounted return (RND-style), so the signals are
 compared on where they pay, not on their scale.
 
 Ground-truth read-outs per iteration (the agent never sees them): agent / block coverage of a
 10x10 grid within an episode, block displacement, contact rate, time on the noisy TV, and where
 the reward pays out (contact / wall / TV / free-space transitions).
-Writes toy/runs/<name>/{config.json, metrics.jsonl, final.pt}.
+Writes toy/runs/<name>/{config.json, metrics.jsonl, final.pt} (final.pt carries the agent's world
+model for pred / lp); --save-replay K adds replay.pt = every iteration's states and applied actions
+of the first K envs (the data a fresh model is trained on in toy/pusht_eval.py).
 """
 from __future__ import annotations
 
@@ -25,6 +28,14 @@ from torch import nn
 
 from point_push import PointPush
 from signals import make_signal
+
+
+def make_env(args, n_envs, seed, device):
+    if args.env == "pusht":
+        from push_t import PushT
+        return PushT(n_envs, device=device, ep_len=args.ep_len, start=args.start,
+                     action_scale=args.action_scale, workers=args.workers, seed=seed, tv=args.tv, physics=args.physics)
+    return PointPush(n_envs, device=device, ep_len=args.ep_len, seed=seed, tv=args.tv)
 
 
 class ActorCritic(nn.Module):
@@ -66,7 +77,7 @@ class RunningVar:
 @torch.no_grad()
 def rollout(env, ac, T):
     obs = env.reset()
-    ro = {k: [] for k in ("obs", "act", "u", "logp", "val", "state", "contact", "block_move", "in_tv")}
+    ro = {k: [] for k in ("obs", "act", "u", "logp", "val", "state", "contact", "block_move", "in_tv", "wall")}
     ro["obs"].append(obs)
     ro["state"].append(env.state())
     for t in range(T):
@@ -78,9 +89,9 @@ def rollout(env, ac, T):
         a = u.clamp(-1, 1)
         obs, info = env.step(a)
         ro["obs"].append(obs)
-        ro["act"].append(a)
+        ro["act"].append(info.get("act_applied", a))            # Push-T: after the arena clamp
         ro["state"].append(env.state())
-        for k in ("contact", "block_move", "in_tv"):
+        for k in ("contact", "block_move", "in_tv", "wall"):
             ro[k].append(info[k])
     return {k: torch.stack(v) for k, v in ro.items()}
 
@@ -150,6 +161,15 @@ def masked_mean(x, m):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--signal", required=True, choices=("none", "pred", "lp", "lps", "ln", "count"))
+    p.add_argument("--env", default="point", choices=("point", "pusht"))
+    p.add_argument("--start", default="fixed", choices=("fixed", "random"),
+                   help="Push-T reset: fixed (agent (100,100), T centred at angle 0) or gym-pusht's random")
+    p.add_argument("--action-scale", type=float, default=100.0, help="Push-T: px of PD-target offset per unit action")
+    p.add_argument("--workers", type=int, default=12, help="Push-T: simulator processes")
+    p.add_argument("--physics", default="safe", choices=("safe", "gym"),
+                   help="Push-T: safe (default; a wall-pinned T cannot be squeezed, see push_t.py) or exact gym-pusht")
+    p.add_argument("--save-replay", type=int, default=0, metavar="K",
+                   help="save every iteration's states + applied actions of the first K envs to replay.pt")
     p.add_argument("--tv", action="store_true", help="add the noisy TV (unlearnable noise channels)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--iters", type=int, default=300)
@@ -173,6 +193,8 @@ def main():
     p.add_argument("--wm-batch", type=int, default=1024)
     p.add_argument("--wm-epochs", type=int, default=1)
     p.add_argument("--lp-ema", type=float, default=0.01, help="EMA rate of the lagged WM copy (per WM step)")
+    p.add_argument("--wm-replay", type=int, default=0,
+                   help="WM trains on each rollout mixed 1:1 with a FIFO replay of this many transitions (0 = rollout only)")
     # learnable novelty (their RL settings)
     p.add_argument("--ln-hidden", type=int, default=32)
     p.add_argument("--ln-ridge", type=float, default=0.3)
@@ -181,19 +203,25 @@ def main():
     p.add_argument("--snap-every", type=int, default=25)
     p.add_argument("--log-every", type=int, default=10)
     args = p.parse_args()
+    if args.env == "point":
+        for k, default in (("start", "fixed"), ("action_scale", 100.0), ("workers", 12), ("physics", "safe")):
+            if getattr(args, k) != default:
+                p.error(f"--{k.replace('_', '-')} is Push-T only (point-push always starts fixed)")
 
     torch.manual_seed(args.seed)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    name = args.name or f"{args.signal}{'_tv' if args.tv else ''}_s{args.seed}"
+    prefix = f"pt{args.start[0]}_" if args.env == "pusht" else ""
+    name = args.name or f"{prefix}{args.signal}{'_tv' if args.tv else ''}_s{args.seed}"
     out = Path(args.out) / name
     out.mkdir(parents=True, exist_ok=True)
 
-    env_kw = dict(device=dev, ep_len=args.ep_len, tv=args.tv)
-    env = PointPush(args.envs, seed=args.seed, **env_kw)
+    env = make_env(args, args.envs, args.seed, dev)
     sig = make_signal(args.signal, env, dev, args)
     extra = {}
     if args.signal == "ln":                                      # frozen stats from a base-seed env
-        extra = sig.calibrate(PointPush(64, seed=1000, **env_kw))
+        cal_env = make_env(args, 64, 1000, dev)
+        extra = sig.calibrate(cal_env)
+        cal_env.close()
         print(f"[ln] calibrated: {extra}", flush=True)
     json.dump({**vars(args), **extra, "obs_dim": env.obs_dim, "device": str(dev)},
               open(out / "config.json", "w"), indent=2)
@@ -201,10 +229,12 @@ def main():
     ac = ActorCritic(env.obs_dim, env.act_dim, log_std=args.log_std_init).to(dev)
     opt = torch.optim.Adam(ac.parameters(), lr=args.lr, eps=1e-5)
     rv = RunningVar()
-    visited = torch.zeros(100 * 100, dtype=torch.bool, device=dev)          # (agent cell, block cell)
+    # cells_cum: point-push (agent cell, block cell) on 10x10 grids; Push-T the count oracle's
+    # 80k (agent, T position, T angle) cells -- a 10x10x10x10 grid saturates under a random walk
+    visited = torch.zeros(env.n_count_cells if args.env == "pusht" else 100 * 100, dtype=torch.bool, device=dev)
     hist_agent = torch.zeros(40, 40, device=dev)
     hist_block = torch.zeros(40, 40, device=dev)
-    snaps = []
+    snaps, replay = [], {"state": [], "act": []}
     tail_from = int(0.9 * args.iters)
     T, E = args.ep_len, args.envs
     t0 = time.time()
@@ -223,13 +253,15 @@ def main():
                 m.update(ppo_update(ac, opt, ro, r_int / math.sqrt(rv.var + 1e-8), args))
 
             st = ro["state"]
-            ag, bl = st[..., :2], st[..., 2:]
+            if args.save_replay:
+                replay["state"].append(st[:, :args.save_replay].cpu())
+                replay["act"].append(ro["act"][:, :args.save_replay].cpu())
+            ag, bl = env.agent_xy(st), env.block_xy(st)
             ca = grid_cells(ag, env.agent_lo, env.agent_hi)
             cb = grid_cells(bl, env.block_lo, env.block_hi)
-            visited[(ca * 100 + cb).reshape(-1)] = True
+            visited[(env.count_cell(st) if args.env == "pusht" else ca * 100 + cb).reshape(-1)] = True
             contact, in_tv = ro["contact"], ro["in_tv"]
-            a1 = ag[1:]
-            at_wall = ((a1 - env.agent_lo).abs() < 1e-6).any(-1) | ((a1 - env.agent_hi).abs() < 1e-6).any(-1)
+            at_wall = ro["wall"]                                   # point-push: agent pinned; Push-T: T on a wall
             free = ~contact & ~in_tv & ~at_wall
             wall_only = at_wall & ~contact & ~in_tv                # the TV disk touches the bottom wall
             disp = (bl[-1] - bl[0]).norm(dim=-1)
@@ -266,8 +298,13 @@ def main():
                       f"{m['time']:.0f}s", flush=True)
 
     torch.save({"args": vars(args), "extra": extra, "ac": ac.state_dict(),
+                "wm": sig.model.state_dict() if hasattr(sig, "model") else None,
                 "hist_agent": hist_agent.cpu(), "hist_block": hist_block.cpu(), "snaps": snaps,
                 "traj": ro["state"][:, :8].cpu(), "visited": visited.cpu()}, out / "final.pt")
+    if args.save_replay:
+        torch.save({"state": torch.stack(replay["state"]), "act": torch.stack(replay["act"]),
+                    "env": args.env, "start": args.start}, out / "replay.pt")
+    env.close()
     print(f"[{name}] done in {time.time() - t0:.0f}s -> {out}", flush=True)
 
 

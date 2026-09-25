@@ -63,10 +63,23 @@ class PredError(Signal):
     name = "pred"
     learns = True
 
-    def __init__(self, obs_dim, act_dim, device, lr=1e-3, batch=1024, epochs=1, hidden=256):
+    def __init__(self, obs_dim, act_dim, device, lr=1e-3, batch=1024, epochs=1, hidden=256, replay=0):
         self.model = Dynamics(obs_dim, act_dim, hidden).to(device)
         self.opt = torch.optim.Adam(self.model.parameters(), lr=lr)
         self.batch, self.epochs = batch, epochs
+        # replay > 0: every minibatch of the latest rollout is joined by an equal-size uniform
+        # sample of a FIFO buffer of the last `replay` transitions, so the model keeps what it
+        # learned from earlier rollouts instead of fitting only the newest one.
+        self.replay, self.buf, self.buf_n, self.buf_i = replay, None, 0, 0
+
+    def _remember(self, o, a, o2):
+        if self.buf is None:
+            self.buf = torch.zeros(self.replay, o.shape[1] * 2 + a.shape[1], device=o.device)
+        x = torch.cat([o, a, o2], -1)[-self.replay:]
+        idx = (self.buf_i + torch.arange(x.shape[0], device=o.device)) % self.replay
+        self.buf[idx] = x
+        self.buf_i = int((self.buf_i + x.shape[0]) % self.replay)
+        self.buf_n = min(self.buf_n + x.shape[0], self.replay)
 
     @torch.no_grad()
     def errors(self, model, ro):
@@ -88,12 +101,20 @@ class PredError(Signal):
             perm = torch.randperm(n, device=o.device)
             for i in range(0, n, self.batch):
                 idx = perm[i:i + self.batch]
-                loss = transition_error(self.model, o[idx], a[idx], o2[idx]).mean()
+                ob, ab, o2b = o[idx], a[idx], o2[idx]
+                if self.buf_n:
+                    x = self.buf[torch.randint(0, self.buf_n, (len(idx),), device=o.device)]
+                    ob = torch.cat([ob, x[:, :D]])
+                    ab = torch.cat([ab, x[:, D:-D]])
+                    o2b = torch.cat([o2b, x[:, -D:]])
+                loss = transition_error(self.model, ob, ab, o2b).mean()
                 self.opt.zero_grad(set_to_none=True)
                 loss.backward()
                 self.opt.step()
                 self._after_step()
                 losses.append(loss.detach())
+        if self.replay:
+            self._remember(o, a, o2)
         return {"wm_loss": float(torch.stack(losses).mean())}
 
 
@@ -217,18 +238,17 @@ class LearnableNovelty(Signal):
 
 # ------------------------------------------------------------------ oracle count
 class CountOracle(Signal):
+    """Cells come from the env's `count_cell` (point-push: (agent, block) on a 10^4 grid;
+    Push-T: agent 10x10, T origin 10x10, T angle 8 bins)."""
     name = "count"
     learns = True
 
-    def __init__(self, env, bins=10):
-        self.bins, self.env = bins, env
-        self.N = torch.zeros(bins ** 4, device=env.device)
+    def __init__(self, env):
+        self.env = env
+        self.N = torch.zeros(env.n_count_cells, device=env.device)
 
     def cell(self, s):
-        e, b = self.env, self.bins
-        ia = ((s[..., :2] - e.agent_lo) / (e.agent_hi - e.agent_lo) * b).long().clamp(0, b - 1)
-        ib = ((s[..., 2:] - e.block_lo) / (e.block_hi - e.block_lo) * b).long().clamp(0, b - 1)
-        return ((ia[..., 0] * b + ia[..., 1]) * b + ib[..., 0]) * b + ib[..., 1]
+        return self.env.count_cell(s)
 
     def reward(self, ro):
         return 1.0 / torch.sqrt(self.N[self.cell(ro["state"][1:])] + 1.0), {}
@@ -244,11 +264,11 @@ def make_signal(name, env, device, args):
         return Signal()
     if name == "pred":
         return PredError(env.obs_dim, env.act_dim, device, lr=args.wm_lr, batch=args.wm_batch,
-                         epochs=args.wm_epochs)
+                         epochs=args.wm_epochs, replay=args.wm_replay)
     if name in ("lp", "lps"):
         cls = LearningProgress if name == "lp" else SignedProgress
         return cls(env.obs_dim, env.act_dim, device, ema=args.lp_ema, lr=args.wm_lr,
-                   batch=args.wm_batch, epochs=args.wm_epochs)
+                   batch=args.wm_batch, epochs=args.wm_epochs, replay=args.wm_replay)
     if name == "ln":
         # reservoir + normalisation are anchored to a base seed, shared by every training seed
         # (as in their rl/calibrate.py)

@@ -304,8 +304,8 @@ echo ""
 echo "=== Installing dependencies ==="
 ensure_mujoco_runtime_deps
 python3 -m pip install --upgrade pip setuptools wheel
-if ! python3 -m pip install -e ".[dev]"; then
-    echo "ERROR: pip install -e \".[dev]\" failed"
+if ! python3 -m pip install -e ".[dev,pusht]"; then
+    echo "ERROR: pip install -e \".[dev,pusht]\" failed"
     exit 1
 fi
 

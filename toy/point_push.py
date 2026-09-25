@@ -66,6 +66,26 @@ class PointPush:
         """Ground truth (agent xy, block xy) in [0, 1] -- for metrics only, never the agent's input."""
         return torch.cat([self.agent, self.block], dim=-1)
 
+    # ground-truth read-out hooks used by run_curiosity.py / signals.py (shared with push_t.PushT)
+    @staticmethod
+    def agent_xy(st):
+        return st[..., :2]
+
+    @staticmethod
+    def block_xy(st):
+        return st[..., 2:4]
+
+    n_count_cells = 10 ** 4
+
+    def count_cell(self, st, bins=10):
+        """(agent, block) cell on a 10^4 grid -- the count oracle's state abstraction."""
+        ia = ((st[..., :2] - self.agent_lo) / (self.agent_hi - self.agent_lo) * bins).long().clamp(0, bins - 1)
+        ib = ((st[..., 2:] - self.block_lo) / (self.block_hi - self.block_lo) * bins).long().clamp(0, bins - 1)
+        return ((ia[..., 0] * bins + ia[..., 1]) * bins + ib[..., 0]) * bins + ib[..., 1]
+
+    def close(self):
+        pass
+
     # ---------------------------------------------------------------- dynamics
     def reset(self, random_start: bool = False) -> torch.Tensor:
         self.t = 0
@@ -96,5 +116,6 @@ class PointPush:
         a = torch.where(dist2 < self.R, b + self.R * d2 / dist2.clamp_min(1e-8), a)
         self.agent, self.block = a, b
         self.t += 1
-        info = {"contact": contact, "block_move": (b - b_old).norm(dim=-1), "in_tv": self.in_tv()}
+        wall = ((a - self.agent_lo).abs() < 1e-6).any(-1) | ((a - self.agent_hi).abs() < 1e-6).any(-1)
+        info = {"contact": contact, "block_move": (b - b_old).norm(dim=-1), "in_tv": self.in_tv(), "wall": wall}
         return self.obs(), info

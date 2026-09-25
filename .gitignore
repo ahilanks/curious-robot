@@ -27,3 +27,6 @@ wandb/
 
 # secrets live only on disk (2026-09-14: untracked; the repo is public)
 .env
+
+# toy: downloaded datasets (Push-T demos)
+toy/data/
