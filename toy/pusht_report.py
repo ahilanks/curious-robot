@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 from scipy import stats
 
-ARMS = ("none", "pred", "lp", "count", "ln")
+ARMS = ("none", "pred", "lp", "count", "ln", "spep", "spch20")
 
 
 def seeds_for_power(d, alpha, power=0.8, n_max=200):
